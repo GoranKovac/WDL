@@ -2046,7 +2046,7 @@ void SWELL_GetViewPort(RECT *r, const RECT *sourcerect, bool wantWork)
 
     RECT tmp;
     tmp.left=rc.x;
-    tmp.top = rc.y;
+    tmp.top=rc.y;
     tmp.right=rc.x+rc.width;
     tmp.bottom=rc.y+rc.height;
     if (!sourcerect || n < 2)
