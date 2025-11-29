@@ -1164,12 +1164,18 @@ static LRESULT WINAPI submenuWndProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM
             }
             else
             {
-              hh = new HWND__(NULL,0,NULL,"menu",false,submenuWndProc,NULL, hwnd);
+              // NOTE: WAYLAND MENU NEEDS PARENT
+              HWND parent = hwnd->m_parent ? hwnd->m_parent : hwnd;
+              hh = new HWND__(parent,0,NULL,"menu",false,submenuWndProc,NULL, hwnd);
               SetProp(hh,"SWELL_MenuOwner",GetProp(hwnd,"SWELL_MenuOwner"));
             }
 
             RECT r;
             GetClientRect(hwnd,&r);
+
+            // NOTE: WAYLAND SUBMENUS NEED OFFSET
+            item_ypos -= g_swell_ctheme.menubar_height;
+
             m_trackingPt.x=r.right;
             m_trackingPt.y=item_ypos;
             m_trackingPt2.x=r.left;
@@ -1282,6 +1288,10 @@ int TrackPopupMenu(HMENU hMenu, int flags, int xpos, int ypos, int resvd, HWND h
   ReleaseCapture();
 
   hMenu->Retain();
+
+  // NOTE: WAYLAND MENUS Y NEED OFFSET MENUBAR HEIGHT
+  ypos -= g_swell_ctheme.menubar_height;
+
   m_trackingPar=hwnd;
   m_trackingFlags=flags;
   m_trackingRet=-1;
@@ -1309,8 +1319,9 @@ int TrackPopupMenu(HMENU hMenu, int flags, int xpos, int ypos, int resvd, HWND h
     hMenu->sel_vis=-1;
 
   if (!resvd || resvd == 0xbeee) swell_menu_ignore_mousemove_from = GetTickCount();
-
-  HWND hh=new HWND__(NULL,0,NULL,"menu",false,submenuWndProc,NULL, hwnd);
+  // NOTE: WAYLAND NEEDS PARENT  
+  HWND parent = hwnd->m_parent ? hwnd->m_parent : hwnd;
+  HWND hh=new HWND__(parent,0,NULL,"menu",false,submenuWndProc,NULL, hwnd);
 
   submenuWndProc(hh,WM_CREATE,0,(LPARAM)hMenu);
 

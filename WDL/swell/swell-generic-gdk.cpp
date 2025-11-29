@@ -50,8 +50,13 @@ extern "C" {
 #endif
 
 #include <X11/extensions/XInput2.h>
-
+#ifdef GDK_WINDOWING_X11
 #include <X11/Xatom.h>
+#endif
+
+#ifdef GDK_WINDOWING_WAYLAND
+#include <gdk/gdkwayland.h>
+#endif
 
 #include <GL/gl.h>
 #include <GL/glx.h>
@@ -230,7 +235,17 @@ static void on_deactivate()
 {
   swell_app_is_inactive=true;
   HWND lf = swell_oswindow_to_hwnd(SWELL_focused_oswindow);
-  s_last_desktop = lf && lf->m_oswindow ? _gdk_x11_window_get_desktop(lf->m_oswindow)+1 : 0;
+
+  #ifdef GDK_WINDOWING_X11
+    if (GDK_IS_X11_WINDOW(lf->m_oswindow))
+        s_last_desktop = lf && lf->m_oswindow ? _gdk_x11_window_get_desktop(lf->m_oswindow) + 1 : 0;
+  #endif
+
+  #ifdef GDK_WINDOWING_WAYLAND
+    if (GDK_IS_WAYLAND_WINDOW(lf->m_oswindow))
+        // TODO: make a function that gets the desktop on wayland
+        s_last_desktop = lf && lf->m_oswindow ? 0 + 1 : 0;
+  #endif
 
   HWND h = SWELL_topwindows; 
   while (h)
@@ -347,7 +362,7 @@ void SWELL_initargs(int *argc, char ***argv)
     *(void **)&_gdk_set_allowed_backends = dlsym(RTLD_DEFAULT,"gdk_set_allowed_backends");
 
     if (_gdk_set_allowed_backends)
-      _gdk_set_allowed_backends("x11");
+      _gdk_set_allowed_backends("wayland, x11");
 #endif
 
 #ifdef SWELL_SUPPORT_GTK
@@ -508,6 +523,7 @@ static void init_options()
     }
 
     const char *wmname = gdk_x11_screen_get_window_manager_name(gdk_screen_get_default());
+
     switch (swell_gdk_option("gdk_fullscreen_for_owner_windows", "auto (default is 1 on kwin, otherwise 0)",-1))
     {
       case -1:
@@ -620,8 +636,9 @@ void swell_oswindow_manage(HWND hwnd, bool wantfocus)
         GdkWindowAttr attr={0,};
         attr.title = (char *)hwnd->m_title.Get();
         attr.event_mask = GDK_ALL_EVENTS_MASK|GDK_EXPOSURE_MASK;
-        attr.x = r.left;
-        attr.y = r.top;
+        // NOTE: WAYLAND OFFSET STARTS AT 0,0
+        attr.x = 0; //r.left;
+        attr.y = 0; //r.top;
         attr.width = r.right-r.left;
         attr.height = r.bottom-r.top;
         attr.wclass = GDK_INPUT_OUTPUT;
@@ -677,8 +694,9 @@ void swell_oswindow_manage(HWND hwnd, bool wantfocus)
           }
 
           if (s_force_window_time)
-            gdk_x11_window_set_user_time(hwnd->m_oswindow,s_force_window_time);
-
+            #ifdef GDK_WINDOWING_X11
+                    gdk_x11_window_set_user_time(hwnd->m_oswindow,s_force_window_time);
+            #endif
           if (!wantfocus || swell_app_is_inactive)
             gdk_window_set_focus_on_map(hwnd->m_oswindow,false);
 
@@ -744,27 +762,27 @@ void swell_oswindow_maximize(HWND hwnd, bool wantmax) // false=restore
 
 void swell_oswindow_updatetoscreen(HWND hwnd, RECT *rect)
 {
-#ifdef SWELL_LICE_GDI
-  if (hwnd && hwnd->m_backingstore && hwnd->m_oswindow)
-  {
-    LICE_IBitmap *bm = hwnd->m_backingstore;
-    LICE_SubBitmap tmpbm(bm,rect->left,rect->top,rect->right-rect->left,rect->bottom-rect->top);
-
-    GdkRectangle rrr={rect->left,rect->top,rect->right-rect->left,rect->bottom-rect->top};
-    gdk_window_begin_paint_rect(hwnd->m_oswindow, &rrr);
-
-    cairo_t * crc = gdk_cairo_create (hwnd->m_oswindow);
-    cairo_surface_t *temp_surface = (cairo_surface_t*)bm->Extended(0xca140,NULL);
-    if (temp_surface) cairo_set_source_surface(crc, temp_surface, 0,0);
-    cairo_paint(crc);
-    cairo_destroy(crc);
-
-    gdk_window_end_paint(hwnd->m_oswindow);
-
-    if (temp_surface) bm->Extended(0xca140,temp_surface); // release
-
-  }
-#endif
+// #ifdef SWELL_LICE_GDI
+//   if (hwnd && hwnd->m_backingstore && hwnd->m_oswindow)
+//   {
+//     LICE_IBitmap *bm = hwnd->m_backingstore;
+//     LICE_SubBitmap tmpbm(bm,rect->left,rect->top,rect->right-rect->left,rect->bottom-rect->top);
+//
+//     GdkRectangle rrr={rect->left,rect->top,rect->right-rect->left,rect->bottom-rect->top};
+//     gdk_window_begin_paint_rect(hwnd->m_oswindow, &rrr);
+//
+//     cairo_t * crc = gdk_cairo_create (hwnd->m_oswindow);
+//     cairo_surface_t *temp_surface = (cairo_surface_t*)bm->Extended(0xca140,NULL);
+//     if (temp_surface) cairo_set_source_surface(crc, temp_surface, 0,0);
+//     cairo_paint(crc);
+//     cairo_destroy(crc);
+//
+//     gdk_window_end_paint(hwnd->m_oswindow);
+//
+//     if (temp_surface) bm->Extended(0xca140,temp_surface); // release
+//
+//   }
+// #endif
 }
 
 #if SWELL_TARGET_GDK == 2
@@ -1404,7 +1422,8 @@ static HWND getMouseTarget(SWELL_OSWINDOW osw, POINT p, const HWND *hwnd_has_osw
 
 static void OnMotionEvent(GdkEventMotion *m)
 {
-  swell_lastMessagePos = MAKELONG(((int)m->x_root&0xffff),((int)m->y_root&0xffff));
+  // NOTE: WAYLAND XY_ROOT NEEDS TO BE REPLACED WITH XY
+  swell_lastMessagePos = MAKELONG(((int)m->x&0xffff),((int)m->y&0xffff));
   POINT p={(int)m->x, (int)m->y};
   HWND hwnd = getMouseTarget(m->window,p,NULL);
 
@@ -1420,13 +1439,14 @@ static void OnMotionEvent(GdkEventMotion *m)
 
 static void OnScrollEvent(GdkEventScroll *b)
 {
-  swell_lastMessagePos = MAKELONG(((int)b->x_root&0xffff),((int)b->y_root&0xffff));
+  // NOTE: WAYLAND XY_ROOT NEEDS TO BE REPLACED WITH XY
+  swell_lastMessagePos = MAKELONG(((int)b->x&0xffff),((int)b->y&0xffff));
   POINT p={(int)b->x, (int)b->y};
 
   HWND hwnd = getMouseTarget(b->window,p,NULL);
   if (hwnd)
   {
-    POINT p2={(int)b->x_root, (int)b->y_root};
+    POINT p2={(int)b->x, (int)b->y};
     // p2 is screen coordinates for WM_MOUSEWHEEL
 
     int msg=(b->direction == GDK_SCROLL_UP || b->direction == GDK_SCROLL_DOWN) ? WM_MOUSEWHEEL :
@@ -1449,11 +1469,12 @@ static void OnButtonEvent(GdkEventButton *b)
 {
   HWND hwnd = swell_oswindow_to_hwnd(b->window);
   if (!hwnd) return;
-  swell_lastMessagePos = MAKELONG(((int)b->x_root&0xffff),((int)b->y_root&0xffff));
+  // NOTE: WAYLAND XY_ROOT NEEDS TO BE REPLACED WITH XY
+  swell_lastMessagePos = MAKELONG(((int)b->x&0xffff),((int)b->y&0xffff));
   POINT p={(int)b->x, (int)b->y};
   HWND hwnd2 = getMouseTarget(b->window,p,&hwnd);
 
-  POINT p2={(int)b->x_root, (int)b->y_root};
+  POINT p2={(int)b->x, (int)b->y};
   ScreenToClient(hwnd2, &p2);
 
   int msg=WM_LBUTTONDOWN;
@@ -1512,8 +1533,8 @@ static void OnButtonEvent(GdkEventButton *b)
       if (hwnd2) hwnd2->Release();
       hwnd2 = hwnd3;
       if (hwnd2) hwnd2->Retain();
-      p2.x = (int)b->x_root;
-      p2.y = (int)b->y_root;
+      p2.x = (int)b->x;
+      p2.y = (int)b->y;
       ScreenToClient(hwnd2, &p2);
     }
 
@@ -2197,12 +2218,13 @@ static HANDLE req_clipboard(GdkAtom type)
     s_clipboard_getstate=NULL;
 
     GdkDisplay *disp = gdk_window_get_display(h->m_oswindow);
-    if (WDL_NORMALLY(disp) &&
-        None == XGetSelectionOwner(gdk_x11_display_get_xdisplay(disp),
-                                   gdk_x11_atom_to_xatom_for_display(disp, GDK_SELECTION_CLIPBOARD)))
-    {
-      return NULL;
-    }
+    // TODO: WAYLAND FIX
+    // if (WDL_NORMALLY(disp) &&
+    //     None == XGetSelectionOwner(gdk_x11_display_get_xdisplay(disp),
+    //                                 gdk_x11_atom_to_xatom_for_display(disp, GDK_SELECTION_CLIPBOARD)))
+    // {
+    //   return NULL;
+    // }
 
     gdk_selection_convert(h->m_oswindow,GDK_SELECTION_CLIPBOARD,type,GDK_CURRENT_TIME);
  
@@ -3162,7 +3184,7 @@ HWND SWELL_CreateXBridgeWindow(HWND viewpar, void **wref, const RECT *r)
     need_reparent = true;
     ospar = gdk_screen_get_root_window(gdk_screen_get_default());
   }
-
+  
   Display *disp = gdk_x11_display_get_xdisplay(gdk_window_get_display(ospar));
   Window w = XCreateWindow(disp,GDK_WINDOW_XID(ospar),0,0,
       wdl_max(r->right-r->left,1),
