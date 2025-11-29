@@ -759,7 +759,7 @@ void swell_oswindow_maximize(HWND hwnd, bool wantmax) // false=restore
       gdk_window_unmaximize(hwnd->m_oswindow);
   }
 }
-
+// NOTE: WAYLAND CURRENTLY BROKEN AND DOES NOT GRAB TOP WINDOW (MENUS)
 void swell_oswindow_updatetoscreen(HWND hwnd, RECT *rect)
 {
 // #ifdef SWELL_LICE_GDI
@@ -2218,7 +2218,7 @@ static HANDLE req_clipboard(GdkAtom type)
     s_clipboard_getstate=NULL;
 
     GdkDisplay *disp = gdk_window_get_display(h->m_oswindow);
-    // TODO: WAYLAND FIX
+    // NOTE: WAYLAND CURRENTLY BROKEN AND CRASHES REAPER ON STARTUP
     // if (WDL_NORMALLY(disp) &&
     //     None == XGetSelectionOwner(gdk_x11_display_get_xdisplay(disp),
     //                                 gdk_x11_atom_to_xatom_for_display(disp, GDK_SELECTION_CLIPBOARD)))
