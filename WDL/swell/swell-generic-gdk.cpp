@@ -762,6 +762,17 @@ void swell_oswindow_maximize(HWND hwnd, bool wantmax) // false=restore
 // NOTE: WAYLAND CURRENTLY BROKEN AND DOES NOT GRAB TOP WINDOW (MENUS)
 void swell_oswindow_updatetoscreen(HWND hwnd, RECT *rect)
 {
+    if (hwnd && hwnd->m_backingstore && hwnd->m_oswindow)
+    {
+        GdkRectangle r = {
+            rect->left,
+            rect->top,
+            rect->right - rect->left,
+            rect->bottom - rect->top
+        };
+        gdk_window_invalidate_rect(hwnd->m_oswindow, &r, FALSE);
+    }
+    return;
 // #ifdef SWELL_LICE_GDI
 //   if (hwnd && hwnd->m_backingstore && hwnd->m_oswindow)
 //   {
