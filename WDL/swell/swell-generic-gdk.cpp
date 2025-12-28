@@ -61,6 +61,7 @@ extern "C" {
 #include <GL/gl.h>
 #include <GL/glx.h>
 
+static RECT lastMainWindowRect = {0,0,0,0};
 static void (*_gdk_drag_drop_done)(GdkDragContext *, gboolean); // may not always be available
 
 static guint32 _gdk_x11_window_get_desktop(GdkWindow *window)
@@ -1105,6 +1106,15 @@ static void OnConfigureEvent(GdkEventConfigure *cfg)
   if (flag&2) SendMessage(hwnd,WM_SIZE,hwnd->m_is_maximized ? SIZE_MAXIMIZED : SIZE_RESTORED,0);
   if (!hwnd->m_hashaddestroy && hwnd->m_oswindow && (hwnd->m_style & WS_THICKFRAME))
     swell_recalcMinMaxInfo(hwnd);
+  if (hwnd->m_parent == NULL) // main window
+  {
+    int wx=0,wy=0;
+    gdk_window_get_origin(hwnd->m_oswindow, &wx, &wy);
+    lastMainWindowRect.left   = wx;
+    lastMainWindowRect.top    = wy;
+    lastMainWindowRect.right  = wx + cfg->width;
+    lastMainWindowRect.bottom = wy + cfg->height;
+  }
 }
 
 static void OnWindowStateEvent(GdkEventWindowState *evt)
@@ -2035,6 +2045,17 @@ void SWELL_GetViewPort(RECT *r, const RECT *sourcerect, bool wantWork)
   if (!swell_initwindowsys()) return;
   GdkScreen *defscr = gdk_screen_get_default();
   if (!defscr) return;
+
+  //NOTE: WAYLAND RETURN CURRENT APP SCREEN FROM ONCONFIGUREEVENT
+  #ifdef GDK_WINDOWING_WAYLAND
+    if (lastMainWindowRect.right > lastMainWindowRect.left &&
+      lastMainWindowRect.bottom > lastMainWindowRect.top)
+    {
+      *r = lastMainWindowRect;
+       return;
+    }
+  #endif
+
   const gint n = gdk_screen_get_n_monitors(defscr);
   if (n < 1) return;
 
