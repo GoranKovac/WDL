@@ -2218,12 +2218,22 @@ void swell_oswindow_invalidate(HWND hwnd, const RECT *r)
   gdk_window_invalidate_rect(hwnd->m_oswindow,r ? &gdkr : NULL,true);
 }
 
+//NOTE:: WAYLAND NEEDS GTK CLIPBOARD TO WORKY
+static GtkClipboard *gtk_clipboard;
+static bool clipboard_requested;
 
+static GtkClipboard *get_clipboard(void)
+{
+    if (!gtk_clipboard)
+        gtk_clipboard = gtk_clipboard_get(GDK_SELECTION_CLIPBOARD);
+    return gtk_clipboard;
+}
 
 bool OpenClipboard(HWND hwndDlg) 
 {
+  (void)hwndDlg; // not needed for wayland apparently
   RegisterClipboardFormat(NULL);
-  s_clip_hwnd=hwndDlg ? hwndDlg : SWELL_topwindows; 
+  s_clip_hwnd = NULL;
   s_clipboard_written = false;
 
   GlobalFree(s_clipboard_getstate);
@@ -2235,70 +2245,48 @@ bool OpenClipboard(HWND hwndDlg)
   return true; 
 }
 
+//NOTE:: WAYLAND FIX WINTH DND
 static HANDLE req_clipboard(GdkAtom type)
 {
   if (s_clipboard_getstate_fmt == type) return s_clipboard_getstate;
   if (type == tgtatom() && s_clipboard_getstate_fmt == atomatom())
     return s_clipboard_getstate;
 
-  HWND h = s_clip_hwnd;
-  while (h && !h->m_oswindow) h = h->m_parent;
+   if (clipboard_requested)
+     return NULL;
 
-  if (h && SWELL_gdk_active > 0)
-  {
-    GlobalFree(s_clipboard_getstate);
-    s_clipboard_getstate=NULL;
+   clipboard_requested = true;
 
-    GdkDisplay *disp = gdk_window_get_display(h->m_oswindow);
-    // NOTE: WAYLAND CURRENTLY BROKEN AND CRASHES REAPER ON STARTUP
-    // if (WDL_NORMALLY(disp) &&
-    //     None == XGetSelectionOwner(gdk_x11_display_get_xdisplay(disp),
-    //                                 gdk_x11_atom_to_xatom_for_display(disp, GDK_SELECTION_CLIPBOARD)))
-    // {
-    //   return NULL;
-    // }
+   gtk_clipboard_request_contents(
+     get_clipboard(),
+     type,
+     [](GtkClipboard *cb, GtkSelectionData *data, gpointer user_data)
+     {
+       clipboard_requested = false;
 
-    gdk_selection_convert(h->m_oswindow,GDK_SELECTION_CLIPBOARD,type,GDK_CURRENT_TIME);
- 
-    GMainContext *ctx=g_main_context_default();
-    DWORD startt = GetTickCount();
-    for (;;)
-    {
-      while (!s_clipboard_getstate && g_main_context_iteration(ctx,FALSE))
-      {
-        GdkEvent *evt;
-        while (!s_clipboard_getstate && gdk_events_pending() && (evt = gdk_event_get()))
-        {
-          switch (evt->type)
-          {
-            case GDK_SELECTION_NOTIFY:
-            case GDK_SELECTION_REQUEST:
-            case GDK_EXPOSE:
-            case GDK_CONFIGURE:
-            case GDK_WINDOW_STATE:
-            case GDK_GRAB_BROKEN:
-              swell_gdkEventHandler(evt,(gpointer)1);
-            break;
-            default:
-              // not ideal to drop events, but hm
-            break;
-          }
-          gdk_event_free(evt);
-        }
-      }
+       if (!data) return;
+       s_clipboard_getstate_fmt = gtk_selection_data_get_target(data);
+       int len = gtk_selection_data_get_length(data);
+       const guchar *bytes = gtk_selection_data_get_data(data);
+       
+       HANDLE h = NULL;
+       if (!bytes || len <= 0) return;
 
-      if (s_clipboard_getstate) 
-      {
-        if (s_clipboard_getstate_fmt == type) return s_clipboard_getstate;
-        if (type == tgtatom() && s_clipboard_getstate_fmt == atomatom())
-          return s_clipboard_getstate;
-        return NULL;
-      }
+       if (s_clipboard_getstate_fmt == urilistatom()) // drag and drop from file manager etc
+       {
+         h = urilistToDropFiles(NULL, bytes, len);
+       }
+       else
+       {
+         h = GlobalAlloc(GMEM_MOVEABLE, len);
+         memcpy(GlobalLock(h), bytes, len);
+         GlobalUnlock(h);
+       }
+       GlobalFree(s_clipboard_getstate);
+       s_clipboard_getstate = h;
+     },
+     NULL);
 
-      if ((GetTickCount()-startt) > 500) break;
-      Sleep(10);
-    }
-  }
   return NULL;
 }
 
@@ -2313,17 +2301,19 @@ UINT EnumClipboardFormats(UINT lastfmt)
 {
   if (lastfmt == 0 && !s_clipboard_enumstate.GetSize())
   {
-    HANDLE h = req_clipboard(tgtatom());
-    if (!h) return 0;
-    int sz = GlobalSize(h) / (int)sizeof(GdkAtom);
-    const char *l = (const char *)h;
-    for (int x = 0; x < sz; x ++)
-    {
-      GdkAtom a;
-      memcpy(&a,l + x*sizeof(GdkAtom), sizeof(a));
-      UINT c = clipboard_type_from_atom(a);
-      if (c) s_clipboard_enumstate.Insert(c);
-    }
+    gtk_clipboard_request_targets(
+      get_clipboard(),
+      [](GtkClipboard *cb, GdkAtom *atoms, gint n_atoms, gpointer user_data)
+      {
+        s_clipboard_enumstate.DeleteAll();
+        for (int i = 0; i < n_atoms; i++)
+        {
+          UINT fmt = clipboard_type_from_atom(atoms[i]);
+          if (fmt)
+          s_clipboard_enumstate.Insert(fmt);
+        }
+      },
+      NULL);
   }
 
   int x = 0;
@@ -2339,7 +2329,23 @@ HANDLE GetClipboardData(UINT type)
   GdkAtom a;
   if (atom_from_clipboard_type(type,&a))
   {
-    return req_clipboard(a);
+    HANDLE h = req_clipboard(a);
+    // we need to wait here for data to arrive or nothing will be pasted 
+    if (!h)
+    {
+      GMainContext *ctx = g_main_context_default();
+      int wait_ms = 0;
+      while (!s_clipboard_getstate && wait_ms < 500)
+      {
+        while (g_main_context_iteration(ctx, FALSE)) {}
+        // this is tricky here, this is minimal to make paste feel instant (from outside of reaper)
+        g_usleep(1000);
+        wait_ms += 10;
+      }
+      h = (s_clipboard_getstate_fmt == a) ? s_clipboard_getstate : NULL;
+    }
+
+    return h;
   }
 
   return NULL;
@@ -2372,21 +2378,25 @@ void SetClipboardData(UINT type, HANDLE h)
       *state = h;
     }
 
-    static GdkWindow *w;
-    if (!w)
-    {
-      GdkWindowAttr attr={0,};
-      attr.title = (char *)"swell clipboard";
-      attr.event_mask = GDK_ALL_EVENTS_MASK;
-      attr.wclass = GDK_INPUT_ONLY;
-      attr.window_type = GDK_WINDOW_TOPLEVEL;
-      w = gdk_window_new(NULL,&attr,0);
-    }
-    if (w && !s_clipboard_written)
+    GtkClipboard *cb = get_clipboard();
+    if (!s_clipboard_written)
     {
       s_clipboard_written = true;
       s_clipboard_enumstate.DeleteAll();
-      gdk_selection_owner_set(w,GDK_SELECTION_CLIPBOARD,GDK_CURRENT_TIME,TRUE);
+
+      gtk_clipboard_set_with_data(
+        cb,
+        (const GtkTargetEntry[]){{.target = gdk_atom_name(a), .flags = 0, .info = 0}},
+        1,
+        [](GtkClipboard *clipboard, GtkSelectionData *selection_data, guint info, gpointer user_data)
+        {
+          HANDLE handle = (HANDLE)user_data;
+          guchar *data = (guchar*)GlobalLock(handle);
+          gtk_selection_data_set(selection_data, gdk_atom_intern("application/octet-stream", FALSE), 8, data, GlobalSize(handle));
+          GlobalUnlock(handle);
+        },
+        NULL,
+        h);
     }
     if (WDL_NORMALLY(type != 0))
       s_clipboard_enumstate.Insert(type);
