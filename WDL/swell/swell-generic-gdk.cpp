@@ -760,7 +760,7 @@ void swell_oswindow_maximize(HWND hwnd, bool wantmax) // false=restore
       gdk_window_unmaximize(hwnd->m_oswindow);
   }
 }
-// NOTE: WAYLAND CURRENTLY BROKEN AND DOES NOT GRAB TOP WINDOW (MENUS)
+//NOTE: Wayland not really sure why this works but it works as same as native reaper as I can tell
 void swell_oswindow_updatetoscreen(HWND hwnd, RECT *rect)
 {
     if (hwnd && hwnd->m_backingstore && hwnd->m_oswindow)
