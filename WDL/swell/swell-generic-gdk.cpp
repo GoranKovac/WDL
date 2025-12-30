@@ -2147,8 +2147,14 @@ bool GetWindowRect(HWND hwnd, RECT *r)
 
 void swell_oswindow_begin_resize(SWELL_OSWINDOW wnd)
 {
-  // make sure window is resizable (hints will be re-set on upcoming CONFIGURE event)
-  gdk_window_set_geometry_hints(wnd,NULL,(GdkWindowHints) 0); 
+#ifdef GDK_WINDOWING_WAYLAND
+    //NOTE: wayland no likey NULL, crashes on dock dragging 
+    GdkGeometry geom;
+    gdk_window_set_geometry_hints(wnd,&geom,(GdkWindowHints) 0);
+#else
+    // make sure window is resizable (hints will be re-set on upcoming CONFIGURE event)
+    gdk_window_set_geometry_hints(wnd,NULL,(GdkWindowHints) 0);
+#endif
 }
 
 void swell_oswindow_resize(SWELL_OSWINDOW wnd, int reposflag, RECT f)
