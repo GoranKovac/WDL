@@ -634,22 +634,19 @@ void swell_oswindow_manage(HWND hwnd, bool wantfocus)
         }
 
         RECT r = hwnd->m_position;
-        GdkWindowAttr attr={0,};
-        attr.title = (char *)hwnd->m_title.Get();
-        attr.event_mask = GDK_ALL_EVENTS_MASK|GDK_EXPOSURE_MASK;
-        // NOTE: WAYLAND OFFSET STARTS AT 0,0
-        attr.x = 0; //r.left;
-        attr.y = 0; //r.top;
-        attr.width = r.right-r.left;
-        attr.height = r.bottom-r.top;
-        attr.wclass = GDK_INPUT_OUTPUT;
-        const char *appname = g_swell_appname;
-        attr.wmclass_name = (gchar*)appname;
-        attr.wmclass_class = (gchar*)appname;
-        attr.window_type = GDK_WINDOW_TOPLEVEL;
-        if (GetProp(hwnd,"SWELLGdkAlphaChannel"))
-          attr.visual = gdk_screen_get_rgba_visual(gdk_screen_get_default());
-        hwnd->m_oswindow = gdk_window_new(NULL,&attr,GDK_WA_X|GDK_WA_Y|(appname?GDK_WA_WMCLASS:0)|(attr.visual ? GDK_WA_VISUAL : 0));
+        GtkWidget *gtk_win = gtk_window_new(GTK_WINDOW_TOPLEVEL);
+        gtk_widget_set_app_paintable(gtk_win, TRUE);
+        gtk_widget_set_double_buffered(gtk_win, FALSE);
+        gtk_widget_add_events(gtk_win,GDK_ALL_EVENTS_MASK|GDK_EXPOSURE_MASK);
+
+        gtk_window_set_title(GTK_WINDOW(gtk_win), hwnd->m_title.Get());
+        gtk_window_set_default_size(GTK_WINDOW(gtk_win), r.right - r.left, r.bottom - r.top);
+        gtk_window_set_wmclass(GTK_WINDOW(gtk_win), g_swell_appname, g_swell_appname);
+        hwnd->m_oswidget = gtk_win;
+
+        gtk_widget_realize(gtk_win);
+        gtk_widget_show(gtk_win);
+        hwnd->m_oswindow = gtk_widget_get_window(gtk_win);
  
         if (hwnd->m_oswindow) 
         {
@@ -733,8 +730,8 @@ void swell_oswindow_manage(HWND hwnd, bool wantfocus)
           else
             gdk_window_show_unraised(hwnd->m_oswindow);
 
-          if (s_last_desktop>0)
-            _gdk_x11_window_move_to_desktop(hwnd->m_oswindow,s_last_desktop-1);
+          // if (s_last_desktop>0)
+          //   _gdk_x11_window_move_to_desktop(hwnd->m_oswindow,s_last_desktop-1);
 
           if (!hwnd->m_oswindow_fullscreen)
           {
@@ -774,27 +771,6 @@ void swell_oswindow_updatetoscreen(HWND hwnd, RECT *rect)
         gdk_window_invalidate_rect(hwnd->m_oswindow, &r, FALSE);
     }
     return;
-// #ifdef SWELL_LICE_GDI
-//   if (hwnd && hwnd->m_backingstore && hwnd->m_oswindow)
-//   {
-//     LICE_IBitmap *bm = hwnd->m_backingstore;
-//     LICE_SubBitmap tmpbm(bm,rect->left,rect->top,rect->right-rect->left,rect->bottom-rect->top);
-//
-//     GdkRectangle rrr={rect->left,rect->top,rect->right-rect->left,rect->bottom-rect->top};
-//     gdk_window_begin_paint_rect(hwnd->m_oswindow, &rrr);
-//
-//     cairo_t * crc = gdk_cairo_create (hwnd->m_oswindow);
-//     cairo_surface_t *temp_surface = (cairo_surface_t*)bm->Extended(0xca140,NULL);
-//     if (temp_surface) cairo_set_source_surface(crc, temp_surface, 0,0);
-//     cairo_paint(crc);
-//     cairo_destroy(crc);
-//
-//     gdk_window_end_paint(hwnd->m_oswindow);
-//
-//     if (temp_surface) bm->Extended(0xca140,temp_surface); // release
-//
-//   }
-// #endif
 }
 
 #if SWELL_TARGET_GDK == 2
@@ -2149,7 +2125,7 @@ void swell_oswindow_begin_resize(SWELL_OSWINDOW wnd)
 {
 #ifdef GDK_WINDOWING_WAYLAND
     //NOTE: wayland no likey NULL, crashes on dock dragging 
-    GdkGeometry geom;
+    GdkGeometry geom = {0};
     gdk_window_set_geometry_hints(wnd,&geom,(GdkWindowHints) 0);
 #else
     // make sure window is resizable (hints will be re-set on upcoming CONFIGURE event)
