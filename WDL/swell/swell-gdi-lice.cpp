@@ -1806,7 +1806,14 @@ void ImageList_Destroy(HIMAGELIST list)
 
 int ImageList_ReplaceIcon(HIMAGELIST list, int offset, HICON image)
 {
-  if (WDL_NOT_NORMALLY(!image || !list)) return -1;
+  //NOTE: WAYLAND MediaExplorer crashes because of icons are null.
+  // This just makes it not crash reaper does not fix the problem
+  // When MediaExplorer opens up for the first time error pops up but not on next open 
+  // Anyway MediaExplorer runs just fine after this (before it crashes reaper)
+  if (WDL_NOT_NORMALLY(!list)) return -1;
+  if (!image)
+    return -1; // Return error but don't crash
+
   WDL_PtrList<HGDIOBJ__> *l=(WDL_PtrList<HGDIOBJ__> *)list;
 
   HGDIOBJ__ *imgsrc = (HGDIOBJ__*)image;
