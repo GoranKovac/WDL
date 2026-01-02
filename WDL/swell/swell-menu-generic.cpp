@@ -22,6 +22,7 @@
 
   */
 
+#include <cstdio>
 #ifndef SWELL_PROVIDED_BY_APP
 
 #include "swell.h"
@@ -1152,30 +1153,23 @@ static LRESULT WINAPI submenuWndProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM
           else if (inf->hSubMenu)
           {
             const int nextidx = m_trackingMenus.Find(hwnd)+1;
-            HWND hh = m_trackingMenus.Get(nextidx);
-
             inf->hSubMenu->sel_vis=-1;
-
-            if (hh)
+            //NOTE: WAYLAND SUBMENUS GET STUCK WHERE FIRST ONE WAS OPENED
+            // SO DELETE ALL MENUS FIRST AND CREATE NEW ONE AFTER
+            int a = m_trackingMenus.GetSize();
+            while (a > nextidx)
             {
+              HWND h = m_trackingMenus.Get(nextidx);
               m_trackingMenus.Delete(nextidx);
-              int a = m_trackingMenus.GetSize();
-              while (a > nextidx) DestroyWindow(m_trackingMenus.Get(--a));
+              if (h) DestroyWindow(h);
+              a = m_trackingMenus.GetSize();
             }
-            else
-            {
-              // NOTE: WAYLAND MENU NEEDS PARENT
-              HWND parent = hwnd->m_parent ? hwnd->m_parent : hwnd;
-              hh = new HWND__(parent,0,NULL,"menu",false,submenuWndProc,NULL, hwnd);
-              SetProp(hh,"SWELL_MenuOwner",GetProp(hwnd,"SWELL_MenuOwner"));
-            }
+
+            HWND hh = new HWND__(NULL,0,NULL,"menu",false,submenuWndProc,NULL, hwnd);
+            SetProp(hh,"SWELL_MenuOwner",GetProp(hwnd,"SWELL_MenuOwner"));
 
             RECT r;
             GetClientRect(hwnd,&r);
-
-            // NOTE: WAYLAND SUBMENUS NEED OFFSET
-            item_ypos -= g_swell_ctheme.menubar_height;
-
             m_trackingPt.x=r.right;
             m_trackingPt.y=item_ypos;
             m_trackingPt2.x=r.left;
@@ -1288,10 +1282,6 @@ int TrackPopupMenu(HMENU hMenu, int flags, int xpos, int ypos, int resvd, HWND h
   ReleaseCapture();
 
   hMenu->Retain();
-
-  // NOTE: WAYLAND MENUS Y NEED OFFSET MENUBAR HEIGHT
-  ypos -= g_swell_ctheme.menubar_height;
-
   m_trackingPar=hwnd;
   m_trackingFlags=flags;
   m_trackingRet=-1;
@@ -1319,9 +1309,8 @@ int TrackPopupMenu(HMENU hMenu, int flags, int xpos, int ypos, int resvd, HWND h
     hMenu->sel_vis=-1;
 
   if (!resvd || resvd == 0xbeee) swell_menu_ignore_mousemove_from = GetTickCount();
-  // NOTE: WAYLAND NEEDS PARENT  
-  HWND parent = hwnd->m_parent ? hwnd->m_parent : hwnd;
-  HWND hh=new HWND__(parent,0,NULL,"menu",false,submenuWndProc,NULL, hwnd);
+
+  HWND hh=new HWND__(NULL,0,NULL,"menu",false,submenuWndProc,NULL, hwnd);
 
   submenuWndProc(hh,WM_CREATE,0,(LPARAM)hMenu);
 
