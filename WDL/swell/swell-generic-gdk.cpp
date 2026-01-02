@@ -593,9 +593,19 @@ bool IsModalDialogBox(HWND);
 void swell_oswindow_manage(HWND hwnd, bool wantfocus)
 {
   if (!hwnd) return;
-
   bool isVis = hwnd->m_oswindow != NULL;
   bool wantVis = !hwnd->m_parent && hwnd->m_visible;
+
+  // if (isVis != wantVis && wantVis)  {
+  // printf("MANAGE: hwnd=%p, classname='%s', style=0x%x, exstyle=0x%x, parent=%p, owner=%p, title='%s'\n",
+  //         hwnd, 
+  //         hwnd->m_classname ? hwnd->m_classname : "NULL",
+  //         hwnd->m_style,
+  //         hwnd->m_exstyle,
+  //         hwnd->m_parent,
+  //         hwnd->m_owner,
+  //         hwnd->m_title.Get());
+  // }
 
   if (isVis != wantVis)
   {
@@ -634,15 +644,62 @@ void swell_oswindow_manage(HWND hwnd, bool wantfocus)
         }
 
         RECT r = hwnd->m_position;
-        GtkWidget *gtk_win = gtk_window_new(GTK_WINDOW_TOPLEVEL);
+ 
+        bool is_popup_menu = (hwnd->m_classname && strcmp(hwnd->m_classname, "__SWELL_MENU") == 0);
+
+        //NOTE: tooltips are bit tricky to detect and have issue when swiping fast across elements:
+        //we get into situation where its using same hwnd and owner and they stuck in place
+        //also this brings another issue which is spawning popups after that and they will get drawn inside the tooltip
+        //did not managed to fix it since there is no code for tooltips (I did not find any or find anything via GDB backtrace)
+        bool is_tooltip = (!hwnd->m_parent && !hwnd->m_owner && (hwnd->m_style & WS_CHILD) && (!hwnd->m_title.Get() || !hwnd->m_title.Get()[0]));
+
+        GtkWidget *gtk_win = gtk_window_new((is_popup_menu || is_tooltip) ? GTK_WINDOW_POPUP : GTK_WINDOW_TOPLEVEL);
+
         gtk_widget_set_app_paintable(gtk_win, TRUE);
         gtk_widget_set_double_buffered(gtk_win, FALSE);
-        gtk_widget_add_events(gtk_win,GDK_ALL_EVENTS_MASK|GDK_EXPOSURE_MASK);
+        gtk_widget_add_events(gtk_win, GDK_ALL_EVENTS_MASK|GDK_EXPOSURE_MASK);
 
-        gtk_window_set_title(GTK_WINDOW(gtk_win), hwnd->m_title.Get());
+        if (!is_popup_menu && !is_tooltip)
+        {
+          gtk_window_set_title(GTK_WINDOW(gtk_win), hwnd->m_title.Get());
+        }
+
         gtk_window_set_default_size(GTK_WINDOW(gtk_win), r.right - r.left, r.bottom - r.top);
-        gtk_window_set_wmclass(GTK_WINDOW(gtk_win), g_swell_appname, g_swell_appname);
         hwnd->m_oswidget = gtk_win;
+
+        if (is_popup_menu || is_tooltip)
+        {
+          gtk_window_move(GTK_WINDOW(gtk_win), r.left, r.top);
+          gtk_window_set_type_hint(GTK_WINDOW(gtk_win), is_tooltip ? GDK_WINDOW_TYPE_HINT_TOOLTIP : GDK_WINDOW_TYPE_HINT_POPUP_MENU);
+          gtk_window_set_decorated(GTK_WINDOW(gtk_win), FALSE);
+          gtk_window_set_skip_taskbar_hint(GTK_WINDOW(gtk_win), TRUE);
+          gtk_window_set_skip_pager_hint(GTK_WINDOW(gtk_win), TRUE);
+
+          HWND parent_hwnd = NULL;
+
+          if (is_popup_menu)
+          {
+            parent_hwnd = hwnd->m_owner;
+
+            if (transient_for)
+            {
+              //NOTE: Some popups spawn normally but some as toplevel so find appropriate one 
+              while (parent_hwnd && parent_hwnd->m_oswindow != transient_for)
+                parent_hwnd = parent_hwnd->m_parent ? parent_hwnd->m_parent : parent_hwnd->m_owner;
+            }
+          }
+          else
+          {
+            //NOTE: Again popoup are tricky since there is no owner or parent for them and so just spawn
+            //them in focused window
+            parent_hwnd = GetFocus();
+            while (parent_hwnd && !parent_hwnd->m_oswidget)
+              parent_hwnd = parent_hwnd->m_parent;
+          }
+
+          if (parent_hwnd && parent_hwnd->m_oswidget)
+            gtk_window_set_transient_for(GTK_WINDOW(gtk_win), GTK_WINDOW(parent_hwnd->m_oswidget));
+        }
 
         gtk_widget_realize(gtk_win);
         gtk_widget_show(gtk_win);
@@ -659,7 +716,22 @@ void swell_oswindow_manage(HWND hwnd, bool wantfocus)
             {
               if (transient_for)
                 gdk_window_set_transient_for(hwnd->m_oswindow,transient_for);
-              gdk_window_set_type_hint(hwnd->m_oswindow, (gdk_options&OPTION_BORDERLESS_DIALOG) ? GDK_WINDOW_TYPE_HINT_DIALOG : GDK_WINDOW_TYPE_HINT_NORMAL);
+
+              GdkWindowTypeHint hint = GDK_WINDOW_TYPE_HINT_NORMAL;
+              if (is_popup_menu) 
+              {
+                hint = GDK_WINDOW_TYPE_HINT_POPUP_MENU;
+              } 
+              else if (is_tooltip)
+              {
+                hint = GDK_WINDOW_TYPE_HINT_TOOLTIP;
+              }
+              else if (gdk_options&OPTION_BORDERLESS_DIALOG)
+              {
+                hint = GDK_WINDOW_TYPE_HINT_DIALOG;
+              }
+
+              gdk_window_set_type_hint(hwnd->m_oswindow, hint);
               gdk_window_set_decorations(hwnd->m_oswindow,(GdkWMDecoration) 0);
             }
             else
@@ -691,10 +763,9 @@ void swell_oswindow_manage(HWND hwnd, bool wantfocus)
             gdk_window_set_decorations(hwnd->m_oswindow,decor);
           }
 
-          if (s_force_window_time)
-            #ifdef GDK_WINDOWING_X11
-                    gdk_x11_window_set_user_time(hwnd->m_oswindow,s_force_window_time);
-            #endif
+          // if (s_force_window_time)
+          //   gdk_x11_window_set_user_time(hwnd->m_oswindow,s_force_window_time);
+
           if (!wantfocus || swell_app_is_inactive)
             gdk_window_set_focus_on_map(hwnd->m_oswindow,false);
 
@@ -1419,8 +1490,7 @@ static HWND getMouseTarget(SWELL_OSWINDOW osw, POINT p, const HWND *hwnd_has_osw
 
 static void OnMotionEvent(GdkEventMotion *m)
 {
-  // NOTE: WAYLAND XY_ROOT NEEDS TO BE REPLACED WITH XY
-  swell_lastMessagePos = MAKELONG(((int)m->x&0xffff),((int)m->y&0xffff));
+  swell_lastMessagePos = MAKELONG(((int)m->x_root&0xffff),((int)m->y_root&0xffff));
   POINT p={(int)m->x, (int)m->y};
   HWND hwnd = getMouseTarget(m->window,p,NULL);
 
@@ -1436,14 +1506,13 @@ static void OnMotionEvent(GdkEventMotion *m)
 
 static void OnScrollEvent(GdkEventScroll *b)
 {
-  // NOTE: WAYLAND XY_ROOT NEEDS TO BE REPLACED WITH XY
-  swell_lastMessagePos = MAKELONG(((int)b->x&0xffff),((int)b->y&0xffff));
+  swell_lastMessagePos = MAKELONG(((int)b->x_root&0xffff),((int)b->y_root&0xffff));
   POINT p={(int)b->x, (int)b->y};
 
   HWND hwnd = getMouseTarget(b->window,p,NULL);
   if (hwnd)
   {
-    POINT p2={(int)b->x, (int)b->y};
+    POINT p2={(int)b->x_root, (int)b->y_root};
     // p2 is screen coordinates for WM_MOUSEWHEEL
 
     int msg=(b->direction == GDK_SCROLL_UP || b->direction == GDK_SCROLL_DOWN) ? WM_MOUSEWHEEL :
@@ -1466,12 +1535,11 @@ static void OnButtonEvent(GdkEventButton *b)
 {
   HWND hwnd = swell_oswindow_to_hwnd(b->window);
   if (!hwnd) return;
-  // NOTE: WAYLAND XY_ROOT NEEDS TO BE REPLACED WITH XY
-  swell_lastMessagePos = MAKELONG(((int)b->x&0xffff),((int)b->y&0xffff));
+  swell_lastMessagePos = MAKELONG(((int)b->x_root&0xffff),((int)b->y_root&0xffff));
   POINT p={(int)b->x, (int)b->y};
   HWND hwnd2 = getMouseTarget(b->window,p,&hwnd);
 
-  POINT p2={(int)b->x, (int)b->y};
+  POINT p2={(int)b->x_root, (int)b->y_root};
   ScreenToClient(hwnd2, &p2);
 
   int msg=WM_LBUTTONDOWN;
@@ -1530,8 +1598,8 @@ static void OnButtonEvent(GdkEventButton *b)
       if (hwnd2) hwnd2->Release();
       hwnd2 = hwnd3;
       if (hwnd2) hwnd2->Retain();
-      p2.x = (int)b->x;
-      p2.y = (int)b->y;
+      p2.x = (int)b->x_root;
+      p2.y = (int)b->y_root;
       ScreenToClient(hwnd2, &p2);
     }
 
