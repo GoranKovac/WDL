@@ -3639,7 +3639,8 @@ int SWELL_ShowCursor(BOOL bShow)
     g_swell_mouse_relmode_curpos_y = y1;
     s_last_cursor = GetCursor();
     SetCursor((HCURSOR)gdk_cursor_new_for_display(gdk_display_get_default(),GDK_BLANK_CURSOR));
-    //g_swell_mouse_relmode=true;
+    //NOTE: WAYLAND needs to be relative in wayland or knobs are wonky (when cursor gets hidden)
+    g_swell_mouse_relmode=true;
   }
   if (s_cursor_vis_cnt==0 && bShow) 
   {
