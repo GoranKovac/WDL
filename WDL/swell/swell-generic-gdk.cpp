@@ -22,7 +22,6 @@
 
 
 #ifndef SWELL_PROVIDED_BY_APP
-#define SWELL_TARGET_GDK
 #include "xwayland-bridge.h"
 #include "swell.h"
 
