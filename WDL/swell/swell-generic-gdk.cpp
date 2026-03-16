@@ -791,7 +791,7 @@ void swell_oswindow_manage(HWND hwnd, bool wantfocus)
             {
               gdk_window_set_transient_for(hwnd->m_oswindow,transient_for);
               if (modal)
-                gdk_window_set_modal_hint(hwnd->m_oswindow,true);
+                gtk_window_set_modal(GTK_WINDOW(gtk_win), TRUE);
             }
 
             if (modal) type_hint = GDK_WINDOW_TYPE_HINT_DIALOG;
