@@ -22,7 +22,8 @@
 
 
 #ifndef SWELL_PROVIDED_BY_APP
-
+#define SWELL_TARGET_GDK
+#include "xwayland-bridge.h"
 #include "swell.h"
 
 //#define SWELL_GDK_IMPROVE_WINDOWRECT // does not work yet (gdk_window_get_frame_extents() does not seem to be sufficiently reliable)
@@ -376,6 +377,9 @@ void SWELL_initargs(int *argc, char ***argv)
 #endif
     if (SWELL_gdk_active > 0)
     {
+#ifdef USE_WAYLAND_BRIDGE
+      init_private_xwayland();
+#endif
       char buf[1024];
       GetModuleFileName(NULL,buf,sizeof(buf));
       WDL_remove_filepart(buf);
@@ -2589,6 +2593,7 @@ struct bridgeState {
   RECT lastrect;
 
   GLXContext gl_ctx;
+  void *x11_capture;
 };
 
 static bridgeState *s_last_gl_ctx;
@@ -2632,6 +2637,7 @@ bridgeState::bridgeState(bool needrep, GdkWindow *_w, Window _nw, Display *_disp
   cur_parent = _curpar;
   memset(&lastrect,0,sizeof(lastrect));
   filter_windows.Add(this);
+  x11_capture = NULL;
 }
 
 static LRESULT xbridgeProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam)
@@ -3302,6 +3308,9 @@ static GdkFilterReturn filterCreateShowProc(GdkXEvent *xev, GdkEvent *event, gpo
 
 HWND SWELL_CreateXBridgeWindow(HWND viewpar, void **wref, const RECT *r)
 {
+  #ifdef USE_WAYLAND_BRIDGE
+    return xw_bridge_create(viewpar, wref, r, "REAPERXBridge");
+  #endif
   HWND hwnd = NULL;
   *wref = NULL;
 
