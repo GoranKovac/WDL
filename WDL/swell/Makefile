@@ -88,6 +88,7 @@ CFLAGS += -O2 -DNDEBUG
 endif
 
 LINKEXTRA =  -lpthread -ldl 
+LINKEXTRA += -lX11 -lXcomposite -lXtst
 
 
 EXTRA_OBJS = 
@@ -101,7 +102,7 @@ SWELL_OBJS = swell.o swell-ini.o swell-miscdlg-generic.o swell-wnd-generic.o \
              swell-menu-generic.o swell-kb-generic.o swell-dlg-generic.o \
              swell-gdi-generic.o swell-misc-generic.o swell-gdi-lice.o \
              swell-generic-headless.o swell-generic-gdk.o \
-             swell-appstub-generic.o swell-modstub-generic.o 
+             swell-appstub-generic.o swell-modstub-generic.o xwayland-bridge.o 
 
 LICE_OBJS = lice.o  lice_arc.o lice_colorspace.o lice_line.o lice_text.o \
             lice_textnew.o lice_ico.o lice_bmp.o
@@ -158,6 +159,11 @@ ifndef NOGDK
 endif
 
 CXXFLAGS = $(CFLAGS)
+
+ifeq ($(USE_WAYLAND_BRIDGE),1)
+  CXXFLAGS += -DUSE_WAYLAND_BRIDGE
+endif
+
 
 default: libSwell$(DLL_EXT)
 

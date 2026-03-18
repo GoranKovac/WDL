@@ -1199,14 +1199,31 @@ static void OnConfigureEvent(GdkEventConfigure *cfg)
   if (flag&2) SendMessage(hwnd,WM_SIZE,hwnd->m_is_maximized ? SIZE_MAXIMIZED : SIZE_RESTORED,0);
   if (!hwnd->m_hashaddestroy && hwnd->m_oswindow && (hwnd->m_style & WS_THICKFRAME))
     swell_recalcMinMaxInfo(hwnd);
-  if (hwnd->m_parent == NULL) // main window
+
+  if (hwnd->m_parent == NULL)
   {
-    int wx=0,wy=0;
-    gdk_window_get_origin(hwnd->m_oswindow, &wx, &wy);
-    lastMainWindowRect.left   = wx;
-    lastMainWindowRect.top    = wy;
-    lastMainWindowRect.right  = wx + cfg->width;
-    lastMainWindowRect.bottom = wy + cfg->height;
+    static void (*get_geometry)(void*, GdkRectangle*);
+    static void* (*get_mon_at_win)(GdkDisplay*, GdkWindow*);
+    static bool dlsym_checked;
+    if (!dlsym_checked)
+    {
+      dlsym_checked = true;
+      *(void**)&get_mon_at_win = dlsym(RTLD_DEFAULT, "gdk_display_get_monitor_at_window");
+      *(void**)&get_geometry = dlsym(RTLD_DEFAULT, "gdk_monitor_get_geometry");
+    }
+    if (get_mon_at_win && get_geometry)
+    {
+      void *mon = get_mon_at_win(gdk_window_get_display(hwnd->m_oswindow), hwnd->m_oswindow);
+      if (mon)
+      {
+        GdkRectangle rc = {0,0,1920,1080};
+        get_geometry(mon, &rc);
+        lastMainWindowRect.left   = rc.x;
+        lastMainWindowRect.top    = rc.y;
+        lastMainWindowRect.right  = rc.x + rc.width;
+        lastMainWindowRect.bottom = rc.y + rc.height;
+      }
+    }
   }
 }
 
@@ -2133,39 +2150,37 @@ void SWELL_GetViewPort(RECT *r, const RECT *sourcerect, bool wantWork)
   r->right=1024;
   r->bottom=768;
   if (!swell_initwindowsys()) return;
+
+  // Wayland: use monitor rect from OnConfigureEvent, normalize to window-relative coords
+  if (lastMainWindowRect.right > lastMainWindowRect.left &&
+      lastMainWindowRect.bottom > lastMainWindowRect.top)
+  {
+    r->left = 0;
+    r->top = 0;
+    r->right = lastMainWindowRect.right - lastMainWindowRect.left;
+    r->bottom = lastMainWindowRect.bottom - lastMainWindowRect.top;
+    return;
+  }
+
+  // original fallback
   GdkScreen *defscr = gdk_screen_get_default();
   if (!defscr) return;
-
-  //NOTE: WAYLAND RETURN CURRENT APP SCREEN FROM ONCONFIGUREEVENT
-  #ifdef GDK_WINDOWING_WAYLAND
-    if (lastMainWindowRect.right > lastMainWindowRect.left &&
-      lastMainWindowRect.bottom > lastMainWindowRect.top)
-    {
-      *r = lastMainWindowRect;
-       return;
-    }
-  #endif
-
   const gint n = gdk_screen_get_n_monitors(defscr);
   if (n < 1) return;
-
   const gint prim = gdk_screen_get_primary_monitor(defscr);
   double best_score = -1e20;
   RECT sr;
   if (sourcerect) sr = *sourcerect;
-
   for (gint idx = 0; idx < n; idx ++)
   {
     GdkRectangle rc={0,0,1024,1024};
     if (!sourcerect && prim>0) idx = prim;
-
 #if SWELL_TARGET_GDK != 2
     if (wantWork)
       gdk_screen_get_monitor_workarea(defscr,idx,&rc);
     else
 #endif
       gdk_screen_get_monitor_geometry(defscr,idx,&rc);
-
     RECT tmp;
     tmp.left=rc.x;
     tmp.top=rc.y;
@@ -2176,7 +2191,6 @@ void SWELL_GetViewPort(RECT *r, const RECT *sourcerect, bool wantWork)
       *r = tmp;
       break;
     }
-
     double score;
     RECT res;
     if (IntersectRect(&res, &tmp, &sr))
@@ -2192,7 +2206,6 @@ void SWELL_GetViewPort(RECT *r, const RECT *sourcerect, bool wantWork)
       else if (tmp.top > sr.bottom) dy = tmp.top - sr.bottom;
       score = - (dx*dx + dy*dy);
     }
-
     if (!idx || score > best_score)
     {
       best_score = score;
