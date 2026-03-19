@@ -46,6 +46,11 @@ void init_private_xwayland()
 //------------------------------------------------------------
 // Structs
 //------------------------------------------------------------
+enum WindowType {
+    WINDOW_PLUGIN = 0,
+    WINDOW_MODAL  = 1,
+    WINDOW_POPUP  = 2
+};
 
 struct WindowRenderData {
     Display *dpy;
@@ -53,6 +58,7 @@ struct WindowRenderData {
     Window parent_win;
     Pixmap backing_pixmap;
     HWND hwnd;
+    WindowType type;
 };
 
 struct X11CaptureState {
@@ -82,10 +88,6 @@ struct bridgeState {
     void *x11_capture;
 };
 
-//------------------------------------------------------------
-// Helpers
-//------------------------------------------------------------
-
 static void set_wm_state(Display *dpy, Window win, int state)
 {
     XWindowAttributes attr;
@@ -102,9 +104,144 @@ static void set_wm_state(Display *dpy, Window win, int state)
 }
 
 //------------------------------------------------------------
+// Window classification
+//------------------------------------------------------------
+struct MotifWmHints {
+    unsigned long flags;
+    unsigned long functions;
+    unsigned long decorations;
+    long input_mode;
+    unsigned long status;
+};
+
+#define MWM_HINTS_DECORATIONS (1L << 1)
+
+static bool hasMotifHints(Display *dpy, Window win, MotifWmHints &hints_out)
+{
+    Atom atom_motif_hints = XInternAtom(dpy, "_MOTIF_WM_HINTS", True);
+    if (atom_motif_hints == None) return false;
+
+    Atom actual_type;
+    int actual_format;
+    unsigned long nitems, bytes_after;
+    unsigned char *prop = nullptr;
+
+    int status = XGetWindowProperty(dpy, win, atom_motif_hints, 0, 5, False, atom_motif_hints,
+                                    &actual_type, &actual_format, &nitems, &bytes_after, &prop);
+
+    if (status != Success || !prop || actual_format != 32 || nitems < 5)
+    {
+        if (prop) XFree(prop);
+        return false;
+    }
+
+    const long *l = reinterpret_cast<long*>(prop);
+    hints_out.flags       = l[0];
+    hints_out.functions   = l[1];
+    hints_out.decorations = l[2];
+    hints_out.input_mode  = l[3];
+    hints_out.status      = l[4];
+    XFree(prop);
+    return true;
+}
+
+static bool is_window_from_owned_plugin(Display *dpy, Window win, X11CaptureState *state)
+{
+    Atom atom_pid = XInternAtom(dpy, "_NET_WM_PID", False);
+    Atom actual_type;
+    int actual_format;
+    unsigned long nitems, bytes_after;
+    unsigned char *prop = NULL;
+
+    pid_t window_pid = 0;
+    if (XGetWindowProperty(dpy, win, atom_pid, 0, 1, False, XA_CARDINAL,
+                           &actual_type, &actual_format, &nitems, &bytes_after, &prop) == Success)
+    {
+        if (prop && nitems > 0) { window_pid = *((pid_t*)prop); XFree(prop); }
+    }
+
+    pid_t our_pid = 0;
+    if (XGetWindowProperty(dpy, state->main_plugin_gui, atom_pid, 0, 1, False, XA_CARDINAL,
+                           &actual_type, &actual_format, &nitems, &bytes_after, &prop) == Success)
+    {
+        if (prop && nitems > 0) { our_pid = *((pid_t*)prop); XFree(prop); }
+    }
+
+    return (window_pid != 0 && our_pid != 0 && window_pid == our_pid);
+}
+
+static bool classify_popup(Display *dpy, Window win, XWindowAttributes *attr)
+{
+    if (!dpy || !win) return false;
+
+    MotifWmHints hints;
+    bool motif_popup = false;
+    if (hasMotifHints(dpy, win, hints))
+        motif_popup = (hints.flags & MWM_HINTS_DECORATIONS) && hints.decorations == 0;
+
+    Atom atom_window_type        = XInternAtom(dpy, "_NET_WM_WINDOW_TYPE", False);
+    Atom atom_type_normal        = XInternAtom(dpy, "_NET_WM_WINDOW_TYPE_NORMAL", False);
+    Atom atom_type_dialog        = XInternAtom(dpy, "_NET_WM_WINDOW_TYPE_DIALOG", False);
+    Atom atom_type_popup_menu    = XInternAtom(dpy, "_NET_WM_WINDOW_TYPE_POPUP_MENU", False);
+    Atom atom_type_menu          = XInternAtom(dpy, "_NET_WM_WINDOW_TYPE_MENU", False);
+    Atom atom_type_dropdown_menu = XInternAtom(dpy, "_NET_WM_WINDOW_TYPE_DROPDOWN_MENU", False);
+    Atom atom_type_tooltip       = XInternAtom(dpy, "_NET_WM_WINDOW_TYPE_TOOLTIP", False);
+    Atom atom_type_dnd           = XInternAtom(dpy, "_NET_WM_WINDOW_TYPE_DND", False);
+    Atom atom_type_utility       = XInternAtom(dpy, "_NET_WM_WINDOW_TYPE_UTILITY", False);
+
+    bool override_redirect = attr->override_redirect;
+    bool is_popup = override_redirect;
+
+    Window transient_for = None;
+    XGetTransientForHint(dpy, win, &transient_for);
+
+    std::vector<Atom> window_types;
+    Atom actual_type;
+    int actual_format;
+    unsigned long nitems = 0, bytes_after = 0;
+    unsigned char *prop = nullptr;
+
+    if (XGetWindowProperty(dpy, win, atom_window_type, 0, 10,
+                           False, XA_ATOM, &actual_type, &actual_format,
+                           &nitems, &bytes_after, &prop) == Success)
+    {
+        if (prop && actual_format == 32 && nitems > 0)
+        {
+            Atom *atoms = (Atom*)prop;
+            window_types.assign(atoms, atoms + nitems);
+        }
+        if (prop) XFree(prop);
+    }
+
+    if (window_types.empty())
+    {
+        if (!override_redirect && transient_for != None)
+            window_types.push_back(atom_type_dialog);
+        else
+            window_types.push_back(atom_type_normal);
+    }
+
+    for (Atom ty : window_types)
+    {
+        if (ty == atom_type_normal)
+            is_popup = override_redirect || motif_popup;
+        else if (ty == atom_type_dialog || ty == atom_type_utility)
+            is_popup = override_redirect;
+        else if (ty == atom_type_popup_menu || ty == atom_type_menu ||
+                 ty == atom_type_dropdown_menu || ty == atom_type_tooltip ||
+                 ty == atom_type_dnd)
+            is_popup = true;
+        else
+            continue;
+        break;
+    }
+
+    return is_popup;
+}
+
+//------------------------------------------------------------
 // Draw callbacks
 //------------------------------------------------------------
-
 static void window_render_data_destroy(gpointer data, GClosure *closure)
 {
     WindowRenderData *rd = (WindowRenderData*)data;
@@ -142,43 +279,114 @@ static gboolean plugin_draw_callback(GtkWidget *widget, cairo_t *cr, gpointer da
 //------------------------------------------------------------
 // Input handlers
 //------------------------------------------------------------
-
-static gboolean plugin_button_press(GtkWidget *widget, GdkEventButton *e, gpointer data)
+static gboolean window_button_press(GtkWidget *widget, GdkEventButton *e, gpointer data)
 {
     WindowRenderData *rd = (WindowRenderData*)data;
     if (!rd || !rd->dpy || !rd->x11_win) return FALSE;
 
-    if (rd->hwnd) SetFocus(rd->hwnd);
+    if (rd->type == WINDOW_PLUGIN)
+    {
+        if (rd->hwnd) SetFocus(rd->hwnd);
+        XRaiseWindow(rd->dpy, rd->parent_win);
+        XFlush(rd->dpy);
+        XTestFakeMotionEvent(rd->dpy, DefaultScreen(rd->dpy), (int)e->x, (int)e->y, CurrentTime);
+    }
+    else
+    {
+        Window child_return;
+        int win_x, win_y;
+        XTranslateCoordinates(rd->dpy, rd->x11_win, DefaultRootWindow(rd->dpy),
+                              (int)e->x, (int)e->y, &win_x, &win_y, &child_return);
+        XTestFakeMotionEvent(rd->dpy, DefaultScreen(rd->dpy), win_x, win_y, CurrentTime);
+    }
 
-    XRaiseWindow(rd->dpy, rd->parent_win);
-    XFlush(rd->dpy);
-
-    XTestFakeMotionEvent(rd->dpy, DefaultScreen(rd->dpy), (int)e->x, (int)e->y, CurrentTime);
     XTestFakeButtonEvent(rd->dpy, e->button, True, CurrentTime);
     XFlush(rd->dpy);
     return TRUE;
 }
 
-static gboolean plugin_button_release(GtkWidget *widget, GdkEventButton *e, gpointer data)
+static gboolean window_button_release(GtkWidget *widget, GdkEventButton *e, gpointer data)
 {
     WindowRenderData *rd = (WindowRenderData*)data;
     if (!rd || !rd->dpy || !rd->x11_win) return FALSE;
+
+    if (rd->type != WINDOW_PLUGIN)
+    {
+        Window child_return;
+        int win_x, win_y;
+        XTranslateCoordinates(rd->dpy, rd->x11_win, DefaultRootWindow(rd->dpy),
+                              (int)e->x, (int)e->y, &win_x, &win_y, &child_return);
+        XTestFakeMotionEvent(rd->dpy, DefaultScreen(rd->dpy), win_x, win_y, CurrentTime);
+    }
 
     XTestFakeButtonEvent(rd->dpy, e->button, False, CurrentTime);
     XFlush(rd->dpy);
     return TRUE;
 }
 
-static gboolean plugin_motion(GtkWidget *widget, GdkEventMotion *e, gpointer data)
+static gboolean window_motion(GtkWidget *widget, GdkEventMotion *e, gpointer data)
 {
     WindowRenderData *rd = (WindowRenderData*)data;
     if (!rd || !rd->dpy || !rd->x11_win) return FALSE;
 
-    XTestFakeMotionEvent(rd->dpy, DefaultScreen(rd->dpy), (int)e->x, (int)e->y, CurrentTime);
+    if (rd->type == WINDOW_PLUGIN)
+    {
+        XTestFakeMotionEvent(rd->dpy, DefaultScreen(rd->dpy), (int)e->x, (int)e->y, CurrentTime);
+    }
+    else
+    {
+        Window child_return;
+        int win_x, win_y;
+        XTranslateCoordinates(rd->dpy, rd->x11_win, DefaultRootWindow(rd->dpy),
+                              (int)e->x, (int)e->y, &win_x, &win_y, &child_return);
+        XTestFakeMotionEvent(rd->dpy, DefaultScreen(rd->dpy), win_x, win_y, CurrentTime);
+    }
+
     XFlush(rd->dpy);
     return TRUE;
 }
 
+static gboolean window_key_press(GtkWidget *widget, GdkEventKey *e, gpointer data)
+{
+    WindowRenderData *rd = (WindowRenderData*)data;
+    if (!rd || !rd->dpy || !rd->x11_win) return FALSE;
+
+    XKeyEvent xev;
+    memset(&xev, 0, sizeof(xev));
+    xev.type = KeyPress;
+    xev.display = rd->dpy;
+    xev.window = rd->x11_win;
+    xev.root = DefaultRootWindow(rd->dpy);
+    xev.time = CurrentTime;
+    xev.keycode = e->hardware_keycode;
+    xev.state = e->state;
+    xev.same_screen = True;
+
+    XSendEvent(rd->dpy, rd->x11_win, True, KeyPressMask, (XEvent*)&xev);
+    XFlush(rd->dpy);
+    return TRUE;
+}
+
+static gboolean window_key_release(GtkWidget *widget, GdkEventKey *e, gpointer data)
+{
+    WindowRenderData *rd = (WindowRenderData*)data;
+    if (!rd || !rd->dpy || !rd->x11_win) return FALSE;
+
+    XKeyEvent xev;
+    memset(&xev, 0, sizeof(xev));
+    xev.type = KeyRelease;
+    xev.display = rd->dpy;
+    xev.window = rd->x11_win;
+    xev.root = DefaultRootWindow(rd->dpy);
+    xev.time = CurrentTime;
+    xev.keycode = e->hardware_keycode;
+    xev.state = e->state;
+    xev.same_screen = True;
+
+    XSendEvent(rd->dpy, rd->x11_win, True, KeyReleaseMask, (XEvent*)&xev);
+    XFlush(rd->dpy);
+    return TRUE;
+}
 //------------------------------------------------------------
 // Key forwarding
 //------------------------------------------------------------
@@ -212,6 +420,29 @@ bool xw_forward_key(HWND hwnd, int keycode, int state, bool is_press)
 //------------------------------------------------------------
 // Window management
 //------------------------------------------------------------
+static void connect_window_signals(GtkWidget *event_widget, GtkWidget *key_widget, WindowRenderData *rd)
+{
+    gtk_widget_add_events(event_widget,
+        GDK_BUTTON_PRESS_MASK | GDK_BUTTON_RELEASE_MASK | GDK_POINTER_MOTION_MASK);
+
+    g_signal_connect_data(event_widget, "draw",
+        G_CALLBACK(plugin_draw_callback), rd, window_render_data_destroy, (GConnectFlags)0);
+    g_signal_connect_data(event_widget, "button-press-event",
+        G_CALLBACK(window_button_press), rd, NULL, (GConnectFlags)0);
+    g_signal_connect_data(event_widget, "button-release-event",
+        G_CALLBACK(window_button_release), rd, NULL, (GConnectFlags)0);
+    g_signal_connect_data(event_widget, "motion-notify-event",
+        G_CALLBACK(window_motion), rd, NULL, (GConnectFlags)0);
+
+    if (key_widget)
+    {
+        gtk_widget_add_events(key_widget, GDK_KEY_PRESS_MASK | GDK_KEY_RELEASE_MASK);
+        g_signal_connect_data(key_widget, "key-press-event",
+            G_CALLBACK(window_key_press), rd, NULL, (GConnectFlags)0);
+        g_signal_connect_data(key_widget, "key-release-event",
+            G_CALLBACK(window_key_release), rd, NULL, (GConnectFlags)0);
+    }
+}
 
 static void handle_new_plugin_window(Display *dpy, Window win, Window parent_win, X11CaptureState *state, XWindowAttributes *attr, HWND hwnd)
 {
@@ -226,24 +457,58 @@ static void handle_new_plugin_window(Display *dpy, Window win, Window parent_win
     rd->parent_win = parent_win;
     rd->backing_pixmap = backing_pixmap;
     rd->hwnd = hwnd;
+    rd->type = WINDOW_PLUGIN;
 
     state->plugin_widget = hwnd->m_oswidget;
 
-    gtk_widget_add_events(hwnd->m_oswidget,
-        GDK_BUTTON_PRESS_MASK | GDK_BUTTON_RELEASE_MASK | GDK_POINTER_MOTION_MASK);
-
-    g_signal_connect_data(hwnd->m_oswidget, "draw",
-        G_CALLBACK(plugin_draw_callback), rd, window_render_data_destroy, (GConnectFlags)0);
-    g_signal_connect_data(hwnd->m_oswidget, "button-press-event",
-        G_CALLBACK(plugin_button_press), rd, NULL, (GConnectFlags)0);
-    g_signal_connect_data(hwnd->m_oswidget, "button-release-event",
-        G_CALLBACK(plugin_button_release), rd, NULL, (GConnectFlags)0);
-    g_signal_connect_data(hwnd->m_oswidget, "motion-notify-event",
-        G_CALLBACK(plugin_motion), rd, NULL, (GConnectFlags)0);
-
+    connect_window_signals(hwnd->m_oswidget, NULL, rd);
     gtk_widget_queue_draw(hwnd->m_oswidget);
 
     X11_PRINT("Plugin window set up: 0x%lx parent=0x%lx\n", win, parent_win);
+}
+
+static void handle_new_modal_window(Display *dpy, Window win, X11CaptureState *state, XWindowAttributes *attr, HWND hwnd)
+{
+    XCompositeRedirectWindow(dpy, win, CompositeRedirectAutomatic);
+    Pixmap backing_pixmap = XCompositeNameWindowPixmap(dpy, win);
+
+    // Create GTK toplevel window
+    GtkWidget *gtk_win = gtk_window_new(GTK_WINDOW_TOPLEVEL);
+    gtk_window_set_decorated(GTK_WINDOW(gtk_win), TRUE);
+    gtk_window_set_resizable(GTK_WINDOW(gtk_win), FALSE);
+
+    // Set transient for plugin's toplevel
+    if (state->plugin_widget)
+    {
+        GtkWidget *toplevel = gtk_widget_get_toplevel(state->plugin_widget);
+        if (toplevel && GTK_IS_WINDOW(toplevel))
+            gtk_window_set_transient_for(GTK_WINDOW(gtk_win), GTK_WINDOW(toplevel));
+    }
+
+    gtk_window_resize(GTK_WINDOW(gtk_win), attr->width, attr->height);
+    gtk_window_move(GTK_WINDOW(gtk_win), attr->x, attr->y);
+
+    // Create drawing area
+    GtkWidget *draw_area = gtk_drawing_area_new();
+    gtk_widget_set_size_request(draw_area, attr->width, attr->height);
+    gtk_container_add(GTK_CONTAINER(gtk_win), draw_area);
+
+    WindowRenderData *rd = new WindowRenderData();
+    rd->dpy = dpy;
+    rd->x11_win = win;
+    rd->parent_win = state->parent_win;
+    rd->backing_pixmap = backing_pixmap;
+    rd->hwnd = hwnd;
+    rd->type = WINDOW_MODAL;
+
+    connect_window_signals(draw_area, gtk_win, rd);
+
+    gtk_widget_show_all(gtk_win);
+
+    state->child_windows[win] = gtk_win;
+
+    X11_PRINT("Modal window created: 0x%lx size=%dx%d pos=%d,%d\n",
+        win, attr->width, attr->height, attr->x, attr->y);
 }
 
 static void handle_xs_events(bridgeState *bs, X11CaptureState *capture, HWND hwnd)
@@ -286,7 +551,25 @@ static void handle_xs_events(bridgeState *bs, X11CaptureState *capture, HWND hwn
                 if (capture->child_windows.find(mapped_win) != capture->child_windows.end())
                     break;
 
-                // Phase 2: handle modals
+                if (!is_window_from_owned_plugin(capture->dpy, mapped_win, capture))
+                {
+                    X11_PRINT("  Not from owned plugin, skipping\n");
+                    break;
+                }
+
+                XWindowAttributes attr;
+                if (!XGetWindowAttributes(capture->dpy, mapped_win, &attr) ||
+                    attr.map_state != IsViewable)
+                    break;
+
+                bool is_popup = classify_popup(capture->dpy, mapped_win, &attr);
+                X11_PRINT("  mapped_win=0x%lx is_popup=%d size=%dx%d\n", 
+                            mapped_win, is_popup, attr.width, attr.height);
+
+                if (!is_popup)
+                {
+                    handle_new_modal_window(capture->dpy, mapped_win, capture, &attr, hwnd);
+                }
                 // Phase 3: handle popups
             }
             break;
@@ -409,8 +692,23 @@ static gboolean xw_capture_update(HWND hwnd)
             capture->child_windows.erase(win);
     }
 
+    // Redraw plugin
     if (capture && hwnd->m_oswidget)
         gtk_widget_queue_draw(hwnd->m_oswidget);
+
+    // Redraw modals/popups
+    if (capture)
+    {
+        for (auto &pair : capture->child_windows)
+        {
+            if (GTK_IS_WINDOW(pair.second))
+            {
+                GtkWidget *draw_area = gtk_bin_get_child(GTK_BIN(pair.second));
+                if (draw_area)
+                    gtk_widget_queue_draw(draw_area);
+            }
+        }
+    }
 
     return TRUE;
 }
@@ -418,7 +716,6 @@ static gboolean xw_capture_update(HWND hwnd)
 //------------------------------------------------------------
 // Cleanup
 //------------------------------------------------------------
-
 static void cleanup_x11_capture(X11CaptureState *state)
 {
     if (!state) return;
