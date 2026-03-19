@@ -1441,6 +1441,16 @@ static void OnKeyEvent(GdkEventKey *k)
   HWND hwnd = swell_oswindow_to_hwnd(k->window);
   if (!hwnd) return;
 
+  // Forward keys to xwayland bridge if focused
+  {
+    HWND foc = GetFocusIncludeMenus();
+    if (foc && foc->m_classname && !strcmp(foc->m_classname, "REAPERXBridge"))
+    {
+      xw_forward_key(foc, k->hardware_keycode, k->state, k->type == GDK_KEY_PRESS);
+      return;
+    }
+  }
+
   int modifiers = 0;
   if (k->state&GDK_CONTROL_MASK) modifiers|=FCONTROL;
   if (k->state&GDK_MOD1_MASK) modifiers|=FALT;
