@@ -519,18 +519,40 @@ static void handle_new_modal_window(Display *dpy, Window win, X11CaptureState *s
 
 static void handle_new_popup_window(Display *dpy, Window win, X11CaptureState *state, XWindowAttributes *attr, HWND hwnd)
 {
+    // get top-most parent popup
+    GtkWidget *parent_popup = nullptr;
+
+    // look for last mapped popup
+    for (auto it = state->child_windows.rbegin(); it != state->child_windows.rend(); ++it) {
+        GtkWidget *popup = it->second;
+        if (GTK_IS_WINDOW(popup) && gtk_widget_get_realized(popup)) {
+            GdkWindow *gdk_win = gtk_widget_get_window(popup);
+            if (gdk_win && gdk_window_is_visible(gdk_win)) {
+                parent_popup = popup;
+                break;
+            }
+        }
+    }
+
+    // fallback to main plugin window if none
+    if (!parent_popup && state->plugin_widget) {
+        parent_popup = gtk_widget_get_toplevel(state->plugin_widget);
+    }
+
     XCompositeRedirectWindow(dpy, win, CompositeRedirectAutomatic);
     Pixmap backing_pixmap = XCompositeNameWindowPixmap(dpy, win);
 
     GtkWidget *gtk_win = gtk_window_new(GTK_WINDOW_POPUP);
     gtk_window_set_decorated(GTK_WINDOW(gtk_win), FALSE);
+    gtk_window_set_resizable(GTK_WINDOW(gtk_win), FALSE);
 
-    // Set transient for plugin toplevel
-    if (state->plugin_widget)
-    {
-        GtkWidget *toplevel = gtk_widget_get_toplevel(state->plugin_widget);
-        if (toplevel && GTK_IS_WINDOW(toplevel))
-            gtk_window_set_transient_for(GTK_WINDOW(gtk_win), GTK_WINDOW(toplevel));
+    gtk_window_set_type_hint(GTK_WINDOW(gtk_win), GDK_WINDOW_TYPE_HINT_POPUP_MENU);
+    gtk_window_set_keep_above(GTK_WINDOW(gtk_win), TRUE);
+    gtk_window_set_gravity(GTK_WINDOW(gtk_win), GDK_GRAVITY_STATIC);
+
+    if (parent_popup) {
+        gtk_window_set_transient_for(GTK_WINDOW(gtk_win), GTK_WINDOW(parent_popup));
+        DEBUG_PRINT("  GTK transient set to parent popup %p\n", parent_popup);
     }
 
     // Translate X11 coords to absolute screen coords
