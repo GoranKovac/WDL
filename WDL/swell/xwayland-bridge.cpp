@@ -602,9 +602,10 @@ static void handle_xs_events(bridgeState *bs, X11CaptureState *capture, HWND hwn
                 if (mapped_win == capture->parent_win ||
                     mapped_win == capture->plugin_win ||
                     mapped_win == capture->main_plugin_gui){
-                        DEBUG_PRINT("MapNotify: skipping main plugin \n");
-                        break;
-                    }
+                    DEBUG_PRINT("MapNotify: skipping main plugin \n");
+                    break;
+                }
+
                 if (capture->child_windows.find(mapped_win) != capture->child_windows.end())
                     break;
 
@@ -619,7 +620,6 @@ static void handle_xs_events(bridgeState *bs, X11CaptureState *capture, HWND hwn
                     attr.map_state != IsViewable)
                     break;
 
-                DEBUG_PRINT("MapNotify222: 0x%lx\n", mapped_win);
                 bool is_popup = classify_popup(capture->dpy, mapped_win, &attr);
                 DEBUG_PRINT("  mapped_win=0x%lx is_popup=%d size=%dx%d\n", 
                             mapped_win, is_popup, attr.width, attr.height);
