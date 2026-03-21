@@ -519,6 +519,14 @@ static void handle_new_modal_window(Display *dpy, Window win, X11CaptureState *s
 
 static void handle_new_popup_window(Display *dpy, Window win, X11CaptureState *state, XWindowAttributes *attr, HWND hwnd)
 {
+    //Juce fix.... shadows....
+    if ((attr->width <= 1 || attr->height <= 1)) {
+        return;
+    }
+    if ((attr->width == 12 || attr->height == 12)) {
+        return;
+    }
+
     // get top-most parent popup
     GtkWidget *parent_popup = nullptr;
 
