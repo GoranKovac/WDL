@@ -1,4 +1,4 @@
-#ifdef _DEBUG
+#ifdef DEBUG_INFO
 #define DEBUG_PRINT(...) fprintf(stderr, __VA_ARGS__)
 #else
 #define DEBUG_PRINT(...) ((void)0)
@@ -64,7 +64,6 @@ struct X11CaptureState {
     Window plugin_win;
     Window main_plugin_gui;
     int gtk_x, gtk_y;
-    // int width, height;
     Pixmap backing_pixmap;
     std::map<Window, GtkWidget*> child_windows;
     GtkWidget *plugin_widget;
@@ -479,12 +478,10 @@ static void handle_new_modal_window(Display *dpy, Window win, X11CaptureState *s
     XCompositeRedirectWindow(dpy, win, CompositeRedirectAutomatic);
     Pixmap backing_pixmap = XCompositeNameWindowPixmap(dpy, win);
 
-    // Create GTK toplevel window
     GtkWidget *gtk_win = gtk_window_new(GTK_WINDOW_TOPLEVEL);
     gtk_window_set_decorated(GTK_WINDOW(gtk_win), TRUE);
     gtk_window_set_resizable(GTK_WINDOW(gtk_win), FALSE);
 
-    // Set transient for plugin's toplevel
     if (state->plugin_widget)
     {
         GtkWidget *toplevel = gtk_widget_get_toplevel(state->plugin_widget);
@@ -495,7 +492,6 @@ static void handle_new_modal_window(Display *dpy, Window win, X11CaptureState *s
     gtk_window_resize(GTK_WINDOW(gtk_win), attr->width, attr->height);
     gtk_window_move(GTK_WINDOW(gtk_win), attr->x, attr->y);
 
-    // Create drawing area
     GtkWidget *draw_area = gtk_drawing_area_new();
     gtk_widget_set_size_request(draw_area, attr->width, attr->height);
     gtk_container_add(GTK_CONTAINER(gtk_win), draw_area);
