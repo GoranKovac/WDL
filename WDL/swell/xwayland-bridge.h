@@ -23,7 +23,6 @@
 
 #include <sys/prctl.h>
 
-extern Display *s_private_xwayland_display;
 void init_private_xwayland();
 HWND xw_bridge_create(
     HWND viewpar,
