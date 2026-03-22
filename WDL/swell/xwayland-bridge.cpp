@@ -1,7 +1,7 @@
 #ifdef _DEBUG
-  #define DEBUG_PRINT(...) fprintf(stderr, __VA_ARGS__)
+#define DEBUG_PRINT(...) fprintf(stderr, __VA_ARGS__)
 #else
-  #define DEBUG_PRINT(...) ((void)0)
+#define DEBUG_PRINT(...) ((void)0)
 #endif
 
 #include "xwayland-bridge.h"
@@ -21,7 +21,7 @@ static int x11_error_handler(Display *dpy, XErrorEvent *err)
     char buf[256];
     XGetErrorText(dpy, err->error_code, buf, sizeof(buf));
     DEBUG_PRINT("X11 Error (non-fatal): %s (request %d, resource 0x%lx)\n",
-              buf, err->request_code, err->resourceid);
+                buf, err->request_code, err->resourceid);
 #endif
     return 0;
 }
@@ -118,7 +118,7 @@ static X11CaptureState* setup_x11_capture(Display *dpy, Window parent_win, Windo
     set_wm_state(dpy, plugin_win, WM_STATE_NORMAL);
 
     XSelectInput(dpy, plugin_win,
-        ButtonPressMask | ButtonReleaseMask | PointerMotionMask | SubstructureNotifyMask);
+                 ButtonPressMask | ButtonReleaseMask | PointerMotionMask | SubstructureNotifyMask);
 
     XSelectInput(dpy, DefaultRootWindow(dpy), SubstructureNotifyMask);
     XFlush(dpy);
@@ -251,8 +251,8 @@ static bool classify_popup(Display *dpy, Window win, XWindowAttributes *attr)
         else if (ty == atom_type_dialog || ty == atom_type_utility)
             is_popup = override_redirect;
         else if (ty == atom_type_popup_menu || ty == atom_type_menu ||
-                 ty == atom_type_dropdown_menu || ty == atom_type_tooltip ||
-                 ty == atom_type_dnd)
+                ty == atom_type_dropdown_menu || ty == atom_type_tooltip ||
+                ty == atom_type_dnd)
             is_popup = true;
         else
             continue;
@@ -309,7 +309,7 @@ static gboolean window_button_press(GtkWidget *widget, GdkEventButton *e, gpoint
         XTestFakeMotionEvent(rd->dpy, DefaultScreen(rd->dpy), (int)e->x, (int)e->y, CurrentTime);
     }
     else
-    {
+{
         Window child_return;
         int win_x, win_y;
         XTranslateCoordinates(rd->dpy, rd->x11_win, DefaultRootWindow(rd->dpy),
@@ -351,7 +351,7 @@ static gboolean window_motion(GtkWidget *widget, GdkEventMotion *e, gpointer dat
         XTestFakeMotionEvent(rd->dpy, DefaultScreen(rd->dpy), (int)e->x, (int)e->y, CurrentTime);
     }
     else
-    {
+{
         Window child_return;
         int win_x, win_y;
         XTranslateCoordinates(rd->dpy, rd->x11_win, DefaultRootWindow(rd->dpy),
@@ -434,24 +434,24 @@ bool xw_forward_key(HWND hwnd, int keycode, int state, bool is_press)
 static void connect_window_signals(GtkWidget *event_widget, GtkWidget *key_widget, WindowRenderData *rd)
 {
     gtk_widget_add_events(event_widget,
-        GDK_BUTTON_PRESS_MASK | GDK_BUTTON_RELEASE_MASK | GDK_POINTER_MOTION_MASK);
+                          GDK_BUTTON_PRESS_MASK | GDK_BUTTON_RELEASE_MASK | GDK_POINTER_MOTION_MASK);
 
     g_signal_connect_data(event_widget, "draw",
-        G_CALLBACK(plugin_draw_callback), rd, window_render_data_destroy, (GConnectFlags)0);
+                          G_CALLBACK(plugin_draw_callback), rd, window_render_data_destroy, (GConnectFlags)0);
     g_signal_connect_data(event_widget, "button-press-event",
-        G_CALLBACK(window_button_press), rd, NULL, (GConnectFlags)0);
+                          G_CALLBACK(window_button_press), rd, NULL, (GConnectFlags)0);
     g_signal_connect_data(event_widget, "button-release-event",
-        G_CALLBACK(window_button_release), rd, NULL, (GConnectFlags)0);
+                          G_CALLBACK(window_button_release), rd, NULL, (GConnectFlags)0);
     g_signal_connect_data(event_widget, "motion-notify-event",
-        G_CALLBACK(window_motion), rd, NULL, (GConnectFlags)0);
+                          G_CALLBACK(window_motion), rd, NULL, (GConnectFlags)0);
 
     if (key_widget)
     {
         gtk_widget_add_events(key_widget, GDK_KEY_PRESS_MASK | GDK_KEY_RELEASE_MASK);
         g_signal_connect_data(key_widget, "key-press-event",
-            G_CALLBACK(window_key_press), rd, NULL, (GConnectFlags)0);
+                              G_CALLBACK(window_key_press), rd, NULL, (GConnectFlags)0);
         g_signal_connect_data(key_widget, "key-release-event",
-            G_CALLBACK(window_key_release), rd, NULL, (GConnectFlags)0);
+                              G_CALLBACK(window_key_release), rd, NULL, (GConnectFlags)0);
     }
 }
 
@@ -514,7 +514,7 @@ static void handle_new_modal_window(Display *dpy, Window win, X11CaptureState *s
     state->child_windows[win] = gtk_win;
 
     DEBUG_PRINT("Modal window created: 0x%lx size=%dx%d pos=%d,%d\n",
-        win, attr->width, attr->height, attr->x, attr->y);
+                win, attr->width, attr->height, attr->x, attr->y);
 }
 
 static void handle_new_popup_window(Display *dpy, Window win, X11CaptureState *state, XWindowAttributes *attr, HWND hwnd)
@@ -568,8 +568,8 @@ static void handle_new_popup_window(Display *dpy, Window win, X11CaptureState *s
     int screen_y = state->gtk_y + attr->y;
 
     DEBUG_PRINT("Popup: x11 pos=%d,%d gtk_offset=%d,%d screen_pos=%d,%d size=%dx%d\n",
-        attr->x, attr->y, state->gtk_x, state->gtk_y,
-        screen_x, screen_y, attr->width, attr->height);
+                attr->x, attr->y, state->gtk_x, state->gtk_y,
+                screen_x, screen_y, attr->width, attr->height);
 
     gtk_window_move(GTK_WINDOW(gtk_win), screen_x, screen_y);
     gtk_window_resize(GTK_WINDOW(gtk_win), attr->width, attr->height);
@@ -592,7 +592,7 @@ static void handle_new_popup_window(Display *dpy, Window win, X11CaptureState *s
     state->child_windows[win] = gtk_win;
 
     DEBUG_PRINT("Popup window created: 0x%lx size=%dx%d screen_pos=%d,%d\n",
-        win, attr->width, attr->height, screen_x, screen_y);
+                win, attr->width, attr->height, screen_x, screen_y);
 }
 
 static void handle_xs_events(bridgeState *bs, X11CaptureState *capture, HWND hwnd)
@@ -605,75 +605,75 @@ static void handle_xs_events(bridgeState *bs, X11CaptureState *capture, HWND hwn
         switch (xev.type)
         {
             case ConfigureNotify:
-            {
-                Window configured_win = xev.xconfigure.window;
-                DEBUG_PRINT("ConfigureNotify: 0x%lx\n", configured_win);
-
-                if ((configured_win == capture->parent_win ||
-                     configured_win == capture->plugin_win ||
-                     configured_win == capture->main_plugin_gui) &&
-                    capture->plugin_widget == NULL &&
-                    capture->main_plugin_gui != 0)
                 {
-                    DEBUG_PRINT("ConfigureNotify: triggering plugin setup for 0x%lx\n", capture->main_plugin_gui);
-                    XWindowAttributes attr;
-                    if (XGetWindowAttributes(capture->dpy, capture->main_plugin_gui, &attr))
-                        handle_new_plugin_window(capture->dpy, capture->main_plugin_gui, capture->parent_win, capture, &attr, hwnd);
+                    Window configured_win = xev.xconfigure.window;
+                    DEBUG_PRINT("ConfigureNotify: 0x%lx\n", configured_win);
+
+                    if ((configured_win == capture->parent_win ||
+                        configured_win == capture->plugin_win ||
+                        configured_win == capture->main_plugin_gui) &&
+                        capture->plugin_widget == NULL &&
+                        capture->main_plugin_gui != 0)
+                    {
+                        DEBUG_PRINT("ConfigureNotify: triggering plugin setup for 0x%lx\n", capture->main_plugin_gui);
+                        XWindowAttributes attr;
+                        if (XGetWindowAttributes(capture->dpy, capture->main_plugin_gui, &attr))
+                            handle_new_plugin_window(capture->dpy, capture->main_plugin_gui, capture->parent_win, capture, &attr, hwnd);
+                    }
                 }
-            }
-            break;
+                break;
             case MapNotify:
-            {
-                Window mapped_win = xev.xmap.window;
-                DEBUG_PRINT("MapNotify: 0x%lx\n", mapped_win);
-
-                set_wm_state(capture->dpy, mapped_win, WM_STATE_NORMAL);
-
-                if (mapped_win == capture->parent_win ||
-                    mapped_win == capture->plugin_win ||
-                    mapped_win == capture->main_plugin_gui){
-                    DEBUG_PRINT("MapNotify: skipping main plugin \n");
-                    break;
-                }
-
-                if (capture->child_windows.find(mapped_win) != capture->child_windows.end())
-                    break;
-
-                if (!is_window_from_owned_plugin(capture->dpy, mapped_win, capture))
                 {
-                    DEBUG_PRINT("  Not from owned plugin, skipping\n");
-                    break;
+                    Window mapped_win = xev.xmap.window;
+                    DEBUG_PRINT("MapNotify: 0x%lx\n", mapped_win);
+
+                    set_wm_state(capture->dpy, mapped_win, WM_STATE_NORMAL);
+
+                    if (mapped_win == capture->parent_win ||
+                        mapped_win == capture->plugin_win ||
+                        mapped_win == capture->main_plugin_gui){
+                        DEBUG_PRINT("MapNotify: skipping main plugin \n");
+                        break;
+                    }
+
+                    if (capture->child_windows.find(mapped_win) != capture->child_windows.end())
+                        break;
+
+                    if (!is_window_from_owned_plugin(capture->dpy, mapped_win, capture))
+                    {
+                        DEBUG_PRINT("  Not from owned plugin, skipping\n");
+                        break;
+                    }
+
+                    XWindowAttributes attr;
+                    if (!XGetWindowAttributes(capture->dpy, mapped_win, &attr) ||
+                        attr.map_state != IsViewable)
+                        break;
+
+                    bool is_popup = classify_popup(capture->dpy, mapped_win, &attr);
+                    DEBUG_PRINT("  mapped_win=0x%lx is_popup=%d size=%dx%d\n", 
+                                mapped_win, is_popup, attr.width, attr.height);
+
+                    if (!is_popup)
+                        handle_new_modal_window(capture->dpy, mapped_win, capture, &attr, hwnd);
+                    else
+                        handle_new_popup_window(capture->dpy, mapped_win, capture, &attr, hwnd);
                 }
-
-                XWindowAttributes attr;
-                if (!XGetWindowAttributes(capture->dpy, mapped_win, &attr) ||
-                    attr.map_state != IsViewable)
-                    break;
-
-                bool is_popup = classify_popup(capture->dpy, mapped_win, &attr);
-                DEBUG_PRINT("  mapped_win=0x%lx is_popup=%d size=%dx%d\n", 
-                            mapped_win, is_popup, attr.width, attr.height);
-
-                if (!is_popup)
-                    handle_new_modal_window(capture->dpy, mapped_win, capture, &attr, hwnd);
-                else
-                    handle_new_popup_window(capture->dpy, mapped_win, capture, &attr, hwnd);
-            }
-            break;
+                break;
             case UnmapNotify:
-            {
-                Window unmapped_win = xev.xunmap.window;
-                DEBUG_PRINT("UnmapNotify: 0x%lx\n", unmapped_win);
-
-                auto it = capture->child_windows.find(unmapped_win);
-                if (it != capture->child_windows.end())
                 {
-                    set_wm_state(capture->dpy, unmapped_win, WM_STATE_WITHDRAWN);
-                    gtk_widget_destroy(it->second);
-                    capture->child_windows.erase(it);
+                    Window unmapped_win = xev.xunmap.window;
+                    DEBUG_PRINT("UnmapNotify: 0x%lx\n", unmapped_win);
+
+                    auto it = capture->child_windows.find(unmapped_win);
+                    if (it != capture->child_windows.end())
+                    {
+                        set_wm_state(capture->dpy, unmapped_win, WM_STATE_WITHDRAWN);
+                        gtk_widget_destroy(it->second);
+                        capture->child_windows.erase(it);
+                    }
                 }
-            }
-            break;
+                break;
         }
     }
 }
@@ -711,7 +711,7 @@ static gboolean xw_capture_update(HWND hwnd)
                 XFlush(bs->native_disp);
             }
             else
-            {
+        {
                 RECT r = hwnd->m_position;
                 width = wdl_max(r.right - r.left, 1);
                 height = wdl_max(r.bottom - r.top, 1);
@@ -751,7 +751,7 @@ static gboolean xw_capture_update(HWND hwnd)
             }
         }
         for (Window win : to_remove)
-            capture->child_windows.erase(win);
+        capture->child_windows.erase(win);
     }
 
     // Redraw plugin
@@ -889,7 +889,7 @@ void xw_size(HWND hwnd)
             bs->need_reparent = false;
         }
         else
-        {
+    {
             gtk_fixed_move(GTK_FIXED(container), hwnd->m_oswidget, pos_x, pos_y);
             gtk_widget_set_size_request(hwnd->m_oswidget, r.right - r.left, r.bottom - r.top);
         }
@@ -897,8 +897,8 @@ void xw_size(HWND hwnd)
         if (GTK_IS_WINDOW(parent->m_oswidget))
         {
             gtk_widget_set_size_request(GTK_WIDGET(parent->m_oswidget),
-                pos_x + (r.right - r.left),
-                pos_y + (r.bottom - r.top));
+                                        pos_x + (r.right - r.left),
+                                        pos_y + (r.bottom - r.top));
             gtk_widget_queue_resize(GTK_WIDGET(parent->m_oswidget));
         }
     }
@@ -942,17 +942,17 @@ HWND xw_bridge_create(HWND viewpar, void **wref, const RECT *r, const char *brid
     Window root = RootWindow(disp, screen);
 
     Window w = XCreateSimpleWindow(disp, root, 0, 0,
-        wdl_max(r->right - r->left, 1),
-        wdl_max(r->bottom - r->top, 1),
-        0, BlackPixel(disp, screen), WhitePixel(disp, screen));
+                                   wdl_max(r->right - r->left, 1),
+                                   wdl_max(r->bottom - r->top, 1),
+                                   0, BlackPixel(disp, screen), WhitePixel(disp, screen));
 
     XMapWindow(disp, w);
     XFlush(disp);
 
     GtkWidget *draw_area = gtk_drawing_area_new();
     gtk_widget_set_size_request(draw_area,
-        wdl_max(r->right - r->left, 1),
-        wdl_max(r->bottom - r->top, 1));
+                                wdl_max(r->right - r->left, 1),
+                                wdl_max(r->bottom - r->top, 1));
 
     hwnd = new HWND__(viewpar, 0, r, NULL, true, xw_bridgeProc);
     hwnd->m_classname = bridge_class_name;
