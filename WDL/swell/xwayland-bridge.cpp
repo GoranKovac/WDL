@@ -1,4 +1,4 @@
-#ifdef DEBUG_INFO
+#ifdef _DEBUG
 #define DEBUG_PRINT(...) fprintf(stderr, __VA_ARGS__)
 #else
 #define DEBUG_PRINT(...) ((void)0)
@@ -49,15 +49,6 @@ enum WindowType {
     WINDOW_POPUP  = 2
 };
 
-struct WindowRenderData {
-    Display *dpy;
-    Window x11_win;
-    Window parent_win;
-    Pixmap backing_pixmap;
-    HWND hwnd;
-    WindowType type;
-};
-
 struct X11CaptureState {
     Display *dpy;
     Window parent_win;
@@ -67,7 +58,21 @@ struct X11CaptureState {
     Pixmap backing_pixmap;
     std::map<Window, GtkWidget*> child_windows;
     GtkWidget *plugin_widget;
+
+    Pixmap dnd_pixmap;
+    Window dnd_win;
+    int dnd_x, dnd_y;
 };
+struct WindowRenderData {
+    Display *dpy;
+    Window x11_win;
+    Window parent_win;
+    Pixmap backing_pixmap;
+    HWND hwnd;
+    WindowType type;
+    X11CaptureState *capture;
+};
+
 
 struct bridgeState {
     bridgeState(bool needrep, GdkWindow *_w, Window _nw, Display *_disp, GdkWindow *_curpar, HWND _hwnd_child);
@@ -113,6 +118,11 @@ static X11CaptureState* setup_x11_capture(Display *dpy, Window parent_win, Windo
     state->gtk_y = 0;
     state->plugin_widget = NULL;
     state->backing_pixmap = 0;
+
+    state->dnd_pixmap = 0;
+    state->dnd_win = 0;
+    state->dnd_x = 0;
+    state->dnd_y = 0;
 
     set_wm_state(dpy, plugin_win, WM_STATE_NORMAL);
 
@@ -264,7 +274,8 @@ static bool classify_popup(Display *dpy, Window win, XWindowAttributes *attr)
 static void window_render_data_destroy(gpointer data, GClosure *closure)
 {
     WindowRenderData *rd = (WindowRenderData*)data;
-    if (rd->backing_pixmap) XFreePixmap(rd->dpy, rd->backing_pixmap);
+    if (rd->backing_pixmap && rd->type != WINDOW_PLUGIN)
+        XFreePixmap(rd->dpy, rd->backing_pixmap);
     delete rd;
 }
 
@@ -279,16 +290,43 @@ static gboolean plugin_draw_callback(GtkWidget *widget, cairo_t *cr, gpointer da
 
     if (XGetGeometry(rd->dpy, rd->backing_pixmap, &root_ret, &x, &y, &w, &h, &border, &depth))
     {
+        XWindowAttributes win_attr;
+        Visual *visual = DefaultVisual(rd->dpy, DefaultScreen(rd->dpy));
+        if (XGetWindowAttributes(rd->dpy, rd->x11_win, &win_attr))
+            visual = win_attr.visual;
+
         cairo_surface_t *surface = cairo_xlib_surface_create(
             rd->dpy, rd->backing_pixmap,
-            DefaultVisual(rd->dpy, DefaultScreen(rd->dpy)),
-            w, h);
-
+            visual, w, h);
         if (surface)
         {
             cairo_set_source_surface(cr, surface, 0, 0);
             cairo_paint(cr);
             cairo_surface_destroy(surface);
+        }
+    }
+
+    if (rd->capture && rd->capture->dnd_pixmap)
+    {
+        int px = rd->capture->dnd_x - rd->capture->gtk_x;
+        int py = rd->capture->dnd_y - rd->capture->gtk_y;
+
+        if (XGetGeometry(rd->dpy, rd->capture->dnd_pixmap, &root_ret, &x, &y, &w, &h, &border, &depth))
+        {
+            XWindowAttributes win_attr;
+            Visual *visual = DefaultVisual(rd->dpy, DefaultScreen(rd->dpy));
+            if (XGetWindowAttributes(rd->dpy, rd->capture->dnd_win, &win_attr))
+                visual = win_attr.visual;
+
+            cairo_surface_t *surface = cairo_xlib_surface_create(
+                rd->dpy, rd->capture->dnd_pixmap,
+                visual, w, h);
+            if (surface)
+            {
+                cairo_set_source_surface(cr, surface, px, py);
+                cairo_paint(cr);
+                cairo_surface_destroy(surface);
+            }
         }
     }
 
@@ -465,6 +503,7 @@ static void handle_new_plugin_window(Display *dpy, Window win, Window parent_win
     rd->backing_pixmap = state->backing_pixmap;
     rd->hwnd = hwnd;
     rd->type = WINDOW_PLUGIN;
+    rd->capture = state;
 
     state->plugin_widget = hwnd->m_oswidget;
 
@@ -503,6 +542,7 @@ static void handle_new_modal_window(Display *dpy, Window win, X11CaptureState *s
     rd->backing_pixmap = backing_pixmap;
     rd->hwnd = hwnd;
     rd->type = WINDOW_MODAL;
+    rd->capture = NULL;
 
     connect_window_signals(draw_area, gtk_win, rd);
     gtk_widget_show_all(gtk_win);
@@ -581,6 +621,7 @@ static void handle_new_popup_window(Display *dpy, Window win, X11CaptureState *s
     rd->backing_pixmap = backing_pixmap;
     rd->hwnd = hwnd;
     rd->type = WINDOW_POPUP;
+    rd->capture = NULL;
 
     connect_window_signals(draw_area, gtk_win, rd);
     gtk_widget_show_all(gtk_win);
@@ -616,6 +657,27 @@ static void handle_xs_events(bridgeState *bs, X11CaptureState *capture, HWND hwn
                         if (XGetWindowAttributes(capture->dpy, capture->main_plugin_gui, &attr))
                             handle_new_plugin_window(capture->dpy, capture->main_plugin_gui, capture->parent_win, capture, &attr, hwnd);
                     }
+
+                    auto it = capture->child_windows.find(configured_win);
+                    if (it != capture->child_windows.end())
+                    {
+                        if (capture->dnd_win != configured_win)
+                        {
+                            capture->dnd_win = configured_win;
+                            capture->dnd_pixmap = XCompositeNameWindowPixmap(capture->dpy, configured_win);
+                            gtk_widget_hide(it->second);
+                        }
+                    }
+
+                    if (capture->dnd_win == configured_win)
+                    {
+                        if (capture->dnd_pixmap) XFreePixmap(capture->dpy, capture->dnd_pixmap);
+                        capture->dnd_pixmap = XCompositeNameWindowPixmap(capture->dpy, configured_win);
+                        capture->dnd_x = capture->gtk_x + xev.xconfigure.x;
+                        capture->dnd_y = capture->gtk_y + xev.xconfigure.y;
+                        if (capture->plugin_widget)
+                            gtk_widget_queue_draw(capture->plugin_widget);
+                    } 
                 }
                 break;
             case MapNotify:
@@ -661,12 +723,19 @@ static void handle_xs_events(bridgeState *bs, X11CaptureState *capture, HWND hwn
                     Window unmapped_win = xev.xunmap.window;
                     DEBUG_PRINT("UnmapNotify: 0x%lx\n", unmapped_win);
 
+                    set_wm_state(capture->dpy, unmapped_win, WM_STATE_WITHDRAWN);
+
                     auto it = capture->child_windows.find(unmapped_win);
                     if (it != capture->child_windows.end())
                     {
-                        set_wm_state(capture->dpy, unmapped_win, WM_STATE_WITHDRAWN);
                         gtk_widget_destroy(it->second);
                         capture->child_windows.erase(it);
+                    }
+                    if (unmapped_win == capture->dnd_win)
+                    {
+                        if (capture->dnd_pixmap) XFreePixmap(capture->dpy, capture->dnd_pixmap);
+                        capture->dnd_pixmap = 0;
+                        capture->dnd_win = 0;
                     }
                 }
                 break;
@@ -774,7 +843,6 @@ static gboolean xw_capture_update(HWND hwnd)
 static void cleanup_x11_capture(X11CaptureState *state)
 {
     if (!state) return;
-
     DEBUG_PRINT("Cleaning up X11 capture state\n");
 
     for (auto &pair : state->child_windows)
@@ -784,6 +852,9 @@ static void cleanup_x11_capture(X11CaptureState *state)
             gtk_widget_destroy(pair.second);
     }
     state->child_windows.clear();
+
+    if (state->dnd_pixmap) XFreePixmap(state->dpy, state->dnd_pixmap);
+    if (state->backing_pixmap) XFreePixmap(state->dpy, state->backing_pixmap);
 
     Display *dpy_to_close = state->dpy;
     state->dpy = NULL;
