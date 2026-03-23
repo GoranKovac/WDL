@@ -671,8 +671,17 @@ static void handle_xs_events(bridgeState *bs, X11CaptureState *capture, HWND hwn
 
                     if (capture->dnd_win == configured_win)
                     {
-                        if (capture->dnd_pixmap) XFreePixmap(capture->dpy, capture->dnd_pixmap);
-                        capture->dnd_pixmap = XCompositeNameWindowPixmap(capture->dpy, configured_win);
+                        if (capture->dnd_pixmap)
+                        {
+                            XFreePixmap(capture->dpy, capture->dnd_pixmap);
+                            capture->dnd_pixmap = 0;
+                        }
+
+                        // Check window still exists before grabbing new pixmap
+                        XWindowAttributes attr;
+                        if (XGetWindowAttributes(capture->dpy, configured_win, &attr))
+                            capture->dnd_pixmap = XCompositeNameWindowPixmap(capture->dpy, configured_win);
+
                         capture->dnd_x = capture->gtk_x + xev.xconfigure.x;
                         capture->dnd_y = capture->gtk_y + xev.xconfigure.y;
                         if (capture->plugin_widget)
@@ -733,8 +742,11 @@ static void handle_xs_events(bridgeState *bs, X11CaptureState *capture, HWND hwn
                     }
                     if (unmapped_win == capture->dnd_win)
                     {
-                        if (capture->dnd_pixmap) XFreePixmap(capture->dpy, capture->dnd_pixmap);
-                        capture->dnd_pixmap = 0;
+                        if (capture->dnd_pixmap)
+                        {
+                            XFreePixmap(capture->dpy, capture->dnd_pixmap);
+                            capture->dnd_pixmap = 0;
+                        }
                         capture->dnd_win = 0;
                     }
                 }
@@ -828,12 +840,9 @@ static gboolean xw_capture_update(HWND hwnd)
     {
         for (auto &pair : capture->child_windows)
         {
-            if (GTK_IS_WINDOW(pair.second))
-            {
-                GtkWidget *draw_area = gtk_bin_get_child(GTK_BIN(pair.second));
-                if (draw_area)
-                    gtk_widget_queue_draw(draw_area);
-            }
+            GtkWidget *draw_area = gtk_bin_get_child(GTK_BIN(pair.second));
+            if (draw_area && gtk_widget_get_visible(pair.second))
+                gtk_widget_queue_draw(draw_area);
         }
     }
 
