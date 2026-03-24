@@ -405,6 +405,43 @@ static gboolean window_motion(GtkWidget *widget, GdkEventMotion *e, gpointer dat
     return TRUE;
 }
 
+static gboolean window_scroll(GtkWidget *widget, GdkEventScroll *e, gpointer data)
+{
+    WindowRenderData *rd = (WindowRenderData*)data;
+    if (!rd || !rd->dpy || !rd->x11_win) return FALSE;
+
+    // Map GDK scroll direction to X11 button (4=up, 5=down, 6=left, 7=right)
+    unsigned int button = 0;
+    switch (e->direction)
+    {
+        case GDK_SCROLL_UP:    button = 4; break;
+        case GDK_SCROLL_DOWN:  button = 5; break;
+        case GDK_SCROLL_LEFT:  button = 6; break;
+        case GDK_SCROLL_RIGHT: button = 7; break;
+        default: return FALSE;
+    }
+
+    if (rd->type == WINDOW_PLUGIN)
+    {
+        XTestFakeMotionEvent(rd->dpy, DefaultScreen(rd->dpy), (int)e->x, (int)e->y, CurrentTime);
+    }
+    else
+    {
+        Window child_return;
+        int win_x, win_y;
+        XTranslateCoordinates(rd->dpy, rd->x11_win, DefaultRootWindow(rd->dpy),
+                              (int)e->x, (int)e->y, &win_x, &win_y, &child_return);
+        XTestFakeMotionEvent(rd->dpy, DefaultScreen(rd->dpy), win_x, win_y, CurrentTime);
+    }
+
+    XTestFakeButtonEvent(rd->dpy, button, True, CurrentTime);
+    XFlush(rd->dpy);
+    XTestFakeButtonEvent(rd->dpy, button, False, CurrentTime);
+    XFlush(rd->dpy);
+
+    return TRUE;
+}
+
 static void send_x11_key(Display *dpy, Window win, GdkEventKey *e, bool is_press)
 {
     XKeyEvent xev;
@@ -467,7 +504,7 @@ bool xw_forward_key(HWND hwnd, int keycode, int state, bool is_press)
 static void connect_window_signals(GtkWidget *event_widget, GtkWidget *key_widget, WindowRenderData *rd)
 {
     gtk_widget_add_events(event_widget,
-                          GDK_BUTTON_PRESS_MASK | GDK_BUTTON_RELEASE_MASK | GDK_POINTER_MOTION_MASK);
+                          GDK_BUTTON_PRESS_MASK | GDK_BUTTON_RELEASE_MASK | GDK_POINTER_MOTION_MASK | GDK_SCROLL_MASK);
 
     g_signal_connect_data(event_widget, "draw",
                           G_CALLBACK(plugin_draw_callback), rd, window_render_data_destroy, (GConnectFlags)0);
@@ -477,6 +514,8 @@ static void connect_window_signals(GtkWidget *event_widget, GtkWidget *key_widge
                           G_CALLBACK(window_button_release), rd, NULL, (GConnectFlags)0);
     g_signal_connect_data(event_widget, "motion-notify-event",
                           G_CALLBACK(window_motion), rd, NULL, (GConnectFlags)0);
+    g_signal_connect_data(event_widget, "scroll-event",
+                          G_CALLBACK(window_scroll), rd, NULL, (GConnectFlags)0);
 
     if (key_widget)
     {
@@ -500,6 +539,7 @@ static void handle_new_plugin_window(Display *dpy, Window win, Window parent_win
     rd->hwnd = hwnd;
     rd->type = WINDOW_PLUGIN;
     rd->capture = state;
+    rd->backing_pixmap = 0;
 
     state->plugin_widget = hwnd->m_oswidget;
 
@@ -654,8 +694,9 @@ static void handle_xs_events(bridgeState *bs, X11CaptureState *capture, HWND hwn
                             handle_new_plugin_window(capture->dpy, capture->main_plugin_gui, capture->parent_win, capture, &attr, hwnd);
                     }
 
-                    if (configured_win == capture->plugin_win ||
-                        configured_win == capture->main_plugin_gui)
+                    if ((configured_win == capture->plugin_win ||
+                        configured_win == capture->main_plugin_gui) &&
+                        capture->plugin_widget != NULL)
                     {
                         if (capture->backing_pixmap) XFreePixmap(capture->dpy, capture->backing_pixmap);
                         capture->backing_pixmap = XCompositeNameWindowPixmap(capture->dpy, capture->plugin_win);
@@ -677,7 +718,6 @@ static void handle_xs_events(bridgeState *bs, X11CaptureState *capture, HWND hwn
                         if (capture->dnd_win != configured_win)
                         {
                             capture->dnd_win = configured_win;
-                            capture->dnd_pixmap = XCompositeNameWindowPixmap(capture->dpy, configured_win);
                             gtk_widget_hide(it->second);
                         }
                     }
