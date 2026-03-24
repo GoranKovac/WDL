@@ -282,13 +282,20 @@ static void window_render_data_destroy(gpointer data, GClosure *closure)
 static gboolean plugin_draw_callback(GtkWidget *widget, cairo_t *cr, gpointer data)
 {
     WindowRenderData *rd = (WindowRenderData*)data;
-    if (!rd || !rd->dpy || !rd->backing_pixmap) return FALSE;
+    if (!rd || !rd->dpy) return FALSE;
+
+    // For plugin, always use capture's backing_pixmap so resize updates work
+    Pixmap pixmap = (rd->type == WINDOW_PLUGIN && rd->capture)
+        ? rd->capture->backing_pixmap
+        : rd->backing_pixmap;
+
+    if (!pixmap) return FALSE;
 
     Window root_ret;
     int x, y;
     unsigned int w, h, border, depth;
 
-    if (XGetGeometry(rd->dpy, rd->backing_pixmap, &root_ret, &x, &y, &w, &h, &border, &depth))
+    if (XGetGeometry(rd->dpy, pixmap, &root_ret, &x, &y, &w, &h, &border, &depth))
     {
         XWindowAttributes win_attr;
         Visual *visual = DefaultVisual(rd->dpy, DefaultScreen(rd->dpy));
@@ -296,8 +303,7 @@ static gboolean plugin_draw_callback(GtkWidget *widget, cairo_t *cr, gpointer da
             visual = win_attr.visual;
 
         cairo_surface_t *surface = cairo_xlib_surface_create(
-            rd->dpy, rd->backing_pixmap,
-            visual, w, h);
+            rd->dpy, pixmap, visual, w, h);
         if (surface)
         {
             cairo_set_source_surface(cr, surface, 0, 0);
@@ -305,7 +311,6 @@ static gboolean plugin_draw_callback(GtkWidget *widget, cairo_t *cr, gpointer da
             cairo_surface_destroy(surface);
         }
     }
-
     if (rd->capture && rd->capture->dnd_pixmap)
     {
         int px = rd->capture->dnd_x - rd->capture->gtk_x;
@@ -400,24 +405,28 @@ static gboolean window_motion(GtkWidget *widget, GdkEventMotion *e, gpointer dat
     return TRUE;
 }
 
-static gboolean window_key_press(GtkWidget *widget, GdkEventKey *e, gpointer data)
+static void send_x11_key(Display *dpy, Window win, GdkEventKey *e, bool is_press)
 {
-    WindowRenderData *rd = (WindowRenderData*)data;
-    if (!rd || !rd->dpy || !rd->x11_win) return FALSE;
-
     XKeyEvent xev;
     memset(&xev, 0, sizeof(xev));
-    xev.type = KeyPress;
-    xev.display = rd->dpy;
-    xev.window = rd->x11_win;
-    xev.root = DefaultRootWindow(rd->dpy);
+    xev.type = is_press ? KeyPress : KeyRelease;
+    xev.display = dpy;
+    xev.window = win;
+    xev.root = DefaultRootWindow(dpy);
     xev.time = CurrentTime;
     xev.keycode = e->hardware_keycode;
     xev.state = e->state;
     xev.same_screen = True;
 
-    XSendEvent(rd->dpy, rd->x11_win, True, KeyPressMask, (XEvent*)&xev);
-    XFlush(rd->dpy);
+    XSendEvent(dpy, win, True, is_press ? KeyPressMask : KeyReleaseMask, (XEvent*)&xev);
+    XFlush(dpy);
+}
+
+static gboolean window_key_press(GtkWidget *widget, GdkEventKey *e, gpointer data)
+{
+    WindowRenderData *rd = (WindowRenderData*)data;
+    if (!rd || !rd->dpy || !rd->x11_win) return FALSE;
+    send_x11_key(rd->dpy, rd->x11_win, e, true);
     return TRUE;
 }
 
@@ -425,20 +434,7 @@ static gboolean window_key_release(GtkWidget *widget, GdkEventKey *e, gpointer d
 {
     WindowRenderData *rd = (WindowRenderData*)data;
     if (!rd || !rd->dpy || !rd->x11_win) return FALSE;
-
-    XKeyEvent xev;
-    memset(&xev, 0, sizeof(xev));
-    xev.type = KeyRelease;
-    xev.display = rd->dpy;
-    xev.window = rd->x11_win;
-    xev.root = DefaultRootWindow(rd->dpy);
-    xev.time = CurrentTime;
-    xev.keycode = e->hardware_keycode;
-    xev.state = e->state;
-    xev.same_screen = True;
-
-    XSendEvent(rd->dpy, rd->x11_win, True, KeyReleaseMask, (XEvent*)&xev);
-    XFlush(rd->dpy);
+    send_x11_key(rd->dpy, rd->x11_win, e, false);
     return TRUE;
 }
 
@@ -656,6 +652,23 @@ static void handle_xs_events(bridgeState *bs, X11CaptureState *capture, HWND hwn
                         XWindowAttributes attr;
                         if (XGetWindowAttributes(capture->dpy, capture->main_plugin_gui, &attr))
                             handle_new_plugin_window(capture->dpy, capture->main_plugin_gui, capture->parent_win, capture, &attr, hwnd);
+                    }
+
+                    if (configured_win == capture->plugin_win ||
+                        configured_win == capture->main_plugin_gui)
+                    {
+                        if (capture->backing_pixmap) XFreePixmap(capture->dpy, capture->backing_pixmap);
+                        capture->backing_pixmap = XCompositeNameWindowPixmap(capture->dpy, capture->plugin_win);
+
+                        // Resize X11 parent window to match plugin
+                        XResizeWindow(capture->dpy, capture->parent_win, xev.xconfigure.width, xev.xconfigure.height);
+                        XFlush(capture->dpy);
+
+                        // Trigger xw_size to update GTK widget and container
+                        SendMessage(hwnd, WM_SIZE, SIZE_RESTORED, 0);
+
+                        if (capture->plugin_widget)
+                            gtk_widget_queue_draw(capture->plugin_widget);
                     }
 
                     auto it = capture->child_windows.find(configured_win);
