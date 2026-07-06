@@ -186,6 +186,15 @@ static bool s_clipboard_written; // has clipboard data been written-to since ope
 
 static void swell_gdkEventHandler(GdkEvent *event, gpointer data);
 
+#ifdef SWELL_TARGET_WAYLAND
+// Wayland allows only one popup per parent. Tooltip and a
+// menu cannot both be showed at the same time. 
+// Track the single active tooltip
+// so we can hide it when a menu opens, and suppress tooltips while a menu is up.
+static HWND s_wayland_active_tooltip;
+bool PopupMenuIsActive();
+#endif
+
 static int s_last_desktop;
 static UINT_PTR s_deactivate_timer;
 static guint32 s_force_window_time;
@@ -284,6 +293,9 @@ void swell_oswindow_destroy(HWND hwnd)
       SendMessage(swell_captured_window,WM_CAPTURECHANGED,0,0);
       swell_captured_window=0;
     }
+#endif
+#ifdef SWELL_TARGET_WAYLAND
+    if (s_wayland_active_tooltip == hwnd) s_wayland_active_tooltip = NULL;
 #endif
     if (g_swell_touchptr && g_swell_touchptr_wnd == hwnd->m_oswindow)
       g_swell_touchptr = NULL;
@@ -682,6 +694,10 @@ void swell_oswindow_manage(HWND hwnd, bool wantfocus)
         bool is_popup_menu = (hwnd->m_classname && strcmp(hwnd->m_classname, "__SWELL_MENU") == 0);
         bool is_tooltip = (!hwnd->m_parent && !hwnd->m_owner && (hwnd->m_style & WS_CHILD) && (!hwnd->m_title.Get() || !hwnd->m_title.Get()[0]));
 
+        bool is_splash = (!hwnd->m_parent && !hwnd->m_owner &&
+                        !(hwnd->m_style & WS_CAPTION) && !(hwnd->m_style & WS_CHILD) &&
+                        (!hwnd->m_title.Get() || !hwnd->m_title.Get()[0]));
+
         GtkWidget *gtk_win = gtk_window_new((is_popup_menu || is_tooltip) ? GTK_WINDOW_POPUP : GTK_WINDOW_TOPLEVEL);
 
         gtk_widget_set_app_paintable(gtk_win, TRUE);
@@ -696,13 +712,51 @@ void swell_oswindow_manage(HWND hwnd, bool wantfocus)
         gtk_window_set_default_size(GTK_WINDOW(gtk_win), r.right - r.left, r.bottom - r.top);
         hwnd->m_oswidget = gtk_win;
 
+        // GTK sizes a toplevel to its content's natural size and asks
+        // the compositor for that — ignoring gtk_window_set_default_size when the
+        // content is larger. That makes dialogs open full-height. A max-size hint
+        // is the only thing GTK won't override, so clamp max to the requested size.
+        if (!is_popup_menu && !is_tooltip && !is_splash)
+        {
+          // GTK ignores set_default_size when content natural size differs, and a
+          // max-only hint just caps (doesn't force). To make the restored size
+          // actually apply on Wayland, pin min=max=restored size — GTK cannot
+          // override an exact min==max constraint. This is released on the FIRST
+          // configure event (see OnConfigureEvent), i.e. once the window has been
+          // mapped at this exact size, after which it is freely resizable.
+          int rw = r.right - r.left, rh = r.bottom - r.top;
+          if (rw < 1) rw = 1;
+          if (rh < 1) rh = 1;
+          GdkGeometry gh;
+          gh.min_width = gh.max_width = rw;
+          gh.min_height = gh.max_height = rh;
+          gtk_window_set_geometry_hints(GTK_WINDOW(gtk_win), NULL, &gh,
+            (GdkWindowHints)(GDK_HINT_MIN_SIZE | GDK_HINT_MAX_SIZE));
+          SetProp(hwnd, "SWELL_SizePinned", (HANDLE)(INT_PTR)1);
+        }
+
+        // Tooltip and a menu can't both be showed at same time,
+        // opening a menu closes any active tooltip, 
+        // while a menu is open tooltips cant spawn.
+        if (is_popup_menu && s_wayland_active_tooltip)
+        {
+          if (s_wayland_active_tooltip->m_oswindow)
+            gdk_window_hide(s_wayland_active_tooltip->m_oswindow);
+          s_wayland_active_tooltip = NULL;
+        }
+        if (is_tooltip && PopupMenuIsActive())
+        {
+          // don't show a tooltip while a menu is up
+          gtk_widget_destroy(gtk_win);
+          hwnd->m_oswidget = NULL;
+          return;
+        }
+
+        HWND popup_parent_hwnd = NULL;
         if (is_popup_menu || is_tooltip)
         {
-          gtk_window_move(GTK_WINDOW(gtk_win), r.left, r.top);
+          if (is_tooltip) s_wayland_active_tooltip = hwnd;
           gtk_window_set_type_hint(GTK_WINDOW(gtk_win), is_tooltip ? GDK_WINDOW_TYPE_HINT_TOOLTIP : GDK_WINDOW_TYPE_HINT_POPUP_MENU);
-          gtk_window_set_decorated(GTK_WINDOW(gtk_win), FALSE);
-          gtk_window_set_skip_taskbar_hint(GTK_WINDOW(gtk_win), TRUE);
-          gtk_window_set_skip_pager_hint(GTK_WINDOW(gtk_win), TRUE);
 
           HWND parent_hwnd = NULL;
 
@@ -724,9 +778,30 @@ void swell_oswindow_manage(HWND hwnd, bool wantfocus)
 
           if (parent_hwnd && parent_hwnd->m_oswidget)
             gtk_window_set_transient_for(GTK_WINDOW(gtk_win), GTK_WINDOW(parent_hwnd->m_oswidget));
+          popup_parent_hwnd = parent_hwnd;
         }
 
         gtk_widget_realize(gtk_win);
+
+        // gtk_window_move is not constrained to the screen,
+        // so popups render outside of the bottom/right edge. Use gdk_window_move_to_rect
+        // so the compositor slides the popup on-screen.
+        // https://bugzilla.mozilla.org/show_bug.cgi?id=1423598
+        if ((is_popup_menu || is_tooltip) && popup_parent_hwnd)
+        {
+          GdkWindow *pw = gtk_widget_get_window(gtk_win);
+          GdkWindow *parent_gw = gtk_widget_get_window(popup_parent_hwnd->m_oswidget);
+          if (pw && parent_gw)
+          {
+            gint psx = 0, psy = 0;
+            gdk_window_get_origin(parent_gw, &psx, &psy);
+            GdkRectangle anchor = { r.left - psx, r.top - psy, 1, 1 };
+            gdk_window_move_to_rect(pw, &anchor,
+                GDK_GRAVITY_NORTH_WEST, GDK_GRAVITY_NORTH_WEST,
+                (GdkAnchorHints)(GDK_ANCHOR_SLIDE_X | GDK_ANCHOR_SLIDE_Y),
+                0, 0);
+          }
+        }
         gtk_widget_show(gtk_win);
         hwnd->m_oswindow = gtk_widget_get_window(gtk_win);
 #else
@@ -1210,8 +1285,24 @@ static void OnConfigureEvent(GdkEventConfigure *cfg)
   hwnd->m_position.bottom = cfg->y + cfg->height;
   if (flag&1) SendMessage(hwnd,WM_MOVE,0,0);
   if (flag&2) SendMessage(hwnd,WM_SIZE,hwnd->m_is_maximized ? SIZE_MAXIMIZED : SIZE_RESTORED,0);
+#ifdef SWELL_TARGET_WAYLAND
+  // Release the creation-time size pin now that the window has been mapped at its
+  // restored size. Do it on the first configure only. After this the window is
+  // freely resizable (recalcMinMaxInfo below re-applies the real min/max limits).
+  if (GetProp(hwnd, "SWELL_SizePinned") && hwnd->m_oswidget && GTK_IS_WINDOW(hwnd->m_oswidget))
+  {
+    RemoveProp(hwnd, "SWELL_SizePinned");
+    gtk_window_set_geometry_hints(GTK_WINDOW(hwnd->m_oswidget), NULL, NULL, (GdkWindowHints)0);
+  }
+#endif
+#ifdef SWELL_TARGET_WAYLAND
+  // Prevent modal windows to be resized manually (broken when fixed windows to remember previous size)
+  if (!hwnd->m_hashaddestroy && hwnd->m_oswindow)
+    swell_recalcMinMaxInfo(hwnd);
+#else
   if (!hwnd->m_hashaddestroy && hwnd->m_oswindow && (hwnd->m_style & WS_THICKFRAME))
     swell_recalcMinMaxInfo(hwnd);
+#endif
 }
 
 static void OnWindowStateEvent(GdkEventWindowState *evt)
@@ -1221,9 +1312,17 @@ static void OnWindowStateEvent(GdkEventWindowState *evt)
 
   if (evt->changed_mask & GDK_WINDOW_STATE_MAXIMIZED)
   {
-    hwnd->m_is_maximized = (evt->new_window_state & GDK_WINDOW_STATE_MAXIMIZED)!=0;
+    bool maximized;
+#ifdef SWELL_TARGET_WAYLAND
+    maximized = hwnd->m_oswidget && GTK_IS_WINDOW(hwnd->m_oswidget)
+                  ? gtk_window_is_maximized(GTK_WINDOW(hwnd->m_oswidget))
+                  : false;
+#else
+    maximized = (evt->new_window_state & GDK_WINDOW_STATE_MAXIMIZED) != 0;
+#endif
+    hwnd->m_is_maximized = maximized;
     SendMessage(hwnd,WM_SIZE,
-        (evt->new_window_state & GDK_WINDOW_STATE_MAXIMIZED) ? SIZE_MAXIMIZED : SIZE_RESTORED, 0);
+        maximized ? SIZE_MAXIMIZED : SIZE_RESTORED, 0);
   }
 }
 
