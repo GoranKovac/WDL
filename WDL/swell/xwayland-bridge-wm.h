@@ -122,8 +122,6 @@ public:
     // Acquire an owner_events grab on behalf of a popup or modal.
     // owner_events=true means events still go to the correct window — this is
     // what lets us click outside a popup without freezing.
-    bool acquire_grab(GrabOwner who, Window x11_win, GtkWidget *gtk_w, Time t);
-    void release_grab(Time t = CurrentTime);
     // Called by your button-press handler to check if we should dismiss a popup.
     // Returns true if the click was outside all tracked popups/modals.
     bool handle_outside_click(Window clicked_win, int x_root, int y_root, Time t);
@@ -140,7 +138,6 @@ public:
     // Callbacks — wire these up after construction
     std::function<void(Window /*dismissed*/)> on_popup_dismissed;
     std::function<void(Window /*w*/, int x, int y, int w2, int h)> on_configure_applied;
-    Window active_popup_ = None;
 
 private:
     void init_atoms();
