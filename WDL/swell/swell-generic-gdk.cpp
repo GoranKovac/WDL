@@ -24,6 +24,7 @@
 #ifndef SWELL_PROVIDED_BY_APP
 #ifdef SWELL_TARGET_WAYLAND
 #include <gdk/gdkwayland.h>
+#include "xwayland-bridge.h"
 #endif
 #include "swell.h"
 
@@ -401,6 +402,9 @@ void SWELL_initargs(int *argc, char ***argv)
 #endif
     if (SWELL_gdk_active > 0)
     {
+#ifdef SWELL_TARGET_WAYLAND
+      init_private_xwayland();
+#endif
       char buf[1024];
       GetModuleFileName(NULL,buf,sizeof(buf));
       WDL_remove_filepart(buf);
@@ -1526,7 +1530,19 @@ static void OnKeyEvent(GdkEventKey *k)
 {
   HWND hwnd = swell_oswindow_to_hwnd(k->window);
   if (!hwnd) return;
-
+#ifdef SWELL_TARGET_WAYLAND
+  // If the focused window is an xwayland plugin bridge, forward the key to the
+  // plugin (or its open popup) and consume it, so REAPER does not also act on it
+  // (prevents Space/Esc etc. wedging while a plugin popup is open).
+  {
+    HWND foc = GetFocusIncludeMenus();
+    if (foc && foc->m_classname && !strcmp(foc->m_classname, "REAPERXBridge"))
+    {
+      xw_forward_key(foc, k->hardware_keycode, k->state, k->type == GDK_KEY_PRESS);
+      return;
+    }
+  }
+#endif
   int modifiers = 0;
   if (k->state&GDK_CONTROL_MASK) modifiers|=FCONTROL;
   if (k->state&GDK_MOD1_MASK) modifiers|=FALT;
@@ -1684,6 +1700,21 @@ static void OnButtonEvent(GdkEventButton *b)
 {
   HWND hwnd = swell_oswindow_to_hwnd(b->window);
   if (!hwnd) return;
+
+#ifdef SWELL_TARGET_WAYLAND
+  if (b->type == GDK_BUTTON_PRESS)
+  {
+    if (g_wm_dpy) {
+      KeyCode esc = XKeysymToKeycode(g_wm_dpy, XK_Escape);
+
+      XTestFakeKeyEvent(g_wm_dpy, esc, True, CurrentTime);
+      XTestFakeKeyEvent(g_wm_dpy, esc, False, CurrentTime);
+
+      XFlush(g_wm_dpy);
+    }
+  }
+#endif
+
   swell_lastMessagePos = MAKELONG(((int)b->x_root&0xffff),((int)b->y_root&0xffff));
   POINT p={(int)b->x, (int)b->y};
   HWND hwnd2 = getMouseTarget(b->window,p,&hwnd);
@@ -3735,11 +3766,7 @@ HWND SWELL_CreateXBridgeWindow(HWND viewpar, void **wref, const RECT *r)
   HWND hwnd = NULL;
   *wref = NULL;
 #ifdef SWELL_TARGET_WAYLAND
-  // do nothing on Wayland for now, will add bridge later
-  hwnd = new HWND__(viewpar,0,r,NULL,true,NULL);
-  hwnd->m_classname = bridge_class_name;
-  hwnd->m_private_data = 0;
-  return hwnd;
+  return xw_bridge_create(viewpar, wref, r, "REAPERXBridge");
 #endif
   GdkWindow *ospar = NULL;
   HWND hpar = viewpar;
