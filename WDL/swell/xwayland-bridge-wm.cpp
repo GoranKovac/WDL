@@ -26,14 +26,10 @@
 #include <algorithm>
 
 // ─── Construction ─────────────────────────────────────────────────────────────
-Window active_popup_ = None;
 XWaylandWM::XWaylandWM(Display *dpy) : dpy_(dpy) {
     init_atoms();
 }
 
-XWaylandWM::~XWaylandWM() {
-    release_grab();
-}
 // ─── Atom initialisation ──────────────────────────────────────────────────────
 
 void XWaylandWM::init_atoms() {
@@ -238,107 +234,28 @@ bool XWaylandWM::handle_event(XEvent *ev) {
     case UnmapNotify:      DEBUG_PRINT("[WM] -> UnmapNotify\n");      return on_unmap_notify(&ev->xunmap);
     case DestroyNotify:    DEBUG_PRINT("[WM] -> DestroyNotify\n");    return on_destroy_notify(&ev->xdestroywindow);
     case ClientMessage:    DEBUG_PRINT("[WM] -> ClientMessage\n");    return on_client_message(&ev->xclient);
-    // case ButtonPress:      DEBUG_PRINT("[WM] -> ButtonPress\n");      return on_button_press(&ev->xbutton);
     case PropertyNotify:   DEBUG_PRINT("[WM] -> PropertyNotify\n");   return on_property_notify(&ev->xproperty);
-    case CreateNotify:     DEBUG_PRINT("[WM] -> CreateNotify\n");     return on_create_notify(&ev->xcreatewindow);
-    case MapNotify:        DEBUG_PRINT("[WM] -> MapNotify\n");        return on_map_notify(&ev->xmap);
-    case KeyPress:
-        DEBUG_PRINT("[WM] KeyPress win=0x%lx keycode=%u state=0x%x time=%lu\n",
-                    ev->xkey.window,
-                    ev->xkey.keycode,
-                    ev->xkey.state,
-                    ev->xkey.time);
-        return false;
-
-    case KeyRelease:
-        DEBUG_PRINT("[WM] KeyRelease win=0x%lx keycode=%u state=0x%x time=%lu\n",
-                    ev->xkey.window,
-                    ev->xkey.keycode,
-                    ev->xkey.state,
-                    ev->xkey.time);
-        return false;
+    // case CreateNotify:     DEBUG_PRINT("[WM] -> CreateNotify\n");     return on_create_notify(&ev->xcreatewindow);
+    // case MapNotify:        DEBUG_PRINT("[WM] -> MapNotify\n");        return on_map_notify(&ev->xmap);
+    // case KeyPress:
+    //     DEBUG_PRINT("[WM] KeyPress win=0x%lx keycode=%u state=0x%x time=%lu\n",
+    //                 ev->xkey.window,
+    //                 ev->xkey.keycode,
+    //                 ev->xkey.state,
+    //                 ev->xkey.time);
+    //     return false;
+    //
+    // case KeyRelease:
+    //     DEBUG_PRINT("[WM] KeyRelease win=0x%lx keycode=%u state=0x%x time=%lu\n",
+    //                 ev->xkey.window,
+    //                 ev->xkey.keycode,
+    //                 ev->xkey.state,
+    //                 ev->xkey.time);
+    //     return false;
     default:
     DEBUG_PRINT("[WM] -> unhandled (type=%d)\n", ev->type);
         return false;
     }
-}
-//NOTE: ADD POPUPS!!!!
-bool XWaylandWM::on_create_notify(XCreateWindowEvent *ev)
-{
-    XWindowAttributes attr{};
-
-    if (!XGetWindowAttributes(dpy_, ev->window, &attr))
-        return false;
-
-    DEBUG_PRINT(
-        "[WM] CreateNotify win=0x%lx parent=0x%lx override_redirect=%d geom=%dx%d+%d+%d\n",
-        ev->window,
-        ev->parent,
-        attr.override_redirect,
-        attr.width,
-        attr.height,
-        attr.x,
-        attr.y);
-
-    if (attr.override_redirect) {
-        DEBUG_PRINT("[WM] override-redirect popup candidate: 0x%lx\n",
-                    ev->window);
-
-        active_popup_ = ev->window;
-
-        // if (!states_.count(ev->window)) {
-        //     track_window(ev->window, ev->parent, true);
-        // }
-        //
-        // XSelectInput(dpy_,
-        //              ev->window,
-        //              StructureNotifyMask |
-        //              PropertyChangeMask);
-        //
-        // //
-        // // Catch outside clicks.
-        // //
-        // int result = XGrabPointer(
-        //     dpy_,
-        //     support_win_,
-        //     True,                    // owner_events
-        //     ButtonPressMask |
-        //     ButtonReleaseMask,
-        //     GrabModeAsync,
-        //     GrabModeAsync,
-        //     None,
-        //     None,
-        //     CurrentTime);
-        //
-        // DEBUG_PRINT("[WM] outside-click grab result=%d\n", result);
-        //
-        // XFlush(dpy_);
-    }
-
-    return false;
-}
-
-bool XWaylandWM::on_map_notify(XMapEvent *ev)
-{
-    XWindowAttributes attr{};
-
-    if (!XGetWindowAttributes(dpy_, ev->window, &attr))
-        return false;
-
-    DEBUG_PRINT("[WM] MapNotify win=0x%lx override_redirect=%d\n",
-                ev->window,
-                attr.override_redirect);
-
-    if (attr.override_redirect) {
-        DEBUG_PRINT("[WM] removing popup keyboard grab\n");
-
-        XUngrabKeyboard(dpy_, CurrentTime);
-        XFlush(dpy_);
-
-        // active_popup_ = ev->window;
-    }
-
-    return false;
 }
 
 // ─── MapRequest ───────────────────────────────────────────────────────────────
@@ -496,21 +413,13 @@ bool XWaylandWM::on_unmap_notify(XUnmapEvent *ev) {
     it->second.mapped = false;
     set_wm_state(ev->window, WM_STATE_WITHDRAWN);
 
-    // If this window owned the grab, release it
-    if (grab_.grab_window == ev->window)
-        release_grab();
-
     return false; // let bridge also handle
 }
 
 // ─── DestroyNotify ────────────────────────────────────────────────────────────
 
 bool XWaylandWM::on_destroy_notify(XDestroyWindowEvent *ev) {
-    if (active_popup_ == ev->window)
-        active_popup_ = None;
     untrack_window(ev->window);
-    if (grab_.grab_window == ev->window)
-        release_grab();
     return false;
 }
 
@@ -552,78 +461,6 @@ bool XWaylandWM::on_client_message(XClientMessageEvent *ev) {
 
     return false;
 }
-
-// ─── ButtonPress — the freeze fix ────────────────────────────────────────────
-// With owner_events=True the grab routes all button events through here.
-// If the click is outside every tracked popup/modal, we dismiss them and
-// release the grab, preventing the deadlock.
-
-// bool XWaylandWM::on_button_press(XButtonEvent *ev)
-// {
-//     if (active_popup_ == None)
-//         return false;
-//
-//     DEBUG_PRINT("[WM] popup ButtonPress win=0x%lx popup=0x%lx root=(%d,%d)\n",
-//                 ev->window,
-//                 active_popup_,
-//                 ev->x_root,
-//                 ev->y_root);
-//
-//     bool inside = false;
-//
-//     XWindowAttributes attr{};
-//     if (XGetWindowAttributes(dpy_, active_popup_, &attr)) {
-//
-//         int x = 0;
-//         int y = 0;
-//         Window child = None;
-//
-//         XTranslateCoordinates(dpy_,
-//                               DefaultRootWindow(dpy_),
-//                               active_popup_,
-//                               ev->x_root,
-//                               ev->y_root,
-//                               &x,
-//                               &y,
-//                               &child);
-//
-//         inside =
-//             x >= 0 &&
-//             y >= 0 &&
-//             x < attr.width &&
-//             y < attr.height;
-//     }
-//
-//     if (!inside) {
-//         DEBUG_PRINT("[WM] outside popup -> releasing X11 grab\n");
-//
-//         XUngrabPointer(dpy_, ev->time);
-//         XUngrabKeyboard(dpy_, ev->time);
-//
-//         // Required for some native X11 popup implementations
-//         KeyCode esc = XKeysymToKeycode(dpy_, XK_Escape);
-//         XTestFakeKeyEvent(dpy_, esc, True, CurrentTime);
-//         XTestFakeKeyEvent(dpy_, esc, False, CurrentTime);
-//
-//         XFlush(dpy_);
-//
-//         active_popup_ = None;
-//     }
-//
-//     return false;
-// }
-//
-// bool XWaylandWM::handle_outside_click(Window /*clicked*/, int /*x*/, int /*y*/, Time t) {
-//     if (grab_.owner == GRAB_NONE) return false;
-//
-//     Window dismissed = grab_.grab_window;
-//     release_grab(t);
-//
-//     if (on_popup_dismissed)
-//         on_popup_dismissed(dismissed);
-//
-//     return true;
-// }
 
 // ─── PropertyNotify — re-read hints when client updates them ─────────────────
 
@@ -686,71 +523,6 @@ void XWaylandWM::send_take_focus(Window w, Time t) {
 
 void XWaylandWM::send_delete_window(Window w, Time t) {
     xwm_send_protocol_message(dpy_, w, atoms_.WM_DELETE_WINDOW, t);
-}
-
-// ─── Grab management — the core of the freeze fix ─────────────────────────────
-//
-// owner_events = True  →  pointer events go to the window they're in,
-//                          not just to grab_window.  This is what lets the
-//                          user click in other Reaper windows without freezing.
-// event_mask           →  events we want even when outside any of our windows.
-// confine_to = None    →  don't trap the cursor.
-// cursor = None        →  keep whatever cursor the window sets.
-
-bool XWaylandWM::acquire_grab(GrabOwner who, Window x11_win, GtkWidget *gtk_w, Time t) {
-    if (grab_.owner != GRAB_NONE)
-        release_grab(t);
-
-    int ptr_result = XGrabPointer(
-        dpy_, x11_win,
-        True,                       // owner_events = True  ← KEY
-        ButtonPressMask | ButtonReleaseMask | PointerMotionMask |
-        EnterWindowMask | LeaveWindowMask,
-        GrabModeAsync, GrabModeAsync,
-        None,                       // confine_to
-        None,                       // cursor
-        t
-    );
-    if (ptr_result != GrabSuccess) {
-        fprintf(stderr, "[XWaylandWM] XGrabPointer failed: %d\n", ptr_result);
-        return false;
-    }
-
-    int kbd_result = XGrabKeyboard(
-        dpy_, x11_win,
-        True,                       // owner_events = True  ← KEY
-        GrabModeAsync, GrabModeAsync,
-        t
-    );
-    if (kbd_result != GrabSuccess) {
-        // Keyboard grab failure is non-fatal; pointer grab is more important
-        fprintf(stderr, "[XWaylandWM] XGrabKeyboard failed: %d (non-fatal)\n", kbd_result);
-    }
-
-    grab_.owner            = who;
-    grab_.grab_window      = x11_win;
-    grab_.gtk_widget       = gtk_w;
-    grab_.pointer_grabbed  = (ptr_result == GrabSuccess);
-    grab_.keyboard_grabbed = (kbd_result == GrabSuccess);
-    grab_.grab_time        = t;
-
-    XFlush(dpy_);
-    return true;
-}
-
-void XWaylandWM::release_grab(Time t) {
-    if (grab_.pointer_grabbed) {
-        XUngrabPointer(dpy_, t);
-        grab_.pointer_grabbed = false;
-    }
-    if (grab_.keyboard_grabbed) {
-        XUngrabKeyboard(dpy_, t);
-        grab_.keyboard_grabbed = false;
-    }
-    grab_.owner       = GRAB_NONE;
-    grab_.grab_window = None;
-    grab_.gtk_widget  = nullptr;
-    XFlush(dpy_);
 }
 
 // ─── WM_STATE property helper ─────────────────────────────────────────────────

@@ -55,6 +55,10 @@ struct Capture {
     Window     root_popup      = 0;     // first popup in the chain
     struct PopupWin { Window x11_win; Pixmap pixmap; int x,y,w,h; bool visible; };
     std::vector<PopupWin> popups;
+
+    // ── Modals (real dialog windows the plugin opens) ──
+    struct ModalWin { Window x11_win; Pixmap pixmap; GtkWidget *gtk_win; GtkWidget *draw; };
+    std::vector<ModalWin> modals;
 };
 
 // Route :10 events (on g_wm_dpy) to the owning capture.
@@ -197,7 +201,6 @@ static void connect_widget(Capture *c)
                           GDK_SCROLL_MASK);
 
     g_signal_connect(c->widget, "enter-notify-event",   G_CALLBACK(on_enter), c);
-    // g_signal_connect(c->widget, "leave-notify-event",   G_CALLBACK(on_leave), c);
     g_signal_connect(c->widget, "draw",                 G_CALLBACK(on_draw),           c);
     g_signal_connect(c->widget, "button-press-event",   G_CALLBACK(on_button_press),   c);
     g_signal_connect(c->widget, "button-release-event", G_CALLBACK(on_button_release), c);
@@ -244,7 +247,7 @@ static void cleanup_capture(Capture *c)
 {
     if (!c) return;
     unregister_capture(c);
-    if (c->damage) XDamageDestroy(g_wm_dpy, c->damage);
+    if (c->damage) XDamageDestroy(c->dpy, c->damage);
     if (c->pixmap) XFreePixmap(c->dpy, c->pixmap);
     Display *d = c->dpy;
     c->dpy = nullptr;
@@ -454,7 +457,342 @@ static void canvas_remove_popup(Capture *c, Window x11_win)
     }
 }
 
+static bool is_window_from_owned_plugin(Display *dpy, Window win, Capture *state) {
+    // Check if this window has the same PID as our plugin
+    Atom atom_pid = XInternAtom(dpy, "_NET_WM_PID", False);
+    Atom actual_type;
+    int actual_format;
+    unsigned long nitems, bytes_after;
+    unsigned char *prop = NULL;
+
+    pid_t window_pid = 0;
+    if (XGetWindowProperty(dpy, win, atom_pid, 0, 1, False, XA_CARDINAL,
+                           &actual_type, &actual_format, &nitems, &bytes_after, &prop) == Success) {
+        if (prop && nitems > 0) {
+            window_pid = *((pid_t*)prop);
+            XFree(prop);
+        }
+    }
+
+    // Get our plugin's PID (from main_plugin_gui)
+    pid_t our_pid = 0;
+    if (XGetWindowProperty(dpy, state->gui_win, atom_pid, 0, 1, False, XA_CARDINAL,
+                           &actual_type, &actual_format, &nitems, &bytes_after, &prop) == Success) {
+        if (prop && nitems > 0) {
+            our_pid = *((pid_t*)prop);
+            XFree(prop);
+        }
+    }
+
+    if (window_pid == 0 || our_pid == 0 || window_pid != our_pid) {
+        return FALSE;
+    }
+
+    return TRUE;
+}
+
+// Motif hints tell us whether a window wants decorations. yabridge popups and
+// modals both arrive as NORMAL type with the yabridge class; the difference is
+// that a popup disables decorations (MWM_HINTS_DECORATIONS set, decorations==0)
+// while a real modal dialog keeps them. This is the signal that separates them.
+struct MotifWmHints {
+    unsigned long flags;
+    unsigned long functions;
+    unsigned long decorations;
+    long          input_mode;
+    unsigned long status;
+};
+#define MWM_HINTS_DECORATIONS (1L << 1)
+
+static bool hasMotifHints(Display *dpy, Window win, MotifWmHints &out) {
+    Atom a = XInternAtom(dpy, "_MOTIF_WM_HINTS", True);
+    if (a == None) return false;
+
+    Atom actual_type; int actual_format;
+    unsigned long nitems, bytes_after;
+    unsigned char *prop = nullptr;
+    if (XGetWindowProperty(dpy, win, a, 0, 5, False, a,
+                           &actual_type, &actual_format,
+                           &nitems, &bytes_after, &prop) != Success)
+        return false;
+    if (!prop || actual_format != 32 || nitems < 5) { if (prop) XFree(prop); return false; }
+
+    const long *l = reinterpret_cast<long*>(prop);
+    out.flags = l[0]; out.functions = l[1]; out.decorations = l[2];
+    out.input_mode = l[3]; out.status = l[4];
+    XFree(prop);
+    return true;
+}
+
+static bool classify_popup(Display *dpy, Window win, XWindowAttributes *attr) {
+    if (!dpy || !win) return false;
+
+    Atom atom_window_type        = XInternAtom(dpy, "_NET_WM_WINDOW_TYPE", False);
+    Atom atom_type_normal        = XInternAtom(dpy, "_NET_WM_WINDOW_TYPE_NORMAL", False);
+    Atom atom_type_dialog        = XInternAtom(dpy, "_NET_WM_WINDOW_TYPE_DIALOG", False);
+    Atom atom_type_popup_menu    = XInternAtom(dpy, "_NET_WM_WINDOW_TYPE_POPUP_MENU", False);
+    Atom atom_type_menu          = XInternAtom(dpy, "_NET_WM_WINDOW_TYPE_MENU", False);
+    Atom atom_type_dropdown_menu = XInternAtom(dpy, "_NET_WM_WINDOW_TYPE_DROPDOWN_MENU", False);
+    Atom atom_type_tooltip       = XInternAtom(dpy, "_NET_WM_WINDOW_TYPE_TOOLTIP", False);
+    Atom atom_type_dnd           = XInternAtom(dpy, "_NET_WM_WINDOW_TYPE_DND", False);
+    Atom atom_type_utility       = XInternAtom(dpy, "_NET_WM_WINDOW_TYPE_UTILITY", False);
+
+    bool is_popup = false;
+    Window transient_for = None;
+    XGetTransientForHint(dpy, win, &transient_for);
+
+    std::vector<Atom> window_types;
+    Atom actual_type;
+    int actual_format;
+    unsigned long nitems = 0, bytes_after = 0;
+    unsigned char* prop = nullptr;
+
+    if (XGetWindowProperty(dpy, win, atom_window_type, 0, 10,
+                           False, XA_ATOM, &actual_type, &actual_format,
+                           &nitems, &bytes_after, &prop) == Success) {
+        if (prop) {
+            if (actual_format == 32 && nitems > 0) {
+                Atom* atoms = (Atom*)prop;  // Simple C cast is fine
+                window_types.assign(atoms, atoms + nitems);
+            }
+            XFree(prop);
+        }
+    }
+
+    if (window_types.empty()) {
+        if (transient_for != None) {
+            window_types.push_back(atom_type_dialog);
+        } else {
+            window_types.push_back(atom_type_normal);
+        }
+    }
+
+    bool override_redirect = attr->override_redirect;
+
+    // Decoration state: a decoration-less window is a popup, a decorated one is
+    // a real (modal) window
+    bool motif_popup = false;
+    MotifWmHints mh;
+    if (hasMotifHints(dpy, win, mh))
+        motif_popup = (mh.flags & MWM_HINTS_DECORATIONS) && mh.decorations == 0;
+
+    for (Atom ty : window_types) {
+        if (ty == atom_type_normal) {
+            is_popup = override_redirect || motif_popup;
+        }
+        else if (ty == atom_type_dialog || ty == atom_type_utility) {
+            is_popup = override_redirect;
+        }
+        else if (
+            ty == atom_type_popup_menu ||
+            ty == atom_type_menu ||
+            ty == atom_type_dropdown_menu ||
+            ty == atom_type_tooltip ||
+            ty == atom_type_dnd
+        ) {
+            is_popup = true;
+        }
+        else {
+            continue;   // unknown → try next
+        }
+        break;
+    }
+    return is_popup;
+}
+
+struct ModalRender { Capture *cap; Window x11_win; };
+
+static gboolean modal_draw_cb(GtkWidget *, cairo_t *cr, gpointer data)
+{
+    ModalRender *m = (ModalRender*)data;
+    if (!m || !m->cap || !m->cap->dpy) return FALSE;
+    Display *dpy = m->cap->dpy;
+    Pixmap pm = 0;
+    for (auto &md : m->cap->modals)
+        if (md.x11_win == m->x11_win) { pm = md.pixmap; break; }
+    if (!pm) return FALSE;
+
+    Window rr; int gx, gy; unsigned int gw, gh, gb, gd;
+    if (!XGetGeometry(dpy, pm, &rr, &gx, &gy, &gw, &gh, &gb, &gd)) return FALSE;
+
+    XWindowAttributes wa;
+    Visual *visual = DefaultVisual(dpy, DefaultScreen(dpy));
+    if (XGetWindowAttributes(dpy, m->x11_win, &wa)) visual = wa.visual;
+
+    cairo_surface_t *surf = cairo_xlib_surface_create(dpy, pm, visual, gw, gh);
+    if (surf) {
+        cairo_set_source_surface(cr, surf, 0, 0);
+        cairo_paint(cr);
+        cairo_surface_destroy(surf);
+    }
+    return TRUE;
+}
+
+static void modal_forward_motion(ModalRender *m, int wx, int wy)
+{
+    Window child; int rx, ry;
+    XTranslateCoordinates(m->cap->dpy, m->x11_win, DefaultRootWindow(m->cap->dpy),
+                          wx, wy, &rx, &ry, &child);
+    XTestFakeMotionEvent(m->cap->dpy, DefaultScreen(m->cap->dpy), rx, ry, CurrentTime);
+}
+
+static gboolean modal_button_press(GtkWidget *, GdkEventButton *e, gpointer data)
+{
+    ModalRender *m = (ModalRender*)data;
+    if (!m || !m->cap->dpy) return FALSE;
+    modal_forward_motion(m, (int)e->x, (int)e->y);
+    XTestFakeButtonEvent(m->cap->dpy, e->button, True, CurrentTime);
+    XFlush(m->cap->dpy);
+    return TRUE;
+}
+
+static gboolean modal_button_release(GtkWidget *, GdkEventButton *e, gpointer data)
+{
+    ModalRender *m = (ModalRender*)data;
+    if (!m || !m->cap->dpy) return FALSE;
+    modal_forward_motion(m, (int)e->x, (int)e->y);
+    XTestFakeButtonEvent(m->cap->dpy, e->button, False, CurrentTime);
+    XFlush(m->cap->dpy);
+    return TRUE;
+}
+
+static gboolean modal_motion(GtkWidget *, GdkEventMotion *e, gpointer data)
+{
+    ModalRender *m = (ModalRender*)data;
+    if (!m || !m->cap->dpy) return FALSE;
+    modal_forward_motion(m, (int)e->x, (int)e->y);
+    XFlush(m->cap->dpy);
+    return TRUE;
+}
+
+static void modal_render_destroy(gpointer data, GClosure *) { delete (ModalRender*)data; }
+
+static void create_modal(Capture *state, Window win, XWindowAttributes *attr)
+{
+    Display *dpy = state->dpy;
+    XCompositeRedirectWindow(dpy, win, CompositeRedirectAutomatic);
+    XSync(dpy, False);
+    Pixmap pm = XCompositeNameWindowPixmap(dpy, win);
+
+    GtkWidget *gtk_win = gtk_window_new(GTK_WINDOW_TOPLEVEL);
+    gtk_window_set_decorated(GTK_WINDOW(gtk_win), TRUE);
+
+    GtkWidget *toplevel = state->widget ? gtk_widget_get_toplevel(state->widget) : nullptr;
+    if (toplevel && GTK_IS_WINDOW(toplevel))
+        gtk_window_set_transient_for(GTK_WINDOW(gtk_win), GTK_WINDOW(toplevel));
+
+    gtk_window_resize(GTK_WINDOW(gtk_win), attr->width, attr->height);
+
+    GtkWidget *draw = gtk_drawing_area_new();
+    gtk_widget_set_size_request(draw, attr->width, attr->height);
+    gtk_container_add(GTK_CONTAINER(gtk_win), draw);
+
+    ModalRender *mr = new ModalRender();
+    mr->cap = state; mr->x11_win = win;
+
+    gtk_widget_add_events(draw, GDK_BUTTON_PRESS_MASK | GDK_BUTTON_RELEASE_MASK | GDK_POINTER_MOTION_MASK);
+    g_signal_connect(draw, "button-press-event",   G_CALLBACK(modal_button_press),   mr);
+    g_signal_connect(draw, "button-release-event", G_CALLBACK(modal_button_release), mr);
+    g_signal_connect(draw, "motion-notify-event",  G_CALLBACK(modal_motion),         mr);
+    g_signal_connect_data(draw, "draw", G_CALLBACK(modal_draw_cb), mr, modal_render_destroy, (GConnectFlags)0);
+
+    gtk_widget_show_all(gtk_win);
+
+    Capture::ModalWin md;
+    md.x11_win = win; md.pixmap = pm; md.gtk_win = gtk_win; md.draw = draw;
+    state->modals.push_back(md);
+}
+
+static void modal_refresh(Capture *c, Window win)
+{
+    for (auto &md : c->modals)
+        if (md.x11_win == win) {
+            if (md.pixmap) XFreePixmap(c->dpy, md.pixmap);
+            md.pixmap = XCompositeNameWindowPixmap(c->dpy, win);
+            if (md.draw) gtk_widget_queue_draw(md.draw);
+            break;
+        }
+}
+
+static void modal_remove(Capture *c, Window win)
+{
+    for (auto it = c->modals.begin(); it != c->modals.end(); ++it)
+        if (it->x11_win == win) {
+            if (it->pixmap) XFreePixmap(c->dpy, it->pixmap);
+            if (it->gtk_win) gtk_widget_destroy(it->gtk_win);
+            c->modals.erase(it);
+            break;
+        }
+}
+
+static void handle_new_window(Window win, Capture *state, XWindowAttributes *attr) {
+    if (!state->dpy || !win || !state) return;
+    // make sure what popup/modal/whatever is comming from owned plugin (pressed one)
+    // if (!is_window_from_owned_plugin(state->dpy, win, state)) return;
+
+    bool is_popup = classify_popup(state->dpy, win, attr);
+    fprintf(stderr, "[HANDLE] win=0x%lx is_popup=%d size=%dx%d\n", win, is_popup, attr->width, attr->height);
+    fflush(stderr);
+    if (is_popup) {
+        if ((attr->width <= 1 || attr->height <= 1)) {
+            DEBUG_PRINT("Skipping 1x1 window: 0x%lx (%dx%d)\n", win, attr->width, attr->height);
+            return;
+        }
+
+        if ((attr->width == 12 || attr->height == 12)) {
+            DEBUG_PRINT("Skipping unnamed shadow JUCE window: 0x%lx (%dx%d)\n", win, attr->width, attr->height);
+            return;
+        }
+        canvas_add_popup(state, win, attr);
+    } else {
+        if (attr->width <= 1 || attr->height <= 1) return;
+        create_modal(state, win, attr);
+    }
+}
 // ─── :10 event loop (on the GLib main loop, main thread) ─────────────────────
+
+// A newly-mapped override-redirect window is a plugin popup. Attribute it to the
+// capture whose plugin shares its PID (correct with multiple plugins open), then
+// hand it to that capture's popup canvas.
+static void on_popup_mapped(Window w)
+{
+    XWindowAttributes attr;
+    if (!XGetWindowAttributes(g_wm_dpy, w, &attr) || attr.map_state != IsViewable)
+        return;
+
+    for (auto &kv : g_captures) {
+        Capture *cand = kv.second;
+        if (cand && is_window_from_owned_plugin(cand->dpy, w, cand)) {
+            handle_new_window(w, cand, &attr);
+            return;
+        }
+    }
+}
+
+// A popup was unmapped — remove it from whichever capture owns it.
+static void on_popup_unmapped(Window w)
+{
+    for (auto &kv : g_captures) {
+        Capture *c = kv.second;
+        auto it = std::find_if(c->popups.begin(), c->popups.end(),
+            [w](const Capture::PopupWin &p){ return p.x11_win == w; });
+        if (it != c->popups.end()) { canvas_remove_popup(c, w); return; }
+
+        auto mit = std::find_if(c->modals.begin(), c->modals.end(),
+            [w](const Capture::ModalWin &m){ return m.x11_win == w; });
+        if (mit != c->modals.end()) { modal_remove(c, w); return; }
+    }
+}
+
+static bool refresh_modal_if_any(Window w)
+{
+    for (auto &kv : g_captures) {
+        Capture *c = kv.second;
+        for (auto &md : c->modals)
+            if (md.x11_win == w) { modal_refresh(c, w); return true; }
+    }
+    return false;
+}
 
 static gboolean wm_event_cb(GIOChannel *, GIOCondition, gpointer)
 {
@@ -466,47 +804,15 @@ static gboolean wm_event_cb(GIOChannel *, GIOCondition, gpointer)
         // Let the ICCCM WM layer handle MapRequest/ConfigureRequest/etc first.
         if (g_wm) g_wm->handle_event(&ev);
 
-        // Popup detection: an override-redirect window mapped on :10 that isn't
-        // one of a capture's own windows is a plugin popup (dropdown menu).
-        if (ev.type == MapNotify) {
-            Window w = ev.xmap.window;
-            XWindowAttributes attr;
-            if (XGetWindowAttributes(g_wm_dpy, w, &attr) &&
-                attr.override_redirect && attr.map_state == IsViewable &&
-                attr.width > 1 && attr.height > 1 &&
-                attr.width != 12 && attr.height != 12 &&
-                !find_capture(w))
-            {
-                // Attribute the popup to the currently-active capture. With one
-                // plugin interacting at a time, that's the most recent capture
-                // whose canvas/root is relevant; use the capture that owns the
-                // plugin the popup belongs to (the only one, in practice).
-                Capture *owner = nullptr;
-                for (auto &kv : g_captures) { owner = kv.second; break; }
-                if (owner) {
-                    // We need this capture's own connection (owner->dpy) to
-                    // composite the popup; but the event came on g_wm_dpy. The
-                    // popup window id is valid on both connections.
-                    canvas_add_popup(owner, w, &attr);
-                    continue;
-                }
-            }
-        }
-        else if (ev.type == UnmapNotify) {
-            Window w = ev.xunmap.window;
-            for (auto &kv : g_captures) {
-                Capture *cc = kv.second;
-                auto it = std::find_if(cc->popups.begin(), cc->popups.end(),
-                    [w](const Capture::PopupWin &p){ return p.x11_win == w; });
-                if (it != cc->popups.end()) { canvas_remove_popup(cc, w); break; }
-            }
-        }
-
         Capture *c = find_capture(ev.xany.window);
-        if (!c) continue;
 
-        // Damage → re-grab the pixmap and redraw.
-        if (c->damage_base && ev.type == c->damage_base + XDamageNotify) {
+        // Modals aren't registered captures; refresh them on their own events.
+        if (!c && (ev.type == ConfigureNotify || ev.type == Expose || ev.type == MapNotify)) {
+            if (refresh_modal_if_any(ev.xany.window)) continue;
+        }
+
+        // Damage on a known capture → re-grab the pixmap and redraw.
+        if (c && c->damage_base && ev.type == c->damage_base + XDamageNotify) {
             XDamageSubtract(c->dpy, c->damage, None, None);
             refresh_pixmap(c);
             continue;
@@ -514,9 +820,26 @@ static gboolean wm_event_cb(GIOChannel *, GIOCondition, gpointer)
 
         switch (ev.type)
         {
+            case MapNotify:
+                if (c) {
+                    // One of a capture's own windows mapped.
+                    if (ev.xmap.window == c->plugin_win || ev.xmap.window == c->gui_win) {
+                        XSync(c->dpy, False);
+                        refresh_pixmap(c);
+                    }
+                } else {
+                    // Not a known capture window → candidate plugin popup.
+                    on_popup_mapped(ev.xmap.window);
+                }
+                break;
+
+            case UnmapNotify:
+                on_popup_unmapped(ev.xunmap.window);
+                break;
+
             case ConfigureNotify:
-                if (ev.xconfigure.window == c->plugin_win || ev.xconfigure.window == c->gui_win)
-                {
+                if (c && (ev.xconfigure.window == c->plugin_win ||
+                          ev.xconfigure.window == c->gui_win)) {
                     XResizeWindow(c->dpy, c->parent_win,
                                   ev.xconfigure.width, ev.xconfigure.height);
                     XFlush(c->dpy);
@@ -525,15 +848,10 @@ static gboolean wm_event_cb(GIOChannel *, GIOCondition, gpointer)
                 }
                 break;
 
-            case MapNotify:
-                if (ev.xmap.window == c->plugin_win || ev.xmap.window == c->gui_win) {
-                    XSync(c->dpy, False);
-                    refresh_pixmap(c);
-                }
-                break;
             case Expose:
-                refresh_pixmap(c);
+                if (c) refresh_pixmap(c);
                 break;
+
             default:
                 break;
         }
@@ -690,6 +1008,21 @@ void xw_size(HWND hwnd)
         } else {
             gtk_fixed_move(GTK_FIXED(container), hwnd->m_oswidget, pos_x, pos_y);
             gtk_widget_set_size_request(hwnd->m_oswidget, w, h);
+        }
+
+        // **Request parent window resize to fit new plugin size**
+        if (GTK_IS_WINDOW(parent->m_oswidget)) {
+            int needed_width = pos_x + (r.right - r.left);
+            int needed_height = pos_y + (r.bottom - r.top);
+
+            // Set minimum size requirement
+            gtk_widget_set_size_request(GTK_WIDGET(parent->m_oswidget), 
+                                        needed_width, 
+                                        needed_height);
+
+            // Trigger relayout
+            gtk_widget_queue_resize(GTK_WIDGET(parent->m_oswidget));
+
         }
     } else if (GTK_IS_CONTAINER(container) && !bs->placed) {
         gtk_container_add(GTK_CONTAINER(container), hwnd->m_oswidget);
