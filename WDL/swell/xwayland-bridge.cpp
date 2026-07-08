@@ -419,15 +419,24 @@ static void canvas_add_popup(Capture *c, Window x11_win, XWindowAttributes *attr
     XSync(c->dpy, False);
     Pixmap pixmap = XCompositeNameWindowPixmap(c->dpy, x11_win);
 
-    Capture::PopupWin p;
-    p.x11_win = x11_win;
-    p.pixmap  = pixmap;
-    p.x = px + attr->x + c->gtk_x;
-    p.y = py + attr->y + c->gtk_y;
-    p.w = attr->width;
-    p.h = attr->height;
-    p.visible = true;
-    c->popups.push_back(p);
+    // Update-or-insert: if this window already has an entry, reuse it and free the
+    // stale pixmap (Wine reuses window IDs; a duplicate would leave a freed pixmap
+    // being composited). One entry per window.
+    Capture::PopupWin *pp = nullptr;
+    for (auto &e : c->popups) if (e.x11_win == x11_win) { pp = &e; break; }
+    if (pp) {
+        if (pp->pixmap != None && pp->pixmap != pixmap) XFreePixmap(c->dpy, pp->pixmap);
+    } else {
+        c->popups.emplace_back();
+        pp = &c->popups.back();
+    }
+    pp->x11_win = x11_win;
+    pp->pixmap  = pixmap;
+    pp->x = px + attr->x + c->gtk_x;
+    pp->y = py + attr->y + c->gtk_y;
+    pp->w = attr->width;
+    pp->h = attr->height;
+    pp->visible = true;
 
     if (c->root_popup == None) c->root_popup = x11_win;
 
@@ -439,10 +448,11 @@ static void canvas_add_popup(Capture *c, Window x11_win, XWindowAttributes *attr
 static void canvas_remove_popup(Capture *c, Window x11_win)
 {
     if (!c) return;
-    auto it = std::find_if(c->popups.begin(), c->popups.end(),
-                           [x11_win](const Capture::PopupWin &p){ return p.x11_win == x11_win; });
-    if (it != c->popups.end()) {
-        c->popups.erase(it);
+    for (auto it = c->popups.begin(); it != c->popups.end(); ) {
+        if (it->x11_win == x11_win) {
+            if (it->pixmap != None) { XFreePixmap(c->dpy, it->pixmap); it->pixmap = None; }
+            it = c->popups.erase(it);
+        } else ++it;
     }
     if (c->root_popup == x11_win) c->root_popup = None;
 
@@ -669,6 +679,9 @@ static void modal_render_destroy(gpointer data, GClosure *) { delete (ModalRende
 
 static void create_modal(Capture *state, Window win, XWindowAttributes *attr)
 {
+    // Never create a second modal for the same window.
+    for (auto &m : state->modals) if (m.x11_win == win) return;
+
     Display *dpy = state->dpy;
     XCompositeRedirectWindow(dpy, win, CompositeRedirectAutomatic);
     XSync(dpy, False);
@@ -727,12 +740,15 @@ static void modal_remove(Capture *c, Window win)
 
 static void handle_new_window(Window win, Capture *state, XWindowAttributes *attr) {
     if (!state->dpy || !win || !state) return;
-    // make sure what popup/modal/whatever is comming from owned plugin (pressed one)
-    // if (!is_window_from_owned_plugin(state->dpy, win, state)) return;
+
+    // Already tracked? A repeated MapNotify (Wine re-maps) must not spawn a second
+    // popup/modal. Refresh an existing popup; leave an existing modal alone.
+    for (auto &p : state->popups)
+        if (p.x11_win == win) { canvas_add_popup(state, win, attr); return; }
+    for (auto &m : state->modals)
+        if (m.x11_win == win) return;
 
     bool is_popup = classify_popup(state->dpy, win, attr);
-    fprintf(stderr, "[HANDLE] win=0x%lx is_popup=%d size=%dx%d\n", win, is_popup, attr->width, attr->height);
-    fflush(stderr);
     if (is_popup) {
         if ((attr->width <= 1 || attr->height <= 1)) {
             DEBUG_PRINT("Skipping 1x1 window: 0x%lx (%dx%d)\n", win, attr->width, attr->height);
@@ -794,6 +810,28 @@ static bool refresh_modal_if_any(Window w)
     return false;
 }
 
+// A popup moved/resized (drag-and-drop popup). Update its geometry from the raw
+// configure coords (already root-relative on :10) and re-capture its pixmap.
+static bool on_popup_configured(Window w, int cx, int cy, int cw, int ch)
+{
+    for (auto &kv : g_captures) {
+        Capture *c = kv.second;
+        for (auto &p : c->popups) {
+            if (p.x11_win != w) continue;
+            p.x = cx; p.y = cy; p.w = cw; p.h = ch;
+            if (p.pixmap != None) XFreePixmap(c->dpy, p.pixmap);
+            p.pixmap = XCompositeNameWindowPixmap(c->dpy, w);
+            if (c->canvas_draw) {
+                GdkWindow *cwin = gtk_widget_get_window(c->canvas_draw);
+                if (cwin) gdk_window_invalidate_rect(cwin, NULL, FALSE);
+                else      gtk_widget_queue_draw(c->canvas_draw);
+            }
+            return true;
+        }
+    }
+    return false;
+}
+
 static gboolean wm_event_cb(GIOChannel *, GIOCondition, gpointer)
 {
     while (XPending(g_wm_dpy))
@@ -845,6 +883,11 @@ static gboolean wm_event_cb(GIOChannel *, GIOCondition, gpointer)
                     XFlush(c->dpy);
                     refresh_pixmap(c);
                     if (c->hwnd) SendMessage(c->hwnd, WM_SIZE, SIZE_RESTORED, 0);
+                }
+                else if (!c) {
+                    on_popup_configured(ev.xconfigure.window,
+                                        ev.xconfigure.x, ev.xconfigure.y,
+                                        ev.xconfigure.width, ev.xconfigure.height);
                 }
                 break;
 
