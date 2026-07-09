@@ -664,6 +664,30 @@ static gboolean modal_motion(GtkWidget *, GdkEventMotion *e, gpointer data)
     return TRUE;
 }
 
+static gboolean modal_key(GtkWidget *, GdkEventKey *e, gpointer data)
+{
+    ModalRender *m = (ModalRender*)data;
+    if (!m || !m->cap->dpy) return FALSE;
+
+    // Modals are separate top-level GTK windows, so they bypass the bridge's
+    // OnKeyEvent/xw_forward_key path. Forward keys straight to the modal's own
+    // X11 window on :10, or it never gets keyboard input (Enter/Esc/text) and wedges.
+    XKeyEvent xev; memset(&xev, 0, sizeof(xev));
+    xev.type        = (e->type == GDK_KEY_PRESS) ? KeyPress : KeyRelease;
+    xev.display     = m->cap->dpy;
+    xev.window      = m->x11_win;
+    xev.root        = DefaultRootWindow(m->cap->dpy);
+    xev.time        = CurrentTime;
+    xev.keycode     = e->hardware_keycode;
+    xev.state       = e->state;
+    xev.same_screen = True;
+    XSendEvent(m->cap->dpy, m->x11_win, True,
+               (e->type == GDK_KEY_PRESS) ? KeyPressMask : KeyReleaseMask,
+               (XEvent*)&xev);
+    XFlush(m->cap->dpy);
+    return TRUE;
+}
+
 static void modal_render_destroy(gpointer data, GClosure *) { delete (ModalRender*)data; }
 
 static void create_modal(Capture *state, Window win, XWindowAttributes *attr)
@@ -692,29 +716,24 @@ static void create_modal(Capture *state, Window win, XWindowAttributes *attr)
     ModalRender *mr = new ModalRender();
     mr->cap = state; mr->x11_win = win;
 
-    gtk_widget_add_events(draw, GDK_BUTTON_PRESS_MASK | GDK_BUTTON_RELEASE_MASK | GDK_POINTER_MOTION_MASK);
+    gtk_widget_add_events(draw, GDK_BUTTON_PRESS_MASK | GDK_BUTTON_RELEASE_MASK |
+                                GDK_POINTER_MOTION_MASK | GDK_KEY_PRESS_MASK | GDK_KEY_RELEASE_MASK);
+    gtk_widget_set_can_focus(draw, TRUE);
     g_signal_connect(draw, "button-press-event",   G_CALLBACK(modal_button_press),   mr);
     g_signal_connect(draw, "button-release-event", G_CALLBACK(modal_button_release), mr);
     g_signal_connect(draw, "motion-notify-event",  G_CALLBACK(modal_motion),         mr);
+    g_signal_connect(draw, "key-press-event",      G_CALLBACK(modal_key),            mr);
+    g_signal_connect(draw, "key-release-event",    G_CALLBACK(modal_key),            mr);
     g_signal_connect_data(draw, "draw", G_CALLBACK(modal_draw_cb), mr, modal_render_destroy, (GConnectFlags)0);
 
     gtk_widget_show_all(gtk_win);
+    gtk_widget_grab_focus(draw);
 
     Capture::ModalWin md;
     md.x11_win = win; md.pixmap = pm; md.gtk_win = gtk_win; md.draw = draw;
     state->modals.push_back(md);
 }
 
-static void modal_refresh(Capture *c, Window win)
-{
-    for (auto &md : c->modals)
-        if (md.x11_win == win) {
-            if (md.pixmap) XFreePixmap(c->dpy, md.pixmap);
-            md.pixmap = XCompositeNameWindowPixmap(c->dpy, win);
-            if (md.draw) gtk_widget_queue_draw(md.draw);
-            break;
-        }
-}
 
 static void modal_remove(Capture *c, Window win)
 {
@@ -789,15 +808,6 @@ static void on_popup_unmapped(Window w)
     }
 }
 
-static bool refresh_modal_if_any(Window w)
-{
-    for (auto &kv : g_captures) {
-        Capture *c = kv.second;
-        for (auto &md : c->modals)
-            if (md.x11_win == w) { modal_refresh(c, w); return true; }
-    }
-    return false;
-}
 
 // A popup moved/resized (drag-and-drop popup). Update its geometry from the raw
 // configure coords (already root-relative on :10) and re-capture its pixmap.
@@ -828,11 +838,6 @@ static void bridge_handle_event(XEvent *ev)
 {
     Capture *c = find_capture(ev->xany.window);
 
-    // Modals aren't registered captures; refresh them on their own events.
-    if (!c && (ev->type == ConfigureNotify || ev->type == Expose || ev->type == MapNotify)) {
-        if (refresh_modal_if_any(ev->xany.window)) return;
-    }
-
     // Damage on a known capture → re-grab the pixmap and redraw.
     if (c && c->damage_base && ev->type == c->damage_base + XDamageNotify) {
         XDamageSubtract(c->dpy, c->damage, None, None);
@@ -840,7 +845,8 @@ static void bridge_handle_event(XEvent *ev)
         return;
     }
 
-    // Beyond here we only deal with popups/modals (c set => plugin window).
+    // Beyond here we only deal with popups (c set => this is a plugin window,
+    // handled elsewhere; modals refresh in capture_update).
     if (c) return;
     switch (ev->type)
     {
@@ -908,6 +914,14 @@ static gboolean capture_update(HWND hwnd)
 
     if (bs->cap && bs->cap->widget)
         gtk_widget_queue_draw(bs->cap->widget);
+
+    // Redraw this plugin's modals each tick — same cheap model as the main GUI:
+    // just queue_draw. The pixmap is named once in create_modal and, under
+    // CompositeRedirectAutomatic, tracks the window's content live, so no per-frame
+    // re-capture is needed (resizes are handled separately if they occur).
+    if (bs->cap)
+        for (auto &md : bs->cap->modals)
+            if (md.draw) gtk_widget_queue_draw(md.draw);
 
     return TRUE;
 }
