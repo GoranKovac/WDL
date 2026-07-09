@@ -13,6 +13,7 @@ static int x11_error_handler(Display *dpy, XErrorEvent *err)
 {
     if (err->error_code == BadWindow   ||
         err->error_code == BadDrawable ||
+        err->error_code == BadPixmap   ||
         err->error_code == BadMatch    ||
         err->error_code == BadAccess) return 0;
 #ifdef _DEBUG
@@ -238,8 +239,13 @@ static Capture* setup_capture(Display *dpy, Window parent_win, Window plugin_win
 static void refresh_pixmap(Capture *c)
 {
     if (!c) return;
-    if (c->pixmap) XFreePixmap(c->dpy, c->pixmap);
+    // Ensure any pending resize is applied server-side before we (re)name the
+    // composite pixmap — otherwise we grab a pixmap that the server immediately
+    // invalidates, and the next free hits BadPixmap.
+    XSync(c->dpy, False);
+    Pixmap old = c->pixmap;
     c->pixmap = XCompositeNameWindowPixmap(c->dpy, c->plugin_win);
+    if (old) XFreePixmap(c->dpy, old);
     if (c->widget) gtk_widget_queue_draw(c->widget);
 }
 
@@ -877,12 +883,20 @@ static gboolean wm_event_cb(GIOChannel *, GIOCondition, gpointer)
 
             case ConfigureNotify:
                 if (c && (ev.xconfigure.window == c->plugin_win ||
-                          ev.xconfigure.window == c->gui_win)) {
-                    XResizeWindow(c->dpy, c->parent_win,
-                                  ev.xconfigure.width, ev.xconfigure.height);
-                    XFlush(c->dpy);
+                          ev.xconfigure.window == c->gui_win  ||
+                          ev.xconfigure.window == c->parent_win)) {
+                    // The plugin GUI changed size. Re-capture the composite pixmap
+                    // at the new size, update the SWELL window's rect to the new
+                    // plugin size, and relayout via WM_SIZE so the GDK container
+                    // grows to match the plugin (plugin drives size, not us).
                     refresh_pixmap(c);
-                    if (c->hwnd) SendMessage(c->hwnd, WM_SIZE, SIZE_RESTORED, 0);
+                    // if (c->hwnd) {
+                    //     RECT r = c->hwnd->m_position;
+                    //     r.right  = r.left + ev.xconfigure.width;
+                    //     r.bottom = r.top  + ev.xconfigure.height;
+                    //     c->hwnd->m_position = r;
+                    //     SendMessage(c->hwnd, WM_SIZE, SIZE_RESTORED, 0);
+                    // }
                 }
                 else if (!c) {
                     on_popup_configured(ev.xconfigure.window,
@@ -1041,6 +1055,10 @@ void xw_size(HWND hwnd)
     // Feed the same GTK offset to the popup canvas so popups position correctly
     // in both floating and FX-list embedded modes.
     if (bs->cap) { bs->cap->gtk_x = pos_x; bs->cap->gtk_y = pos_y; }
+
+    // Re-capture the pixmap at the new size — xw_size runs exactly when the window
+    // is being resized, so the backing pixmap must be refreshed here.
+    if (bs->cap) refresh_pixmap(bs->cap);
 
     if (GTK_IS_FIXED(container)) {
         if (!bs->placed) {
