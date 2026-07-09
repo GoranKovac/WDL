@@ -396,7 +396,7 @@ static void canvas_add_popup(Capture *c, Window x11_win, XWindowAttributes *attr
     if (!c->popup_canvas) create_popup_canvas(c);
 
     XCompositeRedirectWindow(c->dpy, x11_win, CompositeRedirectAutomatic);
-    XSync(c->dpy, False);
+    XFlush(c->dpy);   // non-blocking; don't stall the main loop on every popup
     Pixmap pixmap = XCompositeNameWindowPixmap(c->dpy, x11_win);
 
     // Update-or-insert: if this window already has an entry, reuse it and free the
@@ -897,12 +897,6 @@ HWND xw_bridge_create(HWND viewpar, void **wref, const RECT *r, const char *brid
                                            WhitePixel(disp, screen));
     XMapWindow(disp, container);
     XFlush(disp);
-
-    // Register the container with the WM so it tracks reparented plugin windows
-    // and redirects substructure for it. Without this, a plugin reparenting into
-    // this container isn't tracked and never gets its synthetic ConfigureNotify —
-    // which breaks rendering (notably with multiple plugins open).
-    if (g_wm) g_wm->register_container(container, true);
 
     GtkWidget *draw_area = gtk_drawing_area_new();
     gtk_widget_set_size_request(draw_area, w, h);
