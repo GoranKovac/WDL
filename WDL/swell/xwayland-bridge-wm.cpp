@@ -204,6 +204,17 @@ void XWaylandWM::announce_wm(Window support_win) {
     }
 }
 
+// ─── Container registration ───────────────────────────────────────────────────
+void XWaylandWM::register_container(Window container, bool is_native) {
+    containers_.insert(container);
+    xwm_redirect_container(dpy_, container);
+    (void)is_native;
+}
+
+void XWaylandWM::unregister_container(Window container) {
+    containers_.erase(container);
+}
+
 // ─── Window tracking ──────────────────────────────────────────────────────────
 void XWaylandWM::track_window(Window w, Window parent, bool is_native_plugin) {
     if (states_.count(w)) return;
@@ -263,6 +274,7 @@ bool XWaylandWM::handle_event(XEvent *ev) {
     switch (ev->type) {
     case MapRequest:       DEBUG_PRINT("[WM] -> MapRequest\n");       return on_map_request(&ev->xmaprequest);
     case ConfigureRequest: DEBUG_PRINT("[WM] -> ConfigureRequest\n"); return on_configure_request(&ev->xconfigurerequest);
+    case ReparentNotify:   DEBUG_PRINT("[WM] -> ReparentNotify\n");   return on_reparent_notify(&ev->xreparent);
     case UnmapNotify:      DEBUG_PRINT("[WM] -> UnmapNotify\n");      return on_unmap_notify(&ev->xunmap);
     case DestroyNotify:    DEBUG_PRINT("[WM] -> DestroyNotify\n");    return on_destroy_notify(&ev->xdestroywindow);
     default:
@@ -386,6 +398,35 @@ XFlush(dpy_);
     XFlush(dpy_);
 }
 
+// ─── ReparentNotify ───────────────────────────────────────────────────────────
+// Sent when a window is reparented into our container. Track it and send a
+// synthetic ConfigureNotify so native plugins learn their geometry and render.
+bool XWaylandWM::on_reparent_notify(XReparentEvent *ev) {
+    if (!containers_.count(ev->parent))
+        return false;
+
+    if (!states_.count(ev->window))
+        track_window(ev->window, ev->parent, true);
+
+    XWindowAttributes attr{};
+    if (XGetWindowAttributes(dpy_, ev->window, &attr) == 0) return false;
+
+    XEvent synth{};
+    synth.type                         = ConfigureNotify;
+    synth.xconfigure.event             = ev->window;
+    synth.xconfigure.window            = ev->window;
+    synth.xconfigure.x                 = ev->x;
+    synth.xconfigure.y                 = ev->y;
+    synth.xconfigure.width             = attr.width;
+    synth.xconfigure.height            = attr.height;
+    synth.xconfigure.border_width      = attr.border_width;
+    synth.xconfigure.above             = None;
+    synth.xconfigure.override_redirect = attr.override_redirect;
+    XSendEvent(dpy_, ev->window, False, StructureNotifyMask, &synth);
+
+    return false; // let the bridge also see this
+}
+
 // ─── UnmapNotify ──────────────────────────────────────────────────────────────
 bool XWaylandWM::on_unmap_notify(XUnmapEvent *ev) {
     auto it = states_.find(ev->window);
@@ -463,6 +504,36 @@ void XWaylandWM::read_wm_hints(Window w, WMWindowState &st) {
     if (hints->flags & InputHint)
         st.input_hint = (hints->input != 0);
     XFree(hints);
+}
+
+void xwm_redirect_container(Display *dpy, Window container) {
+    XSelectInput(dpy, container,
+                 SubstructureRedirectMask |
+                 SubstructureNotifyMask   |
+                 StructureNotifyMask      |
+                 PropertyChangeMask);
+    XFlush(dpy);
+}
+
+void xwm_send_reparent_synthetic(Display *dpy, Window client,
+                                  Window new_parent, int x, int y) {
+    (void)new_parent;
+    XWindowAttributes attr{};
+    if (!XGetWindowAttributes(dpy, client, &attr)) return;
+
+    XEvent ev{};
+    ev.type                         = ConfigureNotify;
+    ev.xconfigure.event             = client;
+    ev.xconfigure.window            = client;
+    ev.xconfigure.x                 = x;
+    ev.xconfigure.y                 = y;
+    ev.xconfigure.width             = attr.width;
+    ev.xconfigure.height            = attr.height;
+    ev.xconfigure.border_width      = attr.border_width;
+    ev.xconfigure.above             = None;
+    ev.xconfigure.override_redirect = False;
+    XSendEvent(dpy, client, False, StructureNotifyMask, &ev);
+    XFlush(dpy);
 }
 
 void xwm_send_protocol_message(Display *dpy, Window w, Atom protocol, Time t) {
@@ -620,4 +691,3 @@ bool classify_popup(Display *dpy, Window win, XWindowAttributes *attr) {
     }
     return is_popup;
 }
-
