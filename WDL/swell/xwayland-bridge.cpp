@@ -19,8 +19,6 @@ struct Capture {
     Window     plugin_win  = 0;         // the plugin's X11 window (child of parent)
     Window     gui_win     = 0;         // Wine child GUI (or == plugin_win for native)
     Pixmap     pixmap      = 0;         // composite backing pixmap of plugin_win
-    Damage     damage      = 0;         // damage on parent_win (via g_wm_dpy)
-    int        damage_base = 0;
     GtkWidget *widget      = nullptr;   // SWELL draw area we blit into
     HWND       hwnd        = nullptr;   // back-reference
 
@@ -203,12 +201,6 @@ static Capture* setup_capture(Display *dpy, Window parent_win, Window plugin_win
 
     XCompositeRedirectWindow(dpy, plugin_win, CompositeRedirectAutomatic);
 
-    int base, err;
-    if (g_wm_dpy && XDamageQueryExtension(g_wm_dpy, &base, &err)) {
-        c->damage      = XDamageCreate(g_wm_dpy, parent_win, XDamageReportNonEmpty);
-        c->damage_base = base;
-    }
-
     XFlush(dpy);
 
     c->pixmap = XCompositeNameWindowPixmap(dpy, plugin_win);
@@ -236,7 +228,6 @@ static void cleanup_capture(Capture *c)
 {
     if (!c) return;
     unregister_capture(c);
-    if (c->damage) XDamageDestroy(c->dpy, c->damage);
     if (c->pixmap) XFreePixmap(c->dpy, c->pixmap);
     Display *d = c->dpy;
     c->dpy = nullptr;
@@ -690,20 +681,13 @@ static bool on_popup_configured(Window w, int cx, int cy, int cw, int ch)
 
 // Bridge per-event handling, registered as g_wm->on_unhandled_event. The WM has
 // already processed the event (MapRequest/ConfigureRequest/etc); here we deal
-// only with our own concerns: capture damage, and popup/modal lifecycle.
+// only with our own concerns: popup/modal lifecycle.
 static void bridge_handle_event(XEvent *ev)
 {
     Capture *c = find_capture(ev->xany.window);
 
-    // Damage on a known capture → re-grab the pixmap and redraw.
-    // if (c && c->damage_base && ev->type == c->damage_base + XDamageNotify) {
-    //     XDamageSubtract(c->dpy, c->damage, None, None);
-    //     refresh_pixmap(c);
-    //     return;
-    // }
-
-    // Beyond here we only deal with popups (c set => this is a plugin window,
-    // handled elsewhere; modals refresh in capture_update).
+    // We only deal with popups here (c set => this is a plugin window, refreshed
+    // by the per-tick timer; modals refresh in capture_update).
     if (c) return;
     switch (ev->type)
     {
