@@ -76,7 +76,7 @@ struct bridgeState {
 
 // ─── Blit: plugin pixmap → SWELL widget ──────────────────────────────────────
 
-static gboolean on_draw(GtkWidget *, cairo_t *cr, gpointer data)
+static bool on_draw(GtkWidget *, cairo_t *cr, gpointer data)
 {
     Capture *c = (Capture*)data;
     if (!c || !c->dpy || !c->pixmap) return FALSE;
@@ -95,7 +95,7 @@ static gboolean on_draw(GtkWidget *, cairo_t *cr, gpointer data)
         cairo_paint(cr);
         cairo_surface_destroy(surf);
     }
-    return TRUE;
+    return true;
 }
 
 // ─── Input forwarding ────────────────────────────────────────────────────────
@@ -112,64 +112,64 @@ static void forward_motion(Capture *c, int wx, int wy)
     XTestFakeMotionEvent(c->dpy, DefaultScreen(c->dpy), rx, ry, CurrentTime);
 }
 
-static gboolean on_button_press(GtkWidget *widget, GdkEventButton *e, gpointer data)
+static bool on_button_press(GtkWidget *widget, GdkEventButton *e, gpointer data)
 {
     Capture *c = (Capture*)data;
-    if (!c || !c->dpy) return FALSE;
+    if (!c || !c->dpy) return false;
     if (c->hwnd) SetFocus(c->hwnd);
     // if (!gtk_widget_has_focus(widget))
     //     gtk_widget_grab_focus(widget);
     forward_motion(c, (int)e->x, (int)e->y);
     XTestFakeButtonEvent(c->dpy, e->button, True, CurrentTime);
     XFlush(c->dpy);
-    return TRUE;
+    return true;
 }
 
-static gboolean on_button_release(GtkWidget *, GdkEventButton *e, gpointer data)
+static bool on_button_release(GtkWidget *, GdkEventButton *e, gpointer data)
 {
     Capture *c = (Capture*)data;
-    if (!c || !c->dpy) return FALSE;
+    if (!c || !c->dpy) return false;
     forward_motion(c, (int)e->x, (int)e->y);
     XTestFakeButtonEvent(c->dpy, e->button, False, CurrentTime);
     XFlush(c->dpy);
-    return TRUE;
+    return true;
 }
 
-static gboolean on_motion(GtkWidget *, GdkEventMotion *e, gpointer data)
+static bool on_motion(GtkWidget *, GdkEventMotion *e, gpointer data)
 {
     Capture *c = (Capture*)data;
-    if (!c || !c->dpy) return FALSE;
+    if (!c || !c->dpy) return false;
     forward_motion(c, (int)e->x, (int)e->y);
     XFlush(c->dpy);
-    return TRUE;
+    return true;
 }
 
-static gboolean on_scroll(GtkWidget *, GdkEventScroll *e, gpointer data)
+static bool on_scroll(GtkWidget *, GdkEventScroll *e, gpointer data)
 {
     Capture *c = (Capture*)data;
-    if (!c || !c->dpy) return FALSE;
+    if (!c || !c->dpy) return false;
     unsigned int btn = 0;
     switch (e->direction) {
         case GDK_SCROLL_UP:    btn = 4; break;
         case GDK_SCROLL_DOWN:  btn = 5; break;
         case GDK_SCROLL_LEFT:  btn = 6; break;
         case GDK_SCROLL_RIGHT: btn = 7; break;
-        default: return FALSE;
+        default: return false;
     }
     forward_motion(c, (int)e->x, (int)e->y);
     XTestFakeButtonEvent(c->dpy, btn, True,  CurrentTime);
     XTestFakeButtonEvent(c->dpy, btn, False, CurrentTime);
     XFlush(c->dpy);
-    return TRUE;
+    return true;
 }
 
-gboolean on_enter(GtkWidget *widget, GdkEventCrossing *event, gpointer data)
+bool on_enter(GtkWidget *widget, GdkEventCrossing *event, gpointer data)
 {
     Capture *c = (Capture*)data;
     // DEBUG_PRINT("[GTK] enter widget=%p\n", widget);
     XRaiseWindow(c->dpy, c->parent_win);
     XFlush(c->dpy);
-    return FALSE;
+    return false;
 }
 
 // Wire the SWELL draw area to blit + forward input.
@@ -249,10 +249,10 @@ static void cleanup_capture(Capture *c)
 // (override-redirect menu) is composite-captured and blitted into the canvas at
 // its screen position. Input on the canvas is forwarded back to the plugin.
 
-static gboolean canvas_draw_cb(GtkWidget *, cairo_t *cr, gpointer data)
+static bool canvas_draw_cb(GtkWidget *, cairo_t *cr, gpointer data)
 {
     Capture *c = (Capture*)data;
-    if (!c || !c->dpy) return FALSE;
+    if (!c || !c->dpy) return false;
 
     // Transparent clear.
     cairo_set_source_rgba(cr, 0, 0, 0, 0);
@@ -279,13 +279,13 @@ static gboolean canvas_draw_cb(GtkWidget *, cairo_t *cr, gpointer data)
             cairo_surface_destroy(surf);
         }
     }
-    return TRUE;
+    return true;
 }
 
-static gboolean canvas_button_press(GtkWidget *, GdkEventButton *e, gpointer data)
+static bool canvas_button_press(GtkWidget *, GdkEventButton *e, gpointer data)
 {
     Capture *c = (Capture*)data;
-    if (!c || !c->dpy) return FALSE;
+    if (!c || !c->dpy) return false;
 
     int screen_x = (int)e->x + c->canvas_origin_x;
     int screen_y = (int)e->y + c->canvas_origin_y;
@@ -302,7 +302,7 @@ static gboolean canvas_button_press(GtkWidget *, GdkEventButton *e, gpointer dat
             XFlush(c->dpy);
             XTestFakeButtonEvent(c->dpy, e->button, True, CurrentTime);
             XFlush(c->dpy);
-            return TRUE;
+            return true;
         }
     }
     // Clicked outside any popup — dismiss.
@@ -312,24 +312,24 @@ static gboolean canvas_button_press(GtkWidget *, GdkEventButton *e, gpointer dat
         XFlush(c->dpy);
         XTestFakeButtonEvent(c->dpy, e->button, False, CurrentTime);
         XFlush(c->dpy);
-        return TRUE;
+        return true;
     }
-    return FALSE;
+    return false;
 }
 
-static gboolean canvas_button_release(GtkWidget *, GdkEventButton *e, gpointer data)
+static bool canvas_button_release(GtkWidget *, GdkEventButton *e, gpointer data)
 {
     Capture *c = (Capture*)data;
-    if (!c || !c->dpy) return FALSE;
+    if (!c || !c->dpy) return false;
     XTestFakeButtonEvent(c->dpy, e->button, False, CurrentTime);
     XFlush(c->dpy);
-    return TRUE;
+    return true;
 }
 
-static gboolean canvas_motion(GtkWidget *, GdkEventMotion *e, gpointer data)
+static bool canvas_motion(GtkWidget *, GdkEventMotion *e, gpointer data)
 {
     Capture *c = (Capture*)data;
-    if (!c || !c->dpy) return FALSE;
+    if (!c || !c->dpy) return false;
 
     int screen_x = (int)e->x + c->canvas_origin_x;
     int screen_y = (int)e->y + c->canvas_origin_y;
@@ -341,7 +341,7 @@ static gboolean canvas_motion(GtkWidget *, GdkEventMotion *e, gpointer data)
 
     static guint32 last_time = 0;
     guint32 now = g_get_monotonic_time() / 1000;
-    if (now - last_time < 16) return TRUE;
+    if (now - last_time < 16) return true;
     last_time = now;
 
     for (auto &p : c->popups) {
@@ -354,7 +354,7 @@ static gboolean canvas_motion(GtkWidget *, GdkEventMotion *e, gpointer data)
             break;
         }
     }
-    return TRUE;
+    return true;
 }
 
 static void create_popup_canvas(Capture *c)
@@ -458,15 +458,15 @@ static void canvas_remove_popup(Capture *c, Window x11_win)
 
 struct ModalRender { Capture *cap; Window x11_win; };
 
-static gboolean modal_draw_cb(GtkWidget *, cairo_t *cr, gpointer data)
+static bool modal_draw_cb(GtkWidget *, cairo_t *cr, gpointer data)
 {
     ModalRender *m = (ModalRender*)data;
-    if (!m || !m->cap || !m->cap->dpy) return FALSE;
+    if (!m || !m->cap || !m->cap->dpy) return false;
     Display *dpy = m->cap->dpy;
     Pixmap pm = 0;
     for (auto &md : m->cap->modals)
         if (md.x11_win == m->x11_win) { pm = md.pixmap; break; }
-    if (!pm) return FALSE;
+    if (!pm) return false;
 
     Window rr; int gx, gy; unsigned int gw, gh, gb, gd;
     if (!XGetGeometry(dpy, pm, &rr, &gx, &gy, &gw, &gh, &gb, &gd)) return FALSE;
@@ -481,7 +481,7 @@ static gboolean modal_draw_cb(GtkWidget *, cairo_t *cr, gpointer data)
         cairo_paint(cr);
         cairo_surface_destroy(surf);
     }
-    return TRUE;
+    return true;
 }
 
 static void modal_forward_motion(ModalRender *m, int wx, int wy)
@@ -492,39 +492,39 @@ static void modal_forward_motion(ModalRender *m, int wx, int wy)
     XTestFakeMotionEvent(m->cap->dpy, DefaultScreen(m->cap->dpy), rx, ry, CurrentTime);
 }
 
-static gboolean modal_button_press(GtkWidget *, GdkEventButton *e, gpointer data)
+static bool modal_button_press(GtkWidget *, GdkEventButton *e, gpointer data)
 {
     ModalRender *m = (ModalRender*)data;
-    if (!m || !m->cap->dpy) return FALSE;
+    if (!m || !m->cap->dpy) return false;
     modal_forward_motion(m, (int)e->x, (int)e->y);
     XTestFakeButtonEvent(m->cap->dpy, e->button, True, CurrentTime);
     XFlush(m->cap->dpy);
-    return TRUE;
+    return true;
 }
 
-static gboolean modal_button_release(GtkWidget *, GdkEventButton *e, gpointer data)
+static bool modal_button_release(GtkWidget *, GdkEventButton *e, gpointer data)
 {
     ModalRender *m = (ModalRender*)data;
-    if (!m || !m->cap->dpy) return FALSE;
+    if (!m || !m->cap->dpy) return false;
     modal_forward_motion(m, (int)e->x, (int)e->y);
     XTestFakeButtonEvent(m->cap->dpy, e->button, False, CurrentTime);
     XFlush(m->cap->dpy);
-    return TRUE;
+    return true;
 }
 
-static gboolean modal_motion(GtkWidget *, GdkEventMotion *e, gpointer data)
+static bool modal_motion(GtkWidget *, GdkEventMotion *e, gpointer data)
 {
     ModalRender *m = (ModalRender*)data;
-    if (!m || !m->cap->dpy) return FALSE;
+    if (!m || !m->cap->dpy) return false;
     modal_forward_motion(m, (int)e->x, (int)e->y);
     XFlush(m->cap->dpy);
-    return TRUE;
+    return true;
 }
 
-static gboolean modal_key(GtkWidget *, GdkEventKey *e, gpointer data)
+static bool modal_key(GtkWidget *, GdkEventKey *e, gpointer data)
 {
     ModalRender *m = (ModalRender*)data;
-    if (!m || !m->cap->dpy) return FALSE;
+    if (!m || !m->cap->dpy) return false;
 
     // Modals are separate top-level GTK windows, so they bypass the bridge's
     // OnKeyEvent/xw_forward_key path. Forward keys straight to the modal's own
@@ -542,7 +542,7 @@ static gboolean modal_key(GtkWidget *, GdkEventKey *e, gpointer data)
                (e->type == GDK_KEY_PRESS) ? KeyPressMask : KeyReleaseMask,
                (XEvent*)&xev);
     XFlush(m->cap->dpy);
-    return TRUE;
+    return true;
 }
 
 static void modal_render_destroy(gpointer data, GClosure *) { delete (ModalRender*)data; }
@@ -731,9 +731,9 @@ void init_private_xwayland()
     g_wm->on_unhandled_event = bridge_handle_event;
 }
 
-static gboolean capture_update(HWND hwnd)
+static bool capture_update(HWND hwnd)
 {
-    if (!hwnd || !hwnd->m_private_data) return TRUE;
+    if (!hwnd || !hwnd->m_private_data) return true;
     bridgeState *bs = (bridgeState*)hwnd->m_private_data;
 
     // First tick(s): the plugin creates its window as a child of our container.
@@ -780,7 +780,7 @@ static gboolean capture_update(HWND hwnd)
         for (auto &md : bs->cap->modals)
             if (md.draw) gtk_widget_queue_draw(md.draw);
 
-    return TRUE;
+    return true;
 }
 
 void xw_destroy(HWND hwnd)
