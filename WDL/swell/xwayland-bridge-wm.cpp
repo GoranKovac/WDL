@@ -17,17 +17,96 @@
 #endif
 
 #include "xwayland-bridge-wm.h"
+#include "xwayland-bridge.h"          // g_wm, g_wm_dpy
 #include <X11/extensions/XTest.h>
 #include <X11/extensions/Xcomposite.h>
 #include <cstring>
 #include <cstdio>
-#include <thread>
-#include <atomic>
+#include <cstdlib>
+#include <unistd.h>
+#include <sys/prctl.h>
+#include <signal.h>
+#include <glib.h>
 #include <algorithm>
 
 // ─── Construction ─────────────────────────────────────────────────────────────
 XWaylandWM::XWaylandWM(Display *dpy) : dpy_(dpy) {
     init_atoms();
+}
+
+// ─── Infrastructure: Xwayland spawn, error handling, event pump ───────────────
+// This has nothing to do with the bridge's compositing/input work — it's the WM
+// owning its own X connection, process, and event loop.
+
+static pid_t s_xwayland_pid = 0;
+
+static int wm_x11_error_handler(Display *dpy, XErrorEvent *err)
+{
+    if (err->error_code == BadWindow   ||
+        err->error_code == BadDrawable ||
+        err->error_code == BadPixmap   ||
+        err->error_code == BadMatch    ||
+        err->error_code == BadAccess) return 0;
+#ifdef _DEBUG
+    char buf[256];
+    XGetErrorText(dpy, err->error_code, buf, sizeof(buf));
+    DEBUG_PRINT("X11 Error: %s (request %d, resource 0x%lx)\n",
+                buf, err->request_code, err->resourceid);
+#endif
+    return 0;
+}
+
+// GLib main-loop watch: pump all pending events. The WM handles each first, then
+// the bridge gets a look via on_unhandled_event for its own per-event work.
+static gboolean wm_gio_event_cb(GIOChannel *, GIOCondition, gpointer)
+{
+    while (g_wm_dpy && XPending(g_wm_dpy)) {
+        XEvent ev;
+        XNextEvent(g_wm_dpy, &ev);
+        if (g_wm) {
+            g_wm->handle_event(&ev);
+            if (g_wm->on_unhandled_event) g_wm->on_unhandled_event(&ev);
+        }
+    }
+    return TRUE;
+}
+
+XWaylandWM* XWaylandWM::init_bridge_wm(const char *display_name)
+{
+    if (s_xwayland_pid > 0) return g_wm;
+
+    s_xwayland_pid = fork();
+    if (s_xwayland_pid == 0) {
+        prctl(PR_SET_PDEATHSIG, SIGTERM);
+        execl("/usr/bin/Xwayland", "Xwayland", display_name, "-rootless", NULL);
+        _exit(1);
+    }
+    if (s_xwayland_pid < 0) return nullptr;
+
+    setenv("DISPLAY", display_name, 1);
+    XInitThreads();
+    XSetErrorHandler(wm_x11_error_handler);
+
+    for (int i = 0; i < 30; i++) {
+        g_wm_dpy = XOpenDisplay(display_name);
+        if (g_wm_dpy) break;
+        usleep(100000);
+    }
+    if (!g_wm_dpy) { DEBUG_PRINT("[WM] Xwayland not ready\n"); return nullptr; }
+
+    g_wm = new XWaylandWM(g_wm_dpy);
+
+    Window support = XCreateSimpleWindow(g_wm_dpy, DefaultRootWindow(g_wm_dpy),
+                                         -2, -2, 1, 1, 0, 0, 0);
+    XMapWindow(g_wm_dpy, support);
+    g_wm->announce_wm(support);
+
+    GIOChannel *ch = g_io_channel_unix_new(ConnectionNumber(g_wm_dpy));
+    g_io_add_watch(ch, G_IO_IN, wm_gio_event_cb, nullptr);
+    g_io_channel_unref(ch);
+
+    DEBUG_PRINT("[WM] initialised\n");
+    return g_wm;
 }
 
 // ─── Atom initialisation ──────────────────────────────────────────────────────
@@ -125,53 +204,7 @@ void XWaylandWM::announce_wm(Window support_win) {
     }
 }
 
-void XWaylandWM::start_event_loop()
-{
-    running_ = true;
-    event_thread_ = std::thread([this]() {
-        DEBUG_PRINT("[WM] event loop thread started\n");
-        while (running_) {
-            // Block until an event arrives — no polling, no CPU waste
-            XEvent ev;
-            XNextEvent(dpy_, &ev);
-            DEBUG_PRINT("[WM] thread got event type=%d win=0x%lx\n", ev.type, ev.xany.window);
-            handle_event(&ev);
-        }
-        DEBUG_PRINT("[WM] event loop thread stopped\n");
-    });
-}
-
-void XWaylandWM::stop_event_loop()
-{
-    running_ = false;
-    // Wake the thread if it's blocked on XNextEvent
-    // Send a harmless ClientMessage to ourselves
-    XClientMessageEvent ev{};
-    ev.type         = ClientMessage;
-    ev.window       = support_win_;
-    ev.message_type = XInternAtom(dpy_, "WM_PROTOCOLS", False);
-    ev.format       = 32;
-    XSendEvent(dpy_, support_win_, False, NoEventMask, (XEvent*)&ev);
-    XFlush(dpy_);
-    if (event_thread_.joinable())
-        event_thread_.join();
-}
-
-// ─── Container registration ───────────────────────────────────────────────────
-
-void XWaylandWM::register_container(Window container, bool is_native) {
-    containers_.insert(container);
-    // SubstructureRedirect lets us intercept MapRequest/ConfigureRequest
-    xwm_redirect_container(dpy_, container);
-    (void)is_native; // per-child flag set in track_window
-}
-
-void XWaylandWM::unregister_container(Window container) {
-    containers_.erase(container);
-}
-
 // ─── Window tracking ──────────────────────────────────────────────────────────
-
 void XWaylandWM::track_window(Window w, Window parent, bool is_native_plugin) {
     if (states_.count(w)) return;
 
@@ -226,34 +259,14 @@ const WMWindowState* XWaylandWM::window_state(Window w) const {
 // ─── Main event dispatcher ────────────────────────────────────────────────────
 
 bool XWaylandWM::handle_event(XEvent *ev) {
-    DEBUG_PRINT("[WM] handle_event type=%d win=0x%lx\n", ev->type, ev->xany.window);
+    // DEBUG_PRINT("[WM] handle_event type=%d win=0x%lx\n", ev->type, ev->xany.window);
     switch (ev->type) {
     case MapRequest:       DEBUG_PRINT("[WM] -> MapRequest\n");       return on_map_request(&ev->xmaprequest);
     case ConfigureRequest: DEBUG_PRINT("[WM] -> ConfigureRequest\n"); return on_configure_request(&ev->xconfigurerequest);
-    case ReparentNotify:   DEBUG_PRINT("[WM] -> ReparentNotify\n");   return on_reparent_notify(&ev->xreparent);
     case UnmapNotify:      DEBUG_PRINT("[WM] -> UnmapNotify\n");      return on_unmap_notify(&ev->xunmap);
     case DestroyNotify:    DEBUG_PRINT("[WM] -> DestroyNotify\n");    return on_destroy_notify(&ev->xdestroywindow);
-    case ClientMessage:    DEBUG_PRINT("[WM] -> ClientMessage\n");    return on_client_message(&ev->xclient);
-    case PropertyNotify:   DEBUG_PRINT("[WM] -> PropertyNotify\n");   return on_property_notify(&ev->xproperty);
-    // case CreateNotify:     DEBUG_PRINT("[WM] -> CreateNotify\n");     return on_create_notify(&ev->xcreatewindow);
-    // case MapNotify:        DEBUG_PRINT("[WM] -> MapNotify\n");        return on_map_notify(&ev->xmap);
-    // case KeyPress:
-    //     DEBUG_PRINT("[WM] KeyPress win=0x%lx keycode=%u state=0x%x time=%lu\n",
-    //                 ev->xkey.window,
-    //                 ev->xkey.keycode,
-    //                 ev->xkey.state,
-    //                 ev->xkey.time);
-    //     return false;
-    //
-    // case KeyRelease:
-    //     DEBUG_PRINT("[WM] KeyRelease win=0x%lx keycode=%u state=0x%x time=%lu\n",
-    //                 ev->xkey.window,
-    //                 ev->xkey.keycode,
-    //                 ev->xkey.state,
-    //                 ev->xkey.time);
-    //     return false;
     default:
-    DEBUG_PRINT("[WM] -> unhandled (type=%d)\n", ev->type);
+    // DEBUG_PRINT("[WM] -> unhandled (type=%d)\n", ev->type);
         return false;
     }
 }
@@ -373,39 +386,7 @@ XFlush(dpy_);
     XFlush(dpy_);
 }
 
-// ─── ReparentNotify ───────────────────────────────────────────────────────────
-// Sent when a window is reparented into our container.
-
-bool XWaylandWM::on_reparent_notify(XReparentEvent *ev) {
-    if (!containers_.count(ev->parent))
-        return false;
-
-    if (!states_.count(ev->window))
-        track_window(ev->window, ev->parent, true);
-
-    // Some native plugins need a synthetic ConfigureNotify after reparent
-    // so they know their new position within the parent. Send it.
-    XWindowAttributes attr{};
-    if (XGetWindowAttributes(dpy_, ev->window, &attr) == 0) return false;
-
-    XEvent synth{};
-    synth.type                    = ConfigureNotify;
-    synth.xconfigure.event        = ev->window;
-    synth.xconfigure.window       = ev->window;
-    synth.xconfigure.x            = ev->x;
-    synth.xconfigure.y            = ev->y;
-    synth.xconfigure.width        = attr.width;
-    synth.xconfigure.height       = attr.height;
-    synth.xconfigure.border_width = attr.border_width;
-    synth.xconfigure.above        = None;
-    synth.xconfigure.override_redirect = attr.override_redirect;
-    XSendEvent(dpy_, ev->window, False, StructureNotifyMask, &synth);
-
-    return false; // let the rest of the bridge also see this
-}
-
 // ─── UnmapNotify ──────────────────────────────────────────────────────────────
-
 bool XWaylandWM::on_unmap_notify(XUnmapEvent *ev) {
     auto it = states_.find(ev->window);
     if (it == states_.end()) return false;
@@ -417,83 +398,9 @@ bool XWaylandWM::on_unmap_notify(XUnmapEvent *ev) {
 }
 
 // ─── DestroyNotify ────────────────────────────────────────────────────────────
-
 bool XWaylandWM::on_destroy_notify(XDestroyWindowEvent *ev) {
     untrack_window(ev->window);
     return false;
-}
-
-// ─── ClientMessage ────────────────────────────────────────────────────────────
-
-bool XWaylandWM::on_client_message(XClientMessageEvent *ev) {
-    // _NET_WM_STATE change request (e.g. plugin wants to go modal)
-    if ((Atom)ev->message_type == atoms_._NET_WM_STATE) {
-        // ev->data.l[0] = 0 remove, 1 add, 2 toggle
-        // ev->data.l[1..2] = atoms to change
-        // We update our state but don't veto — the WM would normally do
-        // decoration changes here, which we skip.
-        if (states_.count(ev->window)) {
-            long action = ev->data.l[0];
-            for (int i = 1; i <= 2; ++i) {
-                Atom a = (Atom)ev->data.l[i];
-                if (a == atoms_._NET_WM_STATE_MODAL) {
-                    if (action == 1 || action == 2)
-                        states_[ev->window].is_modal = true;
-                    else
-                        states_[ev->window].is_modal = false;
-                }
-            }
-        }
-        return false;
-    }
-
-    // WM_CHANGE_STATE iconify request — we just ignore
-    if ((Atom)ev->message_type == atoms_.WM_CHANGE_STATE)
-        return true;
-
-    // _NET_ACTIVE_WINDOW request
-    if ((Atom)ev->message_type == atoms_._NET_ACTIVE_WINDOW) {
-        Window w = ev->window;
-        if (states_.count(w) && states_[w].take_focus)
-            send_take_focus(w, (Time)ev->data.l[1]);
-        return true;
-    }
-
-    return false;
-}
-
-// ─── PropertyNotify — re-read hints when client updates them ─────────────────
-
-bool XWaylandWM::on_property_notify(XPropertyEvent *ev) {
-    if (!states_.count(ev->window)) return false;
-    auto &st = states_[ev->window];
-
-    if (ev->atom == atoms_.WM_PROTOCOLS)
-        read_wm_protocols(ev->window, st);
-    else if (ev->atom == atoms_.WM_HINTS)
-        read_wm_hints(ev->window, st);
-    else if (ev->atom == atoms_.WM_TRANSIENT_FOR) {
-        Window trans = None;
-        XGetTransientForHint(dpy_, ev->window, &trans);
-        st.transient_for = trans;
-    }
-    return false;
-}
-
-// ─── Focus ────────────────────────────────────────────────────────────────────
-
-void XWaylandWM::on_gtk_focus(GtkWidget * /*widget*/, Window x11_win) {
-    if (!states_.count(x11_win)) return;
-    auto &st = states_[x11_win];
-    Time t = get_server_time();
-    if (st.take_focus)
-        send_take_focus(x11_win, t);
-    // Force focus for globally-active (input=False) and as a robust fallback.
-    XSetInputFocus(dpy_, x11_win, RevertToParent, t);
-}
-
-void XWaylandWM::on_gtk_unfocus(GtkWidget * /*widget*/) {
-    // Nothing to do — plugin retains focus within its container
 }
 
 // ─── WM_TAKE_FOCUS / WM_DELETE_WINDOW ────────────────────────────────────────
@@ -527,7 +434,6 @@ void XWaylandWM::send_delete_window(Window w, Time t) {
 
 // ─── WM_STATE property helper ─────────────────────────────────────────────────
 // ICCCM §4.1.3.1  WM_STATE = { state, icon_window }
-
 void XWaylandWM::set_wm_state(Window w, int state) {
     long data[2] = { state, None };
     XChangeProperty(dpy_, w,
@@ -536,7 +442,6 @@ void XWaylandWM::set_wm_state(Window w, int state) {
 }
 
 // ─── Read WM_PROTOCOLS ────────────────────────────────────────────────────────
-
 void XWaylandWM::read_wm_protocols(Window w, WMWindowState &st) {
     Atom *protocols = nullptr;
     int n = 0;
@@ -552,52 +457,12 @@ void XWaylandWM::read_wm_protocols(Window w, WMWindowState &st) {
 }
 
 // ─── Read WM_HINTS ────────────────────────────────────────────────────────────
-
 void XWaylandWM::read_wm_hints(Window w, WMWindowState &st) {
     XWMHints *hints = XGetWMHints(dpy_, w);
     if (!hints) return;
     if (hints->flags & InputHint)
         st.input_hint = (hints->input != 0);
     XFree(hints);
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
-// Free helpers
-// ─────────────────────────────────────────────────────────────────────────────
-
-void xwm_redirect_container(Display *dpy, Window container) {
-    // SubstructureRedirectMask lets us receive MapRequest/ConfigureRequest
-    // for direct children of `container`.
-    // SubstructureNotifyMask lets us receive CreateNotify/DestroyNotify etc.
-    XSelectInput(dpy, container,
-                 SubstructureRedirectMask |
-                 SubstructureNotifyMask   |
-                 StructureNotifyMask      |
-                 PropertyChangeMask);
-    XFlush(dpy);
-}
-
-void xwm_send_reparent_synthetic(Display *dpy, Window client,
-                                  Window new_parent, int x, int y) {
-    // After XReparentWindow the X server sends a ReparentNotify to the client,
-    // but some ICCCM clients also expect a synthetic ConfigureNotify with the
-    // new geometry relative to the new parent so they can redraw.
-    XWindowAttributes attr{};
-    if (!XGetWindowAttributes(dpy, client, &attr)) return;
-
-    XEvent ev{};
-    ev.type                         = ConfigureNotify;
-    ev.xconfigure.event             = client;
-    ev.xconfigure.window            = client;
-    ev.xconfigure.x                 = x;
-    ev.xconfigure.y                 = y;
-    ev.xconfigure.width             = attr.width;
-    ev.xconfigure.height            = attr.height;
-    ev.xconfigure.border_width      = attr.border_width;
-    ev.xconfigure.above             = None;
-    ev.xconfigure.override_redirect = False;
-    XSendEvent(dpy, client, False, StructureNotifyMask, &ev);
-    XFlush(dpy);
 }
 
 void xwm_send_protocol_message(Display *dpy, Window w, Atom protocol, Time t) {
