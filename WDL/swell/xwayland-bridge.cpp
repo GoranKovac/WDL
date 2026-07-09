@@ -5,25 +5,8 @@
 #endif
 #include "xwayland-bridge.h"
 
-static pid_t    s_xwayland_pid = 0;
 XWaylandWM     *g_wm           = nullptr;
 Display *g_wm_dpy       = nullptr;
-
-static int x11_error_handler(Display *dpy, XErrorEvent *err)
-{
-    if (err->error_code == BadWindow   ||
-        err->error_code == BadDrawable ||
-        err->error_code == BadPixmap   ||
-        err->error_code == BadMatch    ||
-        err->error_code == BadAccess) return 0;
-#ifdef _DEBUG
-    char buf[256];
-    XGetErrorText(dpy, err->error_code, buf, sizeof(buf));
-    DEBUG_PRINT("X11 Error: %s (request %d, resource 0x%lx)\n",
-                buf, err->request_code, err->resourceid);
-#endif
-    return 0;
-}
 
 // ─── State ───────────────────────────────────────────────────────────────────
 // One plugin = one capture. We composite-capture the plugin's X11 window into a
@@ -838,118 +821,51 @@ static bool on_popup_configured(Window w, int cx, int cy, int cw, int ch)
     return false;
 }
 
-static gboolean wm_event_cb(GIOChannel *, GIOCondition, gpointer)
+// Bridge per-event handling, registered as g_wm->on_unhandled_event. The WM has
+// already processed the event (MapRequest/ConfigureRequest/etc); here we deal
+// only with our own concerns: capture damage, and popup/modal lifecycle.
+static void bridge_handle_event(XEvent *ev)
 {
-    while (XPending(g_wm_dpy))
-    {
-        XEvent ev;
-        XNextEvent(g_wm_dpy, &ev);
+    Capture *c = find_capture(ev->xany.window);
 
-        // Let the ICCCM WM layer handle MapRequest/ConfigureRequest/etc first.
-        if (g_wm) g_wm->handle_event(&ev);
-
-        Capture *c = find_capture(ev.xany.window);
-
-        // Modals aren't registered captures; refresh them on their own events.
-        if (!c && (ev.type == ConfigureNotify || ev.type == Expose || ev.type == MapNotify)) {
-            if (refresh_modal_if_any(ev.xany.window)) continue;
-        }
-
-        // Damage on a known capture → re-grab the pixmap and redraw.
-        if (c && c->damage_base && ev.type == c->damage_base + XDamageNotify) {
-            XDamageSubtract(c->dpy, c->damage, None, None);
-            refresh_pixmap(c);
-            continue;
-        }
-
-        switch (ev.type)
-        {
-            case MapNotify:
-                if (c) {
-                    // One of a capture's own windows mapped.
-                    if (ev.xmap.window == c->plugin_win || ev.xmap.window == c->gui_win) {
-                        XSync(c->dpy, False);
-                        refresh_pixmap(c);
-                    }
-                } else {
-                    // Not a known capture window → candidate plugin popup.
-                    on_popup_mapped(ev.xmap.window);
-                }
-                break;
-
-            case UnmapNotify:
-                on_popup_unmapped(ev.xunmap.window);
-                break;
-
-            case ConfigureNotify:
-                if (c && (ev.xconfigure.window == c->plugin_win ||
-                          ev.xconfigure.window == c->gui_win  ||
-                          ev.xconfigure.window == c->parent_win)) {
-                    // The plugin GUI changed size. Re-capture the composite pixmap
-                    // at the new size, update the SWELL window's rect to the new
-                    // plugin size, and relayout via WM_SIZE so the GDK container
-                    // grows to match the plugin (plugin drives size, not us).
-                    refresh_pixmap(c);
-                    // if (c->hwnd) {
-                    //     RECT r = c->hwnd->m_position;
-                    //     r.right  = r.left + ev.xconfigure.width;
-                    //     r.bottom = r.top  + ev.xconfigure.height;
-                    //     c->hwnd->m_position = r;
-                    //     SendMessage(c->hwnd, WM_SIZE, SIZE_RESTORED, 0);
-                    // }
-                }
-                else if (!c) {
-                    on_popup_configured(ev.xconfigure.window,
-                                        ev.xconfigure.x, ev.xconfigure.y,
-                                        ev.xconfigure.width, ev.xconfigure.height);
-                }
-                break;
-
-            case Expose:
-                if (c) refresh_pixmap(c);
-                break;
-
-            default:
-                break;
-        }
+    // Modals aren't registered captures; refresh them on their own events.
+    if (!c && (ev->type == ConfigureNotify || ev->type == Expose || ev->type == MapNotify)) {
+        if (refresh_modal_if_any(ev->xany.window)) return;
     }
-    return TRUE;
+
+    // Damage on a known capture → re-grab the pixmap and redraw.
+    if (c && c->damage_base && ev->type == c->damage_base + XDamageNotify) {
+        XDamageSubtract(c->dpy, c->damage, None, None);
+        refresh_pixmap(c);
+        return;
+    }
+
+    // Beyond here we only deal with popups/modals (c set => plugin window).
+    if (c) return;
+    switch (ev->type)
+    {
+        case MapNotify:
+            on_popup_mapped(ev->xmap.window);
+            break;
+        case UnmapNotify:
+            on_popup_unmapped(ev->xunmap.window);
+            break;
+        case ConfigureNotify:
+            on_popup_configured(ev->xconfigure.window,
+                                ev->xconfigure.x, ev->xconfigure.y,
+                                ev->xconfigure.width, ev->xconfigure.height);
+            break;
+        default:
+            break;
+    }
 }
 
 void init_private_xwayland()
 {
-    if (s_xwayland_pid > 0) return;
-
-    s_xwayland_pid = fork();
-    if (s_xwayland_pid == 0) {
-        prctl(PR_SET_PDEATHSIG, SIGTERM);
-        execl("/usr/bin/Xwayland", "Xwayland", ":10", "-rootless", NULL);
-        exit(1);
-    }
-    if (s_xwayland_pid < 0) return;
-
-    setenv("DISPLAY", ":10", 1);
-    XInitThreads();
-    XSetErrorHandler(x11_error_handler);
-
-    for (int i = 0; i < 30; i++) {
-        g_wm_dpy = XOpenDisplay(":10");
-        if (g_wm_dpy) break;
-        usleep(100000);
-    }
-    if (!g_wm_dpy) { DEBUG_PRINT("[XW] Xwayland not ready\n"); return; }
-
-    g_wm = new XWaylandWM(g_wm_dpy);
-    Window support = XCreateSimpleWindow(g_wm_dpy, DefaultRootWindow(g_wm_dpy),
-                                         -2, -2, 1, 1, 0, 0, 0);
-    XMapWindow(g_wm_dpy, support);
-    g_wm->announce_wm(support);
-
-    GIOChannel *ch = g_io_channel_unix_new(ConnectionNumber(g_wm_dpy));
-    g_io_add_watch(ch, G_IO_IN, wm_event_cb, nullptr);
-    g_io_channel_unref(ch);
-
-    DEBUG_PRINT("[XW] initialised\n");
+    // The WM owns Xwayland spawn, the X connection, error handling, and the event
+    // pump. We just bring it up and register our per-event handler.
+    if (!XWaylandWM::init_bridge_wm(":10")) return;
+    g_wm->on_unhandled_event = bridge_handle_event;
 }
 
 static gboolean capture_update(HWND hwnd)
@@ -1037,16 +953,16 @@ void xw_size(HWND hwnd)
     HWND fp = hwnd->m_parent;
     if (fp) {
         // FLOATING PLUGIN
-        DEBUG_PRINT("[XWM] xw_size: parent->m_position=%d,%d,%d,%d\n",
-                    fp->m_position.left, fp->m_position.top,
-                    fp->m_position.right, fp->m_position.bottom);
+        // DEBUG_PRINT("[XWM] xw_size: parent->m_position=%d,%d,%d,%d\n",
+        //             fp->m_position.left, fp->m_position.top,
+        //             fp->m_position.right, fp->m_position.bottom);
         pos_x = fp->m_position.left + r.left;
         pos_y = fp->m_position.top  + r.top;
         // PLUGIN IN FX LIST
         if (fp->m_parent) {
-            DEBUG_PRINT("[XWM] xw_size: grandparent->m_position=%d,%d,%d,%d\n",
-                        fp->m_parent->m_position.left, fp->m_parent->m_position.top,
-                        fp->m_parent->m_position.right, fp->m_parent->m_position.bottom);
+            // DEBUG_PRINT("[XWM] xw_size: grandparent->m_position=%d,%d,%d,%d\n",
+            //             fp->m_parent->m_position.left, fp->m_parent->m_position.top,
+            //             fp->m_parent->m_position.right, fp->m_parent->m_position.bottom);
             pos_y += fp->m_parent->m_position.bottom - fp->m_position.bottom;
         }
     }
@@ -1059,7 +975,8 @@ void xw_size(HWND hwnd)
     // Re-capture the pixmap at the new size — xw_size runs exactly when the window
     // is being resized, so the backing pixmap must be refreshed here.
     if (bs->cap) refresh_pixmap(bs->cap);
-
+    XResizeWindow(bs->cap->dpy, bs->cap->parent_win, w, h);
+    XFlush(bs->cap->dpy);
     if (GTK_IS_FIXED(container)) {
         if (!bs->placed) {
             gtk_fixed_put(GTK_FIXED(container), hwnd->m_oswidget, pos_x, pos_y);

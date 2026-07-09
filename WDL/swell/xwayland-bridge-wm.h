@@ -13,8 +13,6 @@
 #include <set>
 #include <vector>
 #include <functional>
-#include <thread>
-#include <atomic>
 
 // ─── Atoms we manage ─────────────────────────────────────────────────────────
 struct WMAtoms {
@@ -86,8 +84,13 @@ class XWaylandWM {
 public:
     explicit XWaylandWM(Display *dpy);
     ~XWaylandWM();
-    void start_event_loop();
-    void stop_event_loop();
+
+    // One-shot bring-up: spawn Xwayland on the given display, install the X error
+    // handler, open the WM connection, construct + announce the WM, and attach a
+    // GIO watch that pumps events on the GLib main loop. Returns the global WM
+    // instance (also stored in g_wm) or nullptr on failure. Infrastructure that
+    // has nothing to do with the bridge lives here.
+    static XWaylandWM* init_bridge_wm(const char *display_name = ":10");
 
     // Call once after creating your root/parent windows to announce ourselves
     // as the WM (needed for native plugins that check _NET_SUPPORTING_WM_CHECK)
@@ -138,6 +141,10 @@ public:
     // Callbacks — wire these up after construction
     std::function<void(Window /*dismissed*/)> on_popup_dismissed;
     std::function<void(Window /*w*/, int x, int y, int w2, int h)> on_configure_applied;
+    // Fired for every event AFTER the WM layer has had a look, so the bridge can
+    // do its own per-event work (captures, popups, modals, damage). The WM does
+    // not consume plugin/popup content events; the bridge owns that.
+    std::function<void(XEvent* /*ev*/)> on_unhandled_event;
 
 private:
     void init_atoms();
@@ -162,8 +169,6 @@ private:
     std::set<Window> containers_;
     GrabState   grab_;
     Window      support_win_ = None;
-    std::thread event_thread_;
-    std::atomic<bool> running_{false};
 };
 
 // ─── Free helpers used by swell-generic-gdk.cpp ──────────────────────────────
