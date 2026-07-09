@@ -266,7 +266,7 @@ bool XWaylandWM::handle_event(XEvent *ev) {
     case UnmapNotify:      DEBUG_PRINT("[WM] -> UnmapNotify\n");      return on_unmap_notify(&ev->xunmap);
     case DestroyNotify:    DEBUG_PRINT("[WM] -> DestroyNotify\n");    return on_destroy_notify(&ev->xdestroywindow);
     default:
-    // DEBUG_PRINT("[WM] -> unhandled (type=%d)\n", ev->type);
+    DEBUG_PRINT("[WM] -> unhandled (type=%d)\n", ev->type);
         return false;
     }
 }
@@ -477,3 +477,147 @@ void xwm_send_protocol_message(Display *dpy, Window w, Atom protocol, Time t) {
     XSendEvent(dpy, w, False, NoEventMask, &ev);
     XFlush(dpy);
 }
+
+bool is_window_from_owned_plugin(Display *dpy, Window org_win, Window gui_win) {
+    // Check if this window has the same PID as our plugin
+    Atom atom_pid = XInternAtom(dpy, "_NET_WM_PID", False);
+    Atom actual_type;
+    int actual_format;
+    unsigned long nitems, bytes_after;
+    unsigned char *prop = NULL;
+
+    pid_t window_pid = 0;
+    if (XGetWindowProperty(dpy, org_win, atom_pid, 0, 1, False, XA_CARDINAL,
+                           &actual_type, &actual_format, &nitems, &bytes_after, &prop) == Success) {
+        if (prop && nitems > 0) {
+            window_pid = *((pid_t*)prop);
+            XFree(prop);
+        }
+    }
+
+    // Get our plugin's PID (from main_plugin_gui)
+    pid_t our_pid = 0;
+    if (XGetWindowProperty(dpy, gui_win, atom_pid, 0, 1, False, XA_CARDINAL,
+                           &actual_type, &actual_format, &nitems, &bytes_after, &prop) == Success) {
+        if (prop && nitems > 0) {
+            our_pid = *((pid_t*)prop);
+            XFree(prop);
+        }
+    }
+
+    if (window_pid == 0 || our_pid == 0 || window_pid != our_pid) {
+        return FALSE;
+    }
+
+    return TRUE;
+}
+
+// Motif hints tell us whether a window wants decorations. yabridge popups and
+// modals both arrive as NORMAL type with the yabridge class; the difference is
+// that a popup disables decorations (MWM_HINTS_DECORATIONS set, decorations==0)
+// while a real modal dialog keeps them. This is the signal that separates them.
+struct MotifWmHints {
+    unsigned long flags;
+    unsigned long functions;
+    unsigned long decorations;
+    long          input_mode;
+    unsigned long status;
+};
+#define MWM_HINTS_DECORATIONS (1L << 1)
+
+static bool hasMotifHints(Display *dpy, Window win, MotifWmHints &out) {
+    Atom a = XInternAtom(dpy, "_MOTIF_WM_HINTS", True);
+    if (a == None) return false;
+
+    Atom actual_type; int actual_format;
+    unsigned long nitems, bytes_after;
+    unsigned char *prop = nullptr;
+    if (XGetWindowProperty(dpy, win, a, 0, 5, False, a,
+                           &actual_type, &actual_format,
+                           &nitems, &bytes_after, &prop) != Success)
+        return false;
+    if (!prop || actual_format != 32 || nitems < 5) { if (prop) XFree(prop); return false; }
+
+    const long *l = reinterpret_cast<long*>(prop);
+    out.flags = l[0]; out.functions = l[1]; out.decorations = l[2];
+    out.input_mode = l[3]; out.status = l[4];
+    XFree(prop);
+    return true;
+}
+
+bool classify_popup(Display *dpy, Window win, XWindowAttributes *attr) {
+    if (!dpy || !win) return false;
+
+    Atom atom_window_type        = XInternAtom(dpy, "_NET_WM_WINDOW_TYPE", False);
+    Atom atom_type_normal        = XInternAtom(dpy, "_NET_WM_WINDOW_TYPE_NORMAL", False);
+    Atom atom_type_dialog        = XInternAtom(dpy, "_NET_WM_WINDOW_TYPE_DIALOG", False);
+    Atom atom_type_popup_menu    = XInternAtom(dpy, "_NET_WM_WINDOW_TYPE_POPUP_MENU", False);
+    Atom atom_type_menu          = XInternAtom(dpy, "_NET_WM_WINDOW_TYPE_MENU", False);
+    Atom atom_type_dropdown_menu = XInternAtom(dpy, "_NET_WM_WINDOW_TYPE_DROPDOWN_MENU", False);
+    Atom atom_type_tooltip       = XInternAtom(dpy, "_NET_WM_WINDOW_TYPE_TOOLTIP", False);
+    Atom atom_type_dnd           = XInternAtom(dpy, "_NET_WM_WINDOW_TYPE_DND", False);
+    Atom atom_type_utility       = XInternAtom(dpy, "_NET_WM_WINDOW_TYPE_UTILITY", False);
+
+    bool is_popup = false;
+    Window transient_for = None;
+    XGetTransientForHint(dpy, win, &transient_for);
+
+    std::vector<Atom> window_types;
+    Atom actual_type;
+    int actual_format;
+    unsigned long nitems = 0, bytes_after = 0;
+    unsigned char* prop = nullptr;
+
+    if (XGetWindowProperty(dpy, win, atom_window_type, 0, 10,
+                           False, XA_ATOM, &actual_type, &actual_format,
+                           &nitems, &bytes_after, &prop) == Success) {
+        if (prop) {
+            if (actual_format == 32 && nitems > 0) {
+                Atom* atoms = (Atom*)prop;  // Simple C cast is fine
+                window_types.assign(atoms, atoms + nitems);
+            }
+            XFree(prop);
+        }
+    }
+
+    if (window_types.empty()) {
+        if (transient_for != None) {
+            window_types.push_back(atom_type_dialog);
+        } else {
+            window_types.push_back(atom_type_normal);
+        }
+    }
+
+    bool override_redirect = attr->override_redirect;
+
+    // Decoration state: a decoration-less window is a popup, a decorated one is
+    // a real (modal) window
+    bool motif_popup = false;
+    MotifWmHints mh;
+    if (hasMotifHints(dpy, win, mh))
+        motif_popup = (mh.flags & MWM_HINTS_DECORATIONS) && mh.decorations == 0;
+
+    for (Atom ty : window_types) {
+        if (ty == atom_type_normal) {
+            is_popup = override_redirect || motif_popup;
+        }
+        else if (ty == atom_type_dialog || ty == atom_type_utility) {
+            is_popup = override_redirect;
+        }
+        else if (
+            ty == atom_type_popup_menu ||
+            ty == atom_type_menu ||
+            ty == atom_type_dropdown_menu ||
+            ty == atom_type_tooltip ||
+            ty == atom_type_dnd
+        ) {
+            is_popup = true;
+        }
+        else {
+            continue;   // unknown → try next
+        }
+        break;
+    }
+    return is_popup;
+}
+
