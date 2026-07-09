@@ -184,3 +184,7 @@ void xwm_send_reparent_synthetic(Display *dpy, Window client, Window new_parent,
 
 // Send a WM_PROTOCOLS ClientMessage.
 void xwm_send_protocol_message(Display *dpy, Window w, Atom protocol, Time t);
+
+bool is_window_from_owned_plugin(Display *dpy, Window org_win, Window gui_win);
+
+bool classify_popup(Display *dpy, Window win, XWindowAttributes *attr);
