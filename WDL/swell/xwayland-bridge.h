@@ -19,7 +19,6 @@
 #include <GL/glx.h>
 
 #include <sys/prctl.h>
-#include <X11/extensions/Xdamage.h>
 #include "xwayland-bridge-wm.h"
 #include "swell.h"
 #include "swell-internal.h"
