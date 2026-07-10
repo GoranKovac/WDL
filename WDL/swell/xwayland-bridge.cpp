@@ -21,6 +21,9 @@ struct Capture {
     Pixmap     pixmap      = 0;         // composite backing pixmap of plugin_win
     GtkWidget *widget      = nullptr;   // SWELL draw area we blit into
     HWND       hwnd        = nullptr;   // back-reference
+    //
+    Damage     damage      = 0;         // damage on parent_win (via g_wm_dpy)
+    int        damage_base = 0;
 
     // ── Popups (plugin dropdown menus / override-redirect windows) ──
     // Drawn into a single transparent full-screen overlay canvas, exactly like
@@ -39,12 +42,18 @@ struct Capture {
     std::vector<PopupWin> popups;
 
     // ── Modals (real dialog windows the plugin opens) ──
-    struct ModalWin { Window x11_win; Pixmap pixmap; GtkWidget *gtk_win; GtkWidget *draw; };
+    struct ModalWin { Window x11_win; Pixmap pixmap; GtkWidget *gtk_win; GtkWidget *draw; Damage damage; };
     std::vector<ModalWin> modals;
 };
 
 // Route :10 events (on g_wm_dpy) to the owning capture.
 static std::map<Window, Capture*> g_captures;
+
+// Damage event base on g_wm_dpy (queried once). Same for every damage object we
+// create, so we test event type against this rather than a per-capture copy —
+// modal windows aren't in g_captures, so we can't resolve them before the type
+// check.
+static int g_damage_event_base = -1;
 
 static void register_capture(Capture *c)
 {
@@ -200,6 +209,12 @@ static Capture* setup_capture(Display *dpy, Window parent_win, Window plugin_win
     c->hwnd       = hwnd;
 
     XCompositeRedirectWindow(dpy, plugin_win, CompositeRedirectAutomatic);
+
+    int base, err;
+    if (g_wm_dpy && XDamageQueryExtension(g_wm_dpy, &base, &err)) {
+        c->damage      = XDamageCreate(g_wm_dpy, plugin_win, XDamageReportBoundingBox);
+        c->damage_base = base;
+    }
 
     XFlush(dpy);
 
@@ -577,8 +592,14 @@ static void create_modal(Capture *state, Window win, XWindowAttributes *attr)
     gtk_widget_show_all(gtk_win);
     gtk_widget_grab_focus(draw);
 
+    // Damage-drive the modal exactly like the main plugin GUI: one damage object
+    // on g_wm_dpy, partial repaints of md.draw. Replaces the old 100ms full-redraw.
+    Damage dmg = 0;
+    if (g_wm_dpy && g_damage_event_base >= 0)
+        dmg = XDamageCreate(g_wm_dpy, win, XDamageReportBoundingBox);
+
     Capture::ModalWin md;
-    md.x11_win = win; md.pixmap = pm; md.gtk_win = gtk_win; md.draw = draw;
+    md.x11_win = win; md.pixmap = pm; md.gtk_win = gtk_win; md.draw = draw; md.damage = dmg;
     state->modals.push_back(md);
 }
 
@@ -587,6 +608,7 @@ static void modal_remove(Capture *c, Window win)
 {
     for (auto it = c->modals.begin(); it != c->modals.end(); ++it)
         if (it->x11_win == win) {
+            if (it->damage && g_wm_dpy) XDamageDestroy(g_wm_dpy, it->damage);
             if (it->pixmap) XFreePixmap(c->dpy, it->pixmap);
             if (it->gtk_win) gtk_widget_destroy(it->gtk_win);
             c->modals.erase(it);
@@ -684,10 +706,43 @@ static bool on_popup_configured(Window w, int cx, int cy, int cw, int ch)
 // only with our own concerns: popup/modal lifecycle.
 static void bridge_handle_event(XEvent *ev)
 {
-    Capture *c = find_capture(ev->xany.window);
+    // Damage may target a plugin GUI or a modal dialog — resolve by the damaged
+    // drawable (XDamageNotifyEvent.drawable overlaps xany.window). Modals aren't
+    // in g_captures, so we test the event type first, then look up the drawable.
+    if (g_damage_event_base >= 0 && ev->type == g_damage_event_base + XDamageNotify) {
+        XDamageNotifyEvent *de = (XDamageNotifyEvent *)ev;
+        DEBUG_PRINT("damage: %dx%d+%d+%d\n",
+            de->area.width, de->area.height, de->area.x, de->area.y);
+        // Subtract on g_wm_dpy — the connection that created the damage object and
+        // receives its events — so the region actually clears and re-arms.
+        XDamageSubtract(g_wm_dpy, de->damage, None, None);
 
-    // We only deal with popups here (c set => this is a plugin window, refreshed
-    // by the per-tick timer; modals refresh in capture_update).
+        // Plugin GUI: de->area is in plugin_win coords, which map 1:1 to the
+        // widget (on_draw blits the pixmap at 0,0). cairo clips the paint to this
+        // rect, so only this region blits. Modals work the same way against md.draw.
+        Capture *c = find_capture(de->drawable);
+        if (c && c->widget) {
+            gtk_widget_queue_draw_area(c->widget, de->area.x, de->area.y,
+                                       de->area.width, de->area.height);
+            return;
+        }
+        for (auto &kv : g_captures) {
+            Capture *cc = kv.second;
+            if (!cc) continue;
+            for (auto &md : cc->modals) {
+                if (md.x11_win == de->drawable) {
+                    if (md.draw)
+                        gtk_widget_queue_draw_area(md.draw, de->area.x, de->area.y,
+                                                   de->area.width, de->area.height);
+                    return;
+                }
+            }
+        }
+        return;
+    }
+
+    // Non-damage: popup lifecycle. (c set => plugin window, nothing to do here.)
+    Capture *c = find_capture(ev->xany.window);
     if (c) return;
     switch (ev->type)
     {
@@ -707,63 +762,77 @@ static void bridge_handle_event(XEvent *ev)
     }
 }
 
+// True if any captured plugin currently has an open popup but NO open modal.
+// Used to scope the Escape-on-click popup-dismiss workaround so it never fires
+// while a modal is up (which would wrongly close the modal).
+bool xw_should_escape_on_click()
+{
+    bool any_popup = false;
+    for (auto &kv : g_captures)
+    {
+        Capture *c = kv.second;
+        if (!c) continue;
+        if (!c->modals.empty()) return false;   // a modal is open -> never escape
+        if (!c->popups.empty()) any_popup = true;
+    }
+    return any_popup;
+}
+
 void init_private_xwayland()
 {
     // The WM owns Xwayland spawn, the X connection, error handling, and the event
     // pump. We just bring it up and register our per-event handler.
     if (!XWaylandWM::init_bridge_wm(":10")) return;
+
+    if (g_wm_dpy) {
+        int base, err;
+        if (XDamageQueryExtension(g_wm_dpy, &base, &err)) g_damage_event_base = base;
+    }
+
     g_wm->on_unhandled_event = bridge_handle_event;
 }
 
-static bool capture_update(HWND hwnd)
+static bool try_create_plugin(HWND hwnd)
 {
     if (!hwnd || !hwnd->m_private_data) return true;
     bridgeState *bs = (bridgeState*)hwnd->m_private_data;
 
-    // First tick(s): the plugin creates its window as a child of our container.
-    if (!bs->cap && bs->disp && bs->parent)
-    {
-        Window root, par, *list = nullptr; unsigned int n = 0;
-        if (XQueryTree(bs->disp, bs->parent, &root, &par, &list, &n) && list && n)
-        {
-            Window plugin_win = list[0];
-            XFree(list);
+     // First tick(s): the plugin creates its window as a child of our container.
+     if (!bs->cap && bs->disp && bs->parent)
+     {
+         Window root, par, *list = nullptr; unsigned int n = 0;
+         if (XQueryTree(bs->disp, bs->parent, &root, &par, &list, &n) && list && n)
+         {
+             Window plugin_win = list[0];
+             XFree(list);
 
-            XWindowAttributes attr;
-            if (XGetWindowAttributes(bs->disp, plugin_win, &attr))
-                XResizeWindow(bs->disp, bs->parent, attr.width, attr.height);
-            XFlush(bs->disp);
+             XWindowAttributes attr;
+             if (XGetWindowAttributes(bs->disp, plugin_win, &attr))
+                 XResizeWindow(bs->disp, bs->parent, attr.width, attr.height);
+             XFlush(bs->disp);
 
-            Capture *c = setup_capture(bs->disp, bs->parent, plugin_win, hwnd);
-            c->widget = hwnd->m_oswidget;
+             Capture *c = setup_capture(bs->disp, bs->parent, plugin_win, hwnd);
+             c->widget = hwnd->m_oswidget;
 
-            // Wine plugins nest a child GUI window; native plugins draw directly.
-            Window gr, gp, *gk = nullptr; unsigned int gn = 0;
-            if (XQueryTree(bs->disp, plugin_win, &gr, &gp, &gk, &gn) && gn) {
-                c->gui_win = gk[0];
-                g_captures[c->gui_win] = c;
-                XFree(gk);
-            } else {
-                c->gui_win = plugin_win;
-            }
+             // Wine plugins nest a child GUI window; native plugins draw directly.
+             Window gr, gp, *gk = nullptr; unsigned int gn = 0;
+             if (XQueryTree(bs->disp, plugin_win, &gr, &gp, &gk, &gn) && gn) {
+                 c->gui_win = gk[0];
+                 g_captures[c->gui_win] = c;
+                 XFree(gk);
+             } else {
+                 c->gui_win = plugin_win;
+             }
 
-            connect_widget(c);
-            bs->cap = c;
-        }
-        else if (list) XFree(list);
-    }
+             connect_widget(c);
+             bs->cap = c;
+         }
+         else if (list) XFree(list);
+     }
 
-    if (bs->cap && bs->cap->widget)
-        gtk_widget_queue_draw(bs->cap->widget);
-
-    // Redraw this plugin's modals each tick — same cheap model as the main GUI:
-    // just queue_draw. The pixmap is named once in create_modal and, under
-    // CompositeRedirectAutomatic, tracks the window's content live, so no per-frame
-    // re-capture is needed (resizes are handled separately if they occur).
-    if (bs->cap)
-        for (auto &md : bs->cap->modals)
-            if (md.draw) gtk_widget_queue_draw(md.draw);
-
+    // Modals are damage-driven now (create_modal installs a Damage object, handled
+    // in bridge_handle_event) — same partial-repaint model as the main plugin GUI.
+    // No per-tick redraw needed; initial paint comes from the show_all expose.
     return true;
 }
 
@@ -872,7 +941,7 @@ static LRESULT xw_bridgeProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam)
 {
     switch (uMsg) {
         case WM_DESTROY: xw_destroy(hwnd); break;
-        case WM_TIMER: capture_update(hwnd); break;
+        case WM_TIMER: try_create_plugin(hwnd); break;
         case WM_MOVE:
         case WM_SIZE: xw_size(hwnd); break;
     }
@@ -915,7 +984,7 @@ HWND xw_bridge_create(HWND viewpar, void **wref, const RECT *r, const char *brid
     hwnd->m_private_data = (INT_PTR)bs;
 
     *wref = (void*)container;
-    SetTimer(hwnd, 1, 16, NULL);
+    SetTimer(hwnd, 1, 100, NULL);
     return hwnd;
 }
 
