@@ -828,10 +828,14 @@ void xw_size(HWND hwnd)
     if (bs->cap) { bs->cap->gtk_x = pos_x; bs->cap->gtk_y = pos_y; }
 
     // Re-capture the pixmap at the new size — xw_size runs exactly when the window
-    // is being resized, so the backing pixmap must be refreshed here.
-    if (bs->cap) refresh_pixmap(bs->cap);
-    XResizeWindow(bs->cap->dpy, bs->cap->parent_win, w, h);
-    XFlush(bs->cap->dpy);
+    // is being resized, so the backing pixmap must be refreshed here. Guard on
+    // bs->cap: WM_SIZE/SetWindowPos can fire before the plugin is captured (e.g.
+    // during an FX-list swap), and the container resize also needs a live capture.
+    if (bs->cap) {
+        refresh_pixmap(bs->cap);
+        XResizeWindow(bs->cap->dpy, bs->cap->parent_win, w, h);
+        XFlush(bs->cap->dpy);
+    }
     if (GTK_IS_FIXED(container)) {
         if (!bs->placed) {
             gtk_fixed_put(GTK_FIXED(container), hwnd->m_oswidget, pos_x, pos_y);
