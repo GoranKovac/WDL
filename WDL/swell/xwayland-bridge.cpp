@@ -213,6 +213,15 @@ bool on_enter(GtkWidget *widget, GdkEventCrossing *event, gpointer data)
 {
     Capture *c = (Capture*)data;
     // DEBUG_PRINT("[GTK] enter widget=%p\n", widget);
+    // Reset the cursor. Otherwise the draw area inherits the toplevel's cursor,
+    // so REAPER's FX-list resize cursor (set while hovering the splitter) sticks
+    // as you move into the plugin GUI. Force the default arrow on entry.
+    GdkWindow *gw = gtk_widget_get_window(widget);
+    if (gw) {
+        GdkCursor *cur = gdk_cursor_new_from_name(gdk_window_get_display(gw), "default");
+        gdk_window_set_cursor(gw, cur);
+        if (cur) g_object_unref(cur);
+    }
     XRaiseWindow(c->dpy, c->parent_win);
     XFlush(c->dpy);
     return false;
