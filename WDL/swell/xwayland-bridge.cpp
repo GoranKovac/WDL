@@ -55,6 +55,10 @@ static std::map<Window, Capture*> g_captures;
 // check.
 static int g_damage_event_base = -1;
 
+// Damage error base (XDamageQueryExtension), non-static so the WM's X error
+// handler can ignore BadDamage teardown races. -1 until queried in init.
+int g_bridge_damage_error_base = -1;
+
 static void register_capture(Capture *c)
 {
     g_captures[c->parent_win] = c;
@@ -119,10 +123,45 @@ static void forward_motion(Capture *c, int wx, int wy)
     XTestFakeMotionEvent(c->dpy, DefaultScreen(c->dpy), rx, ry, CurrentTime);
 }
 
+// Defined below; used by on_button_press to raise the modal on a plugin click.
+void xw_raise_modals();
+
+// True if any captured plugin currently has an open modal.
+static bool any_modal_open()
+{
+    for (auto &kv : g_captures)
+        if (kv.second && !kv.second->modals.empty()) return true;
+    return false;
+}
+
+// Force every open modal to the top by remapping it (hide -> show). On Wayland a
+// client can't raise/keep-above/present itself reliably — Hyprland ignores those
+// once the compositor has raised the window you actually clicked (the plugin's FX
+// window, which is the modal's transient parent). Map-to-top, however, is always
+// honored: a freshly shown surface is placed on top. This is the only thing that
+// reliably pulls the modal back over the plugin after a click on the plugin GUI.
+static void force_modals_top()
+{
+    for (auto &kv : g_captures) {
+        Capture *c = kv.second;
+        if (!c) continue;
+        for (auto &md : c->modals)
+            if (md.gtk_win && gtk_widget_get_visible(md.gtk_win)) {
+                gtk_widget_hide(md.gtk_win);
+                gtk_widget_show(md.gtk_win);
+            }
+    }
+}
+
 static bool on_button_press(GtkWidget *widget, GdkEventButton *e, gpointer data)
 {
     Capture *c = (Capture*)data;
     if (!c || !c->dpy) return false;
+    // A modal is open: a click on the plugin GUI must bring the modal back to the
+    // front, not interact with the plugin. present()/keep_above don't work here
+    // (see force_modals_top) so we remap the modal, which the compositor always
+    // places on top. Don't SetFocus and don't forward the click.
+    if (any_modal_open()) { force_modals_top(); return true; }
     if (c->hwnd) SetFocus(c->hwnd);
     // if (!gtk_widget_has_focus(widget))
     //     gtk_widget_grab_focus(widget);
@@ -570,6 +609,15 @@ static void create_modal(Capture *state, Window win, XWindowAttributes *attr)
     if (toplevel && GTK_IS_WINDOW(toplevel))
         gtk_window_set_transient_for(GTK_WINDOW(gtk_win), GTK_WINDOW(toplevel));
 
+    // NOTE: no gtk_window_set_modal(TRUE). A GTK modal grab redirects events away
+    // from every other toplevel in the app — including the plugin GUI draw area —
+    // so on_button_press never fires on a plugin click, while Hyprland's
+    // compositor-level click-to-raise still lifts the plugin over the modal. That
+    // combination is exactly the "modal disappears behind the plugin and nothing
+    // responds" bug. We enforce modality ourselves instead: on_button_press blocks
+    // plugin input and raises the modal while one is open.
+    gtk_window_set_type_hint(GTK_WINDOW(gtk_win), GDK_WINDOW_TYPE_HINT_DIALOG);
+
     gtk_window_resize(GTK_WINDOW(gtk_win), attr->width, attr->height);
 
     GtkWidget *draw = gtk_drawing_area_new();
@@ -762,20 +810,42 @@ static void bridge_handle_event(XEvent *ev)
     }
 }
 
-// True if any captured plugin currently has an open popup but NO open modal.
-// Used to scope the Escape-on-click popup-dismiss workaround so it never fires
-// while a modal is up (which would wrongly close the modal).
-bool xw_should_escape_on_click()
+// Present + keep-above every open modal. Called when a click lands on a background
+// window while a modal is up — with true modality this is rare, but if a grab
+// leaked this pulls the modal back to the front instead of leaving REAPER stuck.
+void xw_raise_modals()
 {
-    bool any_popup = false;
     for (auto &kv : g_captures)
     {
         Capture *c = kv.second;
         if (!c) continue;
-        if (!c->modals.empty()) return false;   // a modal is open -> never escape
-        if (!c->popups.empty()) any_popup = true;
+        for (auto &md : c->modals)
+            if (md.gtk_win)
+            {
+                gtk_window_present(GTK_WINDOW(md.gtk_win));
+                gtk_window_set_keep_above(GTK_WINDOW(md.gtk_win), TRUE);
+            }
     }
-    return any_popup;
+}
+
+// True if any captured plugin currently has an open popup but NO open modal.
+// Used to scope the Escape-on-click popup-dismiss workaround so it never fires
+// while a modal is up (which would wrongly close the modal).
+void xw_should_escape_on_click()
+{
+    for (auto &kv : g_captures)
+    {
+        Capture *c = kv.second;
+        if (!c) continue;
+        if (!c->modals.empty())
+            xw_raise_modals();
+        if (!c->popups.empty()){
+            KeyCode esc = XKeysymToKeycode(g_wm_dpy, XK_Escape);
+            XTestFakeKeyEvent(g_wm_dpy, esc, True, CurrentTime);
+            XTestFakeKeyEvent(g_wm_dpy, esc, False, CurrentTime);
+            XFlush(g_wm_dpy);
+        }
+    }
 }
 
 void init_private_xwayland()
@@ -786,7 +856,14 @@ void init_private_xwayland()
 
     if (g_wm_dpy) {
         int base, err;
-        if (XDamageQueryExtension(g_wm_dpy, &base, &err)) g_damage_event_base = base;
+        if (XDamageQueryExtension(g_wm_dpy, &base, &err)) {
+            g_damage_event_base = base;
+            // Expose the Damage error base so the WM's X error handler can swallow
+            // BadDamage. modal_remove runs on UnmapNotify, but a closing dialog is
+            // usually destroyed right after, and the server auto-frees its damage
+            // on DestroyNotify — so our XDamageDestroy races an already-freed damage.
+            g_bridge_damage_error_base = err;
+        }
     }
 
     g_wm->on_unhandled_event = bridge_handle_event;

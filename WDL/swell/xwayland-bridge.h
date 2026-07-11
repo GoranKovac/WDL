@@ -32,6 +32,6 @@ HWND xw_bridge_create(
     const char* bridge_class_name
 );
 bool xw_forward_key(HWND hwnd, int keycode, int state, bool is_press);
-bool xw_should_escape_on_click();
+void xw_should_escape_on_click();
 extern XWaylandWM *g_wm;
 extern Display *g_wm_dpy;
