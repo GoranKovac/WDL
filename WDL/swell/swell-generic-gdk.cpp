@@ -1702,21 +1702,9 @@ static void OnButtonEvent(GdkEventButton *b)
   if (!hwnd) return;
 
 #ifdef SWELL_TARGET_WAYLAND
-  // Popup-dismiss workaround: a click sends Escape to :10 to unstick an open
-  // plugin popup. Only do this when a popup is actually open AND no modal is up —
-  // otherwise the Escape would wrongly close the modal (or fire needlessly on
-  // every click when nothing is open).
-  if (b->type == GDK_BUTTON_PRESS && g_wm_dpy)
-  {
-    // if (xw_should_escape_on_click()) {
-            KeyCode esc = XKeysymToKeycode(g_wm_dpy, XK_Escape);
-            XTestFakeKeyEvent(g_wm_dpy, esc, True, CurrentTime);
-            XTestFakeKeyEvent(g_wm_dpy, esc, False, CurrentTime);
-            XFlush(g_wm_dpy);
-        // }else {
-            // TODO: RAISE MODAL WINDOW
-        // }
-  }
+  // Popup-dismiss workaround click sends Escape to :10 to unstick an open plugin popup
+    if (b->type == GDK_BUTTON_PRESS && g_wm_dpy)
+        xw_should_escape_on_click();
 #endif
 
   swell_lastMessagePos = MAKELONG(((int)b->x_root&0xffff),((int)b->y_root&0xffff));

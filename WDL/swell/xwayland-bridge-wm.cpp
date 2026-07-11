@@ -42,6 +42,13 @@ static pid_t s_xwayland_pid = 0;
 
 static int wm_x11_error_handler(Display *dpy, XErrorEvent *err)
 {
+    // BadDamage: modal teardown can XDamageDestroy a damage the server already
+    // auto-freed when the dialog window was destroyed. Ignore like other teardown
+    // races. g_bridge_damage_error_base is set once the bridge queries XDamage.
+    extern int g_bridge_damage_error_base;
+    if (g_bridge_damage_error_base >= 0 &&
+        err->error_code == g_bridge_damage_error_base) return 0;
+
     if (err->error_code == BadWindow   ||
         err->error_code == BadDrawable ||
         err->error_code == BadPixmap   ||
