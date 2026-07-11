@@ -925,15 +925,6 @@ bool xw_bridge_dismiss_popups()
         if (!c || c->popups.empty()) continue;
         any = true;
 
-        if (g_wm_dpy) {
-            KeyCode esc = XKeysymToKeycode(g_wm_dpy, XK_Escape);
-            if (esc) {
-                XTestFakeKeyEvent(g_wm_dpy, esc, True,  CurrentTime);
-                XTestFakeKeyEvent(g_wm_dpy, esc, False, CurrentTime);
-                XFlush(g_wm_dpy);
-            }
-        }
-
         for (auto &p : c->popups)
             if (p.pixmap != None && c->dpy) XFreePixmap(c->dpy, p.pixmap);
         c->popups.clear();
@@ -948,6 +939,12 @@ bool xw_bridge_dismiss_popups()
     // FX window (its parent) is unmapped by the close that follows — otherwise the
     // protocol error / hang can still race.
     if (any) gdk_display_flush(gdk_display_get_default());
+    if (g_wm_dpy) {
+        KeyCode esc = XKeysymToKeycode(g_wm_dpy, XK_Escape);
+        XTestFakeKeyEvent(g_wm_dpy, esc, True,  CurrentTime);
+        XTestFakeKeyEvent(g_wm_dpy, esc, False, CurrentTime);
+        XFlush(g_wm_dpy);
+    }
     return any;
 }
 
