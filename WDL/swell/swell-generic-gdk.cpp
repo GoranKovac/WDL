@@ -2018,6 +2018,14 @@ static void swell_gdkEventHandler(GdkEvent *evt, gpointer data)
     case GDK_DELETE:
      {
        HWND hwnd = swell_oswindow_to_hwnd(((GdkEventAny*)evt)->window);
+#ifdef SWELL_TARGET_WAYLAND
+       // Destroy the plugin popup's overlay canvas (an xdg_popup on Wayland) and
+       // release the plugin's :10 grab BEFORE closing. If the xdg_popup is still
+       // mapped when its parent (the FX window) closes, the compositor raises a
+       // protocol error that kills GTK's Wayland connection and hangs REAPER. With
+       // the canvas destroyed first, the close can proceed normally.
+       if (g_wm_dpy) xw_bridge_dismiss_popups();
+#endif
        if (hwnd && IsWindowEnabled(hwnd) &&
            !DestroyPopupMenus() && // ignore if a menu is open, instead just close the menu
            !SendMessage(hwnd,WM_CLOSE,0,0))
