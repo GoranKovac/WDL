@@ -399,23 +399,41 @@ static bool canvas_motion(GtkWidget *, GdkEventMotion *e, gpointer data)
     Capture *c = (Capture*)data;
     if (!c || !c->dpy) return false;
 
-    int screen_x = (int)e->x + c->canvas_origin_x;
-    int screen_y = (int)e->y + c->canvas_origin_y;
-    int x11_x = screen_x - c->gtk_x;
-    int x11_y = screen_y - c->gtk_y;
-
-    XTestFakeMotionEvent(c->dpy, DefaultScreen(c->dpy), x11_x, x11_y, CurrentTime);
-    XFlush(c->dpy);
-
     static guint32 last_time = 0;
     guint32 now = g_get_monotonic_time() / 1000;
     if (now - last_time < 16) return true;
     last_time = now;
 
+    int screen_x = (int)e->x + c->canvas_origin_x;
+    int screen_y = (int)e->y + c->canvas_origin_y;
+    int x11_x = screen_x - c->gtk_x;
+    int x11_y = screen_y - c->gtk_y;
+
+    // Deliver motion to the popup under the cursor with a synthetic MotionNotify
+    // instead of XTestFakeMotionEvent. Warping the pointer via XTest on a nested
+    // XWayland is unreliable and *blocks* — it round-trips to the parent compositor
+    // (see KDE #442846, and SDL disabling XTest on XWayland) — which is the popup
+    // hover hang. XSendEvent just posts the event to the popup: no warp, no
+    // round-trip, nothing to block on.
     for (auto &p : c->popups) {
         if (!p.visible) continue;
         if (screen_x >= p.x && screen_x < p.x + p.w &&
             screen_y >= p.y && screen_y < p.y + p.h) {
+            XEvent me; memset(&me, 0, sizeof(me));
+            me.type              = MotionNotify;
+            me.xmotion.display   = c->dpy;
+            me.xmotion.window    = p.x11_win;
+            me.xmotion.root      = DefaultRootWindow(c->dpy);
+            me.xmotion.subwindow = None;
+            me.xmotion.time      = CurrentTime;
+            me.xmotion.x         = screen_x - p.x;   // local to the popup
+            me.xmotion.y         = screen_y - p.y;
+            me.xmotion.x_root    = x11_x;
+            me.xmotion.y_root    = x11_y;
+            me.xmotion.same_screen = True;
+            XSendEvent(c->dpy, p.x11_win, True, PointerMotionMask, &me);
+            XFlush(c->dpy);
+
             if (p.pixmap != None) XFreePixmap(c->dpy, p.pixmap);
             p.pixmap = XCompositeNameWindowPixmap(c->dpy, p.x11_win);
             if (c->canvas_draw) gtk_widget_queue_draw(c->canvas_draw);
