@@ -33,5 +33,6 @@ HWND xw_bridge_create(
 );
 bool xw_forward_key(HWND hwnd, int keycode, int state, bool is_press);
 void xw_should_escape_on_click();
+bool xw_bridge_dismiss_popups();
 extern XWaylandWM *g_wm;
 extern Display *g_wm_dpy;

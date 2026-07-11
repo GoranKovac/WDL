@@ -292,7 +292,21 @@ static void cleanup_capture(Capture *c)
     if (!c) return;
     unregister_capture(c);
     if (c->pixmap) XFreePixmap(c->dpy, c->pixmap);
+
     Display *d = c->dpy;
+    if (d) {
+        // Explicitly destroy the plugin's :10 windows. Relying on XCloseDisplay's
+        // DestroyAll is not enough: plugin_win/gui_win are owned by the plugin's
+        // own X connection and the WM reparents them, so closing our connection
+        // leaves the plugin alive on :10 with no DestroyNotify — which orphans it
+        // and breaks reopen. Destroying them here forces the plugin's GUI to shut
+        // down and emit the notify. BadWindow (already gone) is ignored by the WM
+        // error handler. Innermost first.
+        if (c->gui_win && c->gui_win != c->plugin_win) XDestroyWindow(d, c->gui_win);
+        if (c->plugin_win)                             XDestroyWindow(d, c->plugin_win);
+        if (c->parent_win)                             XDestroyWindow(d, c->parent_win);
+        XSync(d, False);
+    }
     c->dpy = nullptr;
     if (d) XCloseDisplay(d);
     delete c;
@@ -455,6 +469,22 @@ static void canvas_add_popup(Capture *c, Window x11_win, XWindowAttributes *attr
     Window child; int px, py;
     XTranslateCoordinates(c->dpy, c->gui_win ? c->gui_win : c->plugin_win,
                           DefaultRootWindow(c->dpy), 0, 0, &px, &py, &child);
+
+    // Refresh the screen offset from the plugin widget's LIVE origin instead of
+    // trusting c->gtk_x/gtk_y cached by xw_size. Those go stale when a popup opens
+    // before xw_size has run with correct geometry — a startup race, and always
+    // after a Super+Q reopen (fresh capture) — which is what puts popups at the
+    // wrong place. gdk_window_get_origin is always current; gtk_x = origin - px
+    // keeps the existing (px + attr + gtk_x) formula and the motion mapping correct.
+    if (c->widget) {
+        GdkWindow *ww = gtk_widget_get_window(c->widget);
+        if (ww) {
+            int wox = 0, woy = 0;
+            gdk_window_get_origin(ww, &wox, &woy);
+            c->gtk_x = wox - px;
+            c->gtk_y = woy - py;
+        }
+    }
 
     if (!c->popup_canvas) create_popup_canvas(c);
 
@@ -707,6 +737,7 @@ static void handle_new_window(Window win, Capture *state, XWindowAttributes *att
 // hand it to that capture's popup canvas.
 static void on_popup_mapped(Window w)
 {
+    fprintf(stderr, "[xwb] popup_mapped w=0x%lx\n", w); fflush(stderr);
     XWindowAttributes attr;
     if (!XGetWindowAttributes(g_wm_dpy, w, &attr) || attr.map_state != IsViewable)
         return;
@@ -723,6 +754,7 @@ static void on_popup_mapped(Window w)
 // A popup was unmapped — remove it from whichever capture owns it.
 static void on_popup_unmapped(Window w)
 {
+    fprintf(stderr, "[xwb] popup_unmapped w=0x%lx\n", w); fflush(stderr);
     for (auto &kv : g_captures) {
         Capture *c = kv.second;
         auto it = std::find_if(c->popups.begin(), c->popups.end(),
@@ -778,7 +810,7 @@ static void bridge_handle_event(XEvent *ev)
         // widget (on_draw blits the pixmap at 0,0). cairo clips the paint to this
         // rect, so only this region blits. Modals work the same way against md.draw.
         Capture *c = find_capture(de->drawable);
-        if (c && c->widget) {
+        if (c && c->widget && GTK_IS_WIDGET(c->widget)) {
             gtk_widget_queue_draw_area(c->widget, de->area.x, de->area.y,
                                        de->area.width, de->area.height);
             return;
@@ -788,7 +820,7 @@ static void bridge_handle_event(XEvent *ev)
             if (!cc) continue;
             for (auto &md : cc->modals) {
                 if (md.x11_win == de->drawable) {
-                    if (md.draw)
+                    if (md.draw && GTK_IS_WIDGET(md.draw))
                         gtk_widget_queue_draw_area(md.draw, de->area.x, de->area.y,
                                                    de->area.width, de->area.height);
                     return;
@@ -855,6 +887,50 @@ void xw_should_escape_on_click()
             XFlush(g_wm_dpy);
         }
     }
+}
+
+// If any plugin popup is open, dismiss it and return true. Called from SWELL's
+// GDK_DELETE handler when a window is being closed (e.g. Hyprland Super+Q).
+//
+// The overlay canvas is a GTK_WINDOW_POPUP made transient to the plugin's FX
+// window, i.e. an xdg_popup child on Wayland. If that popup is still mapped when
+// its parent (the FX window) closes, the compositor raises an xdg_shell protocol
+// error that kills GTK's Wayland connection and hangs REAPER instantly. So we
+// must fully DESTROY the canvas here (gtk_widget_destroy, not hide) to tear down
+// the xdg_popup and its grab before any close proceeds. We also Escape the :10
+// menu so the plugin drops its own X grab.
+bool xw_bridge_dismiss_popups()
+{
+    bool any = false;
+    for (auto &kv : g_captures) {
+        Capture *c = kv.second;
+        if (!c || c->popups.empty()) continue;
+        any = true;
+
+        if (g_wm_dpy) {
+            KeyCode esc = XKeysymToKeycode(g_wm_dpy, XK_Escape);
+            if (esc) {
+                XTestFakeKeyEvent(g_wm_dpy, esc, True,  CurrentTime);
+                XTestFakeKeyEvent(g_wm_dpy, esc, False, CurrentTime);
+                XFlush(g_wm_dpy);
+            }
+        }
+
+        for (auto &p : c->popups)
+            if (p.pixmap != None && c->dpy) XFreePixmap(c->dpy, p.pixmap);
+        c->popups.clear();
+        c->root_popup = None;
+        if (c->popup_canvas && GTK_IS_WIDGET(c->popup_canvas)) {
+            gtk_widget_destroy(c->popup_canvas);
+            c->popup_canvas = nullptr;
+            c->canvas_draw  = nullptr;
+        }
+    }
+    // Push the xdg_popup destroy to the compositor now, so it is gone before the
+    // FX window (its parent) is unmapped by the close that follows — otherwise the
+    // protocol error / hang can still race.
+    if (any) gdk_display_flush(gdk_display_get_default());
+    return any;
 }
 
 void init_private_xwayland()
@@ -926,7 +1002,10 @@ void xw_destroy(HWND hwnd)
 {
     if (!hwnd || !hwnd->m_private_data) return;
     bridgeState *bs = (bridgeState*)hwnd->m_private_data;
-    if (hwnd->m_oswidget) {
+    // m_oswidget is non-NULL here only if the widget is still alive (the weak
+    // pointer nulls it on destroy), so this is safe.
+    if (hwnd->m_oswidget && GTK_IS_WIDGET(hwnd->m_oswidget)) {
+        g_object_remove_weak_pointer(G_OBJECT(hwnd->m_oswidget), (gpointer*)&hwnd->m_oswidget);
         GtkWidget *parent = gtk_widget_get_parent(hwnd->m_oswidget);
         if (parent) gtk_container_remove(GTK_CONTAINER(parent), hwnd->m_oswidget);
     }
@@ -1063,6 +1142,12 @@ HWND xw_bridge_create(HWND viewpar, void **wref, const RECT *r, const char *brid
     hwnd = new HWND__(viewpar, 0, r, NULL, true, xw_bridgeProc);
     hwnd->m_classname = bridge_class_name;
     hwnd->m_oswidget  = draw_area;
+    // Auto-null m_oswidget the moment the widget is destroyed (e.g. its container
+    // is torn down when the plugin/FX window closes). Without this the pointer
+    // dangles and later GTK calls (get_parent/container_remove during teardown or
+    // reopen) hit freed memory — GTK_IS_WIDGET can't catch that. With the weak
+    // pointer, m_oswidget != NULL reliably means the widget is alive.
+    g_object_add_weak_pointer(G_OBJECT(draw_area), (gpointer*)&hwnd->m_oswidget);
 
     bridgeState *bs = new bridgeState();
     bs->disp   = disp;
