@@ -1538,7 +1538,7 @@ static void OnKeyEvent(GdkEventKey *k)
     HWND foc = GetFocusIncludeMenus();
     if (foc && foc->m_classname && !strcmp(foc->m_classname, "REAPERXBridge"))
     {
-      xw_forward_key(foc, k->hardware_keycode, k->state, k->type == GDK_KEY_PRESS);
+      xw_bridge_forward_key(foc, k->hardware_keycode, k->state, k->type == GDK_KEY_PRESS);
       return;
     }
   }

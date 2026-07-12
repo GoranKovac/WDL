@@ -1178,7 +1178,7 @@ HWND xw_bridge_create(HWND viewpar, void **wref, const RECT *r, const char *brid
 // Sends a key to :10, targeting the open popup (whose keyboard grab wedges
 // REAPER when keys aren't delivered) or the main plugin GUI otherwise. SWELL
 // consumes the key after calling this so REAPER does not also act on it.
-bool xw_forward_key(HWND hwnd, int keycode, int state, bool is_press)
+bool xw_bridge_forward_key(HWND hwnd, int keycode, int state, bool is_press)
 {
     if (!hwnd || !hwnd->m_private_data) return false;
     bridgeState *bs = (bridgeState*)hwnd->m_private_data;
