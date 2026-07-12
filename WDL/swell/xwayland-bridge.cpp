@@ -292,21 +292,7 @@ static void cleanup_capture(Capture *c)
     if (!c) return;
     unregister_capture(c);
     if (c->pixmap) XFreePixmap(c->dpy, c->pixmap);
-
     Display *d = c->dpy;
-    if (d) {
-        // Explicitly destroy the plugin's :10 windows. Relying on XCloseDisplay's
-        // DestroyAll is not enough: plugin_win/gui_win are owned by the plugin's
-        // own X connection and the WM reparents them, so closing our connection
-        // leaves the plugin alive on :10 with no DestroyNotify — which orphans it
-        // and breaks reopen. Destroying them here forces the plugin's GUI to shut
-        // down and emit the notify. BadWindow (already gone) is ignored by the WM
-        // error handler. Innermost first.
-        if (c->gui_win && c->gui_win != c->plugin_win) XDestroyWindow(d, c->gui_win);
-        if (c->plugin_win)                             XDestroyWindow(d, c->plugin_win);
-        if (c->parent_win)                             XDestroyWindow(d, c->parent_win);
-        XSync(d, False);
-    }
     c->dpy = nullptr;
     if (d) XCloseDisplay(d);
     delete c;
@@ -713,10 +699,17 @@ static void modal_remove(Capture *c, Window win)
 {
     for (auto it = c->modals.begin(); it != c->modals.end(); ++it)
         if (it->x11_win == win) {
-            if (it->damage && g_wm_dpy) XDamageDestroy(g_wm_dpy, it->damage);
-            if (it->pixmap) XFreePixmap(c->dpy, it->pixmap);
-            if (it->gtk_win) gtk_widget_destroy(it->gtk_win);
+            // Pull resources out and drop the entry BEFORE destroying the widget:
+            // gtk_widget_destroy can dispatch events (re-entrancy), and on Super+Q
+            // GTK may already have destroyed the modal — so guard with GTK_IS_WIDGET
+            // to avoid the 'GTK_IS_WIDGET (widget)' assertion on a dead widget.
+            Damage     dmg = it->damage;
+            Pixmap     pm  = it->pixmap;
+            GtkWidget *w   = it->gtk_win;
             c->modals.erase(it);
+            if (dmg && g_wm_dpy)       XDamageDestroy(g_wm_dpy, dmg);
+            if (pm)                    XFreePixmap(c->dpy, pm);
+            if (w && GTK_IS_WIDGET(w)) gtk_widget_destroy(w);
             break;
         }
 }
@@ -922,28 +915,33 @@ bool xw_bridge_dismiss_popups()
     bool any = false;
     for (auto &kv : g_captures) {
         Capture *c = kv.second;
-        if (!c || c->popups.empty()) continue;
-        any = true;
-
-        for (auto &p : c->popups)
-            if (p.pixmap != None && c->dpy) XFreePixmap(c->dpy, p.pixmap);
-        c->popups.clear();
-        c->root_popup = None;
-        if (c->popup_canvas && GTK_IS_WIDGET(c->popup_canvas)) {
-            gtk_widget_destroy(c->popup_canvas);
-            c->popup_canvas = nullptr;
-            c->canvas_draw  = nullptr;
+        if (!c) continue;
+        if (!c->popups.empty()) {
+            any = true;
+            for (auto &p : c->popups)
+                if (p.pixmap != None && c->dpy) XFreePixmap(c->dpy, p.pixmap);
+            c->popups.clear();
+            c->root_popup = None;
+            if (c->popup_canvas && GTK_IS_WIDGET(c->popup_canvas)) {
+                gtk_widget_destroy(c->popup_canvas);
+                c->popup_canvas = nullptr;
+                c->canvas_draw  = nullptr;
+            }
         }
+        if (!c->modals.empty()) any = true;   // a modal also needs the Escape
     }
-    // Push the xdg_popup destroy to the compositor now, so it is gone before the
-    // FX window (its parent) is unmapped by the close that follows — otherwise the
-    // protocol error / hang can still race.
-    if (any) gdk_display_flush(gdk_display_get_default());
-    if (g_wm_dpy) {
-        KeyCode esc = XKeysymToKeycode(g_wm_dpy, XK_Escape);
-        XTestFakeKeyEvent(g_wm_dpy, esc, True,  CurrentTime);
-        XTestFakeKeyEvent(g_wm_dpy, esc, False, CurrentTime);
-        XFlush(g_wm_dpy);
+    // Only touch :10 / send Escape when there was actually a popup or modal to
+    // dismiss. Firing Escape on EVERY window close — including a plain plugin close
+    // with nothing open — is what corrupts the teardown and crashes Wine (the
+    // plugin's GUI window gets destroyed from the outside -> BadWindow).
+    if (any) {
+        gdk_display_flush(gdk_display_get_default());
+        if (g_wm_dpy) {
+            KeyCode esc = XKeysymToKeycode(g_wm_dpy, XK_Escape);
+            XTestFakeKeyEvent(g_wm_dpy, esc, True,  CurrentTime);
+            XTestFakeKeyEvent(g_wm_dpy, esc, False, CurrentTime);
+            XFlush(g_wm_dpy);
+        }
     }
     return any;
 }
