@@ -1704,7 +1704,7 @@ static void OnButtonEvent(GdkEventButton *b)
 #ifdef SWELL_TARGET_WAYLAND
   // Popup-dismiss workaround click sends Escape to :10 to unstick an open plugin popup
     if (b->type == GDK_BUTTON_PRESS && g_wm_dpy)
-        xw_should_escape_on_click();
+        xw_swell_on_button_event_escape();
 #endif
 
   swell_lastMessagePos = MAKELONG(((int)b->x_root&0xffff),((int)b->y_root&0xffff));
@@ -2024,7 +2024,7 @@ static void swell_gdkEventHandler(GdkEvent *evt, gpointer data)
        // mapped when its parent (the FX window) closes, the compositor raises a
        // protocol error that kills GTK's Wayland connection and hangs REAPER. With
        // the canvas destroyed first, the close can proceed normally.
-       if (g_wm_dpy) xw_bridge_dismiss_popups();
+       if (g_wm_dpy) xw_bridge_on_gdk_delete_release();
 #endif
        if (hwnd && IsWindowEnabled(hwnd) &&
            !DestroyPopupMenus() && // ignore if a menu is open, instead just close the menu
