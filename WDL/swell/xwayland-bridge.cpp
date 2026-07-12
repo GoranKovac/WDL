@@ -224,6 +224,7 @@ bool on_enter(GtkWidget *widget, GdkEventCrossing *event, gpointer data)
     }
     XRaiseWindow(c->dpy, c->parent_win);
     XFlush(c->dpy);
+    xw_raise_modals();
     return false;
 }
 
@@ -871,6 +872,7 @@ void xw_raise_modals()
     {
         Capture *c = kv.second;
         if (!c) continue;
+        if (c->modals.empty()) continue;
         for (auto &md : c->modals)
             if (md.gtk_win)
             {
