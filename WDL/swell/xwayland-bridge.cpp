@@ -885,7 +885,7 @@ void xw_raise_modals()
 // True if any captured plugin currently has an open popup but NO open modal.
 // Used to scope the Escape-on-click popup-dismiss workaround so it never fires
 // while a modal is up (which would wrongly close the modal).
-void xw_swell_on_button_event_escape()
+void xw_bridge_swell_on_button_event_escape()
 {
     for (auto &kv : g_captures)
     {
@@ -912,7 +912,7 @@ void xw_swell_on_button_event_escape()
 // must fully DESTROY the canvas here (gtk_widget_destroy, not hide) to tear down
 // the xdg_popup and its grab before any close proceeds. We also Escape the :10
 // menu so the plugin drops its own X grab.
-bool xw_bridge_on_gdk_delete_release()
+bool xw_bridge_swell_on_gdk_delete_release()
 {
     bool any = false;
     for (auto &kv : g_captures) {
