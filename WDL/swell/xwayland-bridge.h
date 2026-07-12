@@ -31,7 +31,7 @@ HWND xw_bridge_create(
     const RECT *r,
     const char* bridge_class_name
 );
-bool xw_forward_key(HWND hwnd, int keycode, int state, bool is_press);
+bool xw_bridge_forward_key(HWND hwnd, int keycode, int state, bool is_press);
 void xw_bridge_swell_on_button_event_escape();
 bool xw_bridge_swell_on_gdk_delete_release();
 extern XWaylandWM *g_wm;
