@@ -85,8 +85,6 @@ struct bridgeState {
     bool     placed = false;     // has the SWELL widget been put in its container
 };
 
-// ─── Blit: plugin pixmap → SWELL widget ──────────────────────────────────────
-
 static bool on_draw(GtkWidget *, cairo_t *cr, gpointer data)
 {
     Capture *c = (Capture*)data;
@@ -109,12 +107,6 @@ static bool on_draw(GtkWidget *, cairo_t *cr, gpointer data)
     return true;
 }
 
-// ─── Input forwarding ────────────────────────────────────────────────────────
-// The plugin's window on :10 lives at some origin (its container's position on
-// :10 plus its own offset within it). XTest wants root coordinates, so translate
-// the widget-local event point through the plugin window's actual on-:10 origin.
-// No hardcoded offset: XTranslateCoordinates gives the true origin every time.
-
 static void forward_motion(Capture *c, int wx, int wy)
 {
     Window child; int rx, ry;
@@ -123,8 +115,24 @@ static void forward_motion(Capture *c, int wx, int wy)
     XTestFakeMotionEvent(c->dpy, DefaultScreen(c->dpy), rx, ry, CurrentTime);
 }
 
-// Defined below; used by on_button_press to raise the modal on a plugin click.
-void xw_raise_modals();
+// Present + keep-above every open modal. Called when a click lands on a background
+// window while a modal is up — with true modality this is rare, but if a grab
+// leaked this pulls the modal back to the front instead of leaving REAPER stuck.
+void xw_raise_modals()
+{
+    for (auto &kv : g_captures)
+    {
+        Capture *c = kv.second;
+        if (!c) continue;
+        if (c->modals.empty()) continue;
+        for (auto &md : c->modals)
+            if (md.gtk_win)
+            {
+                gtk_window_present(GTK_WINDOW(md.gtk_win));
+                gtk_window_set_keep_above(GTK_WINDOW(md.gtk_win), TRUE);
+            }
+    }
+}
 
 // True if any captured plugin currently has an open modal.
 static bool any_modal_open()
@@ -134,24 +142,6 @@ static bool any_modal_open()
     return false;
 }
 
-// Force every open modal to the top by remapping it (hide -> show). On Wayland a
-// client can't raise/keep-above/present itself reliably — Hyprland ignores those
-// once the compositor has raised the window you actually clicked (the plugin's FX
-// window, which is the modal's transient parent). Map-to-top, however, is always
-// honored: a freshly shown surface is placed on top. This is the only thing that
-// reliably pulls the modal back over the plugin after a click on the plugin GUI.
-static void force_modals_top()
-{
-    for (auto &kv : g_captures) {
-        Capture *c = kv.second;
-        if (!c) continue;
-        for (auto &md : c->modals)
-            if (md.gtk_win && gtk_widget_get_visible(md.gtk_win)) {
-                gtk_widget_hide(md.gtk_win);
-                gtk_widget_show(md.gtk_win);
-            }
-    }
-}
 
 static bool on_button_press(GtkWidget *widget, GdkEventButton *e, gpointer data)
 {
@@ -161,7 +151,10 @@ static bool on_button_press(GtkWidget *widget, GdkEventButton *e, gpointer data)
     // front, not interact with the plugin. present()/keep_above don't work here
     // (see force_modals_top) so we remap the modal, which the compositor always
     // places on top. Don't SetFocus and don't forward the click.
-    if (any_modal_open()) { force_modals_top(); return true; }
+    if (any_modal_open()){
+        xw_raise_modals();
+        return true;
+    }
     if (c->hwnd) SetFocus(c->hwnd);
     // if (!gtk_widget_has_focus(widget))
     //     gtk_widget_grab_focus(widget);
@@ -281,7 +274,7 @@ static void refresh_pixmap(Capture *c)
     // Ensure any pending resize is applied server-side before we (re)name the
     // composite pixmap — otherwise we grab a pixmap that the server immediately
     // invalidates, and the next free hits BadPixmap.
-    XSync(c->dpy, False);
+    XFlush(c->dpy);
     Pixmap old = c->pixmap;
     c->pixmap = XCompositeNameWindowPixmap(c->dpy, c->plugin_win);
     if (old) XFreePixmap(c->dpy, old);
@@ -643,7 +636,7 @@ static void create_modal(Capture *state, Window win, XWindowAttributes *attr)
 
     Display *dpy = state->dpy;
     XCompositeRedirectWindow(dpy, win, CompositeRedirectAutomatic);
-    XSync(dpy, False);
+    XFlush(dpy);
     Pixmap pm = XCompositeNameWindowPixmap(dpy, win);
 
     GtkWidget *gtk_win = gtk_window_new(GTK_WINDOW_TOPLEVEL);
@@ -653,13 +646,6 @@ static void create_modal(Capture *state, Window win, XWindowAttributes *attr)
     if (toplevel && GTK_IS_WINDOW(toplevel))
         gtk_window_set_transient_for(GTK_WINDOW(gtk_win), GTK_WINDOW(toplevel));
 
-    // NOTE: no gtk_window_set_modal(TRUE). A GTK modal grab redirects events away
-    // from every other toplevel in the app — including the plugin GUI draw area —
-    // so on_button_press never fires on a plugin click, while Hyprland's
-    // compositor-level click-to-raise still lifts the plugin over the modal. That
-    // combination is exactly the "modal disappears behind the plugin and nothing
-    // responds" bug. We enforce modality ourselves instead: on_button_press blocks
-    // plugin input and raises the modal while one is open.
     gtk_window_set_type_hint(GTK_WINDOW(gtk_win), GDK_WINDOW_TYPE_HINT_DIALOG);
 
     gtk_window_resize(GTK_WINDOW(gtk_win), attr->width, attr->height);
@@ -684,8 +670,6 @@ static void create_modal(Capture *state, Window win, XWindowAttributes *attr)
     gtk_widget_show_all(gtk_win);
     gtk_widget_grab_focus(draw);
 
-    // Damage-drive the modal exactly like the main plugin GUI: one damage object
-    // on g_wm_dpy, partial repaints of md.draw. Replaces the old 100ms full-redraw.
     Damage dmg = 0;
     if (g_wm_dpy && g_damage_event_base >= 0)
         dmg = XDamageCreate(g_wm_dpy, win, XDamageReportBoundingBox);
@@ -694,7 +678,6 @@ static void create_modal(Capture *state, Window win, XWindowAttributes *attr)
     md.x11_win = win; md.pixmap = pm; md.gtk_win = gtk_win; md.draw = draw; md.damage = dmg;
     state->modals.push_back(md);
 }
-
 
 static void modal_remove(Capture *c, Window win)
 {
@@ -742,14 +725,9 @@ static void handle_new_window(Window win, Capture *state, XWindowAttributes *att
         create_modal(state, win, attr);
     }
 }
-// ─── :10 event loop (on the GLib main loop, main thread) ─────────────────────
 
-// A newly-mapped override-redirect window is a plugin popup. Attribute it to the
-// capture whose plugin shares its PID (correct with multiple plugins open), then
-// hand it to that capture's popup canvas.
 static void on_popup_mapped(Window w)
 {
-    fprintf(stderr, "[xwb] popup_mapped w=0x%lx\n", w); fflush(stderr);
     XWindowAttributes attr;
     if (!XGetWindowAttributes(g_wm_dpy, w, &attr) || attr.map_state != IsViewable)
         return;
@@ -763,7 +741,6 @@ static void on_popup_mapped(Window w)
     }
 }
 
-// A popup was unmapped — remove it from whichever capture owns it.
 static void on_popup_unmapped(Window w)
 {
     fprintf(stderr, "[xwb] popup_unmapped w=0x%lx\n", w); fflush(stderr);
@@ -778,7 +755,6 @@ static void on_popup_unmapped(Window w)
         if (mit != c->modals.end()) { modal_remove(c, w); return; }
     }
 }
-
 
 // A popup moved/resized (drag-and-drop popup). Update its geometry from the raw
 // configure coords (already root-relative on :10) and re-capture its pixmap.
@@ -863,25 +839,6 @@ static void bridge_handle_event(XEvent *ev)
     }
 }
 
-// Present + keep-above every open modal. Called when a click lands on a background
-// window while a modal is up — with true modality this is rare, but if a grab
-// leaked this pulls the modal back to the front instead of leaving REAPER stuck.
-void xw_raise_modals()
-{
-    for (auto &kv : g_captures)
-    {
-        Capture *c = kv.second;
-        if (!c) continue;
-        if (c->modals.empty()) continue;
-        for (auto &md : c->modals)
-            if (md.gtk_win)
-            {
-                gtk_window_present(GTK_WINDOW(md.gtk_win));
-                gtk_window_set_keep_above(GTK_WINDOW(md.gtk_win), TRUE);
-            }
-    }
-}
-
 // True if any captured plugin currently has an open popup but NO open modal.
 // Used to scope the Escape-on-click popup-dismiss workaround so it never fires
 // while a modal is up (which would wrongly close the modal).
@@ -930,7 +887,16 @@ bool xw_bridge_swell_on_gdk_delete_release()
                 c->canvas_draw  = nullptr;
             }
         }
-        if (!c->modals.empty()) any = true;   // a modal also needs the Escape
+        if (!c->modals.empty()) {
+            // any = true;   // a modal also needs the Escapefor (auto &md : c->modals) {
+            for (auto &md : c->modals) {
+                if (md.gtk_win &&
+                    gtk_window_is_active(GTK_WINDOW(md.gtk_win))) {
+                    any = true;
+                    break;
+                }
+            }
+        }
     }
     // Only touch :10 / send Escape when there was actually a popup or modal to
     // dismiss. Firing Escape on EVERY window close — including a plain plugin close
@@ -950,8 +916,8 @@ bool xw_bridge_swell_on_gdk_delete_release()
 
 void init_private_xwayland()
 {
-    // The WM owns Xwayland spawn, the X connection, error handling, and the event
-    // pump. We just bring it up and register our per-event handler.
+    // The WM owns Xwayland spawn, the X connection, error handling.
+    // We just bring it up and register our per-event handler.
     if (!XWaylandWM::init_bridge_wm(":10")) return;
 
     if (g_wm_dpy) {
@@ -1007,9 +973,6 @@ static bool try_create_plugin(HWND hwnd)
          else if (list) XFree(list);
      }
 
-    // Modals are damage-driven now (create_modal installs a Damage object, handled
-    // in bridge_handle_event) — same partial-repaint model as the main plugin GUI.
-    // No per-tick redraw needed; initial paint comes from the show_all expose.
     return true;
 }
 
@@ -1029,8 +992,6 @@ void xw_destroy(HWND hwnd)
     delete bs;
 }
 
-// Place the SWELL draw area inside its parent container, at the SWELL-computed
-// position, and size it. Works for both floating (own window) and list-embedded.
 void xw_size(HWND hwnd)
 {
     if (!hwnd || !hwnd->m_private_data || !hwnd->m_oswidget) return;
@@ -1057,16 +1018,10 @@ void xw_size(HWND hwnd)
     HWND fp = hwnd->m_parent;
     if (fp) {
         // FLOATING PLUGIN
-        // DEBUG_PRINT("[XWM] xw_size: parent->m_position=%d,%d,%d,%d\n",
-        //             fp->m_position.left, fp->m_position.top,
-        //             fp->m_position.right, fp->m_position.bottom);
         pos_x = fp->m_position.left + r.left;
         pos_y = fp->m_position.top  + r.top;
         // PLUGIN IN FX LIST
         if (fp->m_parent) {
-            // DEBUG_PRINT("[XWM] xw_size: grandparent->m_position=%d,%d,%d,%d\n",
-            //             fp->m_parent->m_position.left, fp->m_parent->m_position.top,
-            //             fp->m_parent->m_position.right, fp->m_parent->m_position.bottom);
             pos_y += fp->m_parent->m_position.bottom - fp->m_position.bottom;
         }
     }
@@ -1174,10 +1129,7 @@ HWND xw_bridge_create(HWND viewpar, void **wref, const RECT *r, const char *brid
     return hwnd;
 }
 
-// ─── Public key forwarding (called from SWELL OnKeyEvent) ────────────────────
-// Sends a key to :10, targeting the open popup (whose keyboard grab wedges
-// REAPER when keys aren't delivered) or the main plugin GUI otherwise. SWELL
-// consumes the key after calling this so REAPER does not also act on it.
+// Called from SWELL OnKeyEvent
 bool xw_bridge_forward_key(HWND hwnd, int keycode, int state, bool is_press)
 {
     if (!hwnd || !hwnd->m_private_data) return false;
