@@ -387,6 +387,13 @@ static bool canvas_button_press(GtkWidget *, GdkEventButton *e, gpointer data)
     // Clicked outside any popup — dismiss.
     if (!hit) {
         if (c->popup_canvas) gtk_widget_hide(c->popup_canvas);
+        // Position the :10 pointer at the click first. canvas_motion no longer warps
+        // the real pointer (it posts synthetic MotionNotify to avoid the XTest hover
+        // hang), so without this the button lands at the stale pointer position —
+        // typically the button that opened the menu, which just re-opens it. A
+        // single warp on click is fine; only continuous warping blocked.
+        XTestFakeMotionEvent(c->dpy, DefaultScreen(c->dpy), x11_x, x11_y, CurrentTime);
+        XFlush(c->dpy);
         XTestFakeButtonEvent(c->dpy, e->button, True,  CurrentTime);
         XFlush(c->dpy);
         XTestFakeButtonEvent(c->dpy, e->button, False, CurrentTime);
