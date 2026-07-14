@@ -221,35 +221,6 @@ bool on_enter(GtkWidget *widget, GdkEventCrossing *event, gpointer data)
     return false;
 }
 
-// Put the plugin's toplevel in its own GtkWindowGroup. SWELL modal dialogs use
-// gtk_window_set_modal(TRUE) on Wayland (required there — without it, closing the
-// dialog quits REAPER), which does gtk_grab_add and never releases it. A leaked
-// grab makes GTK route ALL pointer/keyboard events to the dead modal, so the
-// plugin GUI goes input-dead. gtk_grab only affects windows in the SAME window
-// group, so isolating the plugin toplevel keeps the grab from ever reaching it,
-// while SWELL's real modality (EnableWindow) is unaffected. This MUST be done
-// structurally (creation / hierarchy-changed) — NOT from a pointer handler like
-// on_enter, because once the grab is leaked those events never arrive, so the
-// group could never get set (chicken-and-egg).
-static void ensure_own_window_group(GtkWidget *w)
-{
-    if (!w) return;
-    GtkWidget *top = gtk_widget_get_toplevel(w);
-    if (top && GTK_IS_WINDOW(top) &&
-        !g_object_get_data(G_OBJECT(top), "xwb-own-group"))
-    {
-        GtkWindowGroup *grp = gtk_window_group_new();
-        gtk_window_group_add_window(grp, GTK_WINDOW(top));
-        g_object_unref(grp);   // the window holds its own ref now
-        g_object_set_data(G_OBJECT(top), "xwb-own-group", (gpointer)1);
-    }
-}
-
-static void on_hierarchy_changed(GtkWidget *w, GtkWidget *, gpointer)
-{
-    ensure_own_window_group(w);   // fires when the widget gains/changes its toplevel
-}
-
 // Wire the SWELL draw area to blit + forward input.
 static void connect_widget(Capture *c)
 {
@@ -263,13 +234,11 @@ static void connect_widget(Capture *c)
                           GDK_SCROLL_MASK);
 
     g_signal_connect(c->widget, "enter-notify-event",   G_CALLBACK(on_enter), c);
-    g_signal_connect(c->widget, "hierarchy-changed",    G_CALLBACK(on_hierarchy_changed), NULL);
     g_signal_connect(c->widget, "draw",                 G_CALLBACK(on_draw),           c);
     g_signal_connect(c->widget, "button-press-event",   G_CALLBACK(on_button_press),   c);
     g_signal_connect(c->widget, "button-release-event", G_CALLBACK(on_button_release), c);
     g_signal_connect(c->widget, "motion-notify-event",  G_CALLBACK(on_motion),         c);
     g_signal_connect(c->widget, "scroll-event",         G_CALLBACK(on_scroll),         c);
-    ensure_own_window_group(c->widget);  // in case the toplevel already exists
     gtk_widget_queue_draw(c->widget);
 }
 
