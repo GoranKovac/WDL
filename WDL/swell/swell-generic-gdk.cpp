@@ -281,6 +281,8 @@ static void on_deactivate()
 
 void swell_oswindow_destroy(HWND hwnd)
 {
+  if (hwnd && hwnd->m_oswidget)
+    // gtk_window_set_modal(GTK_WINDOW(hwnd->m_oswidget), FALSE);
   if (hwnd && hwnd->m_oswindow)
   {
     if (SWELL_focused_oswindow == hwnd->m_oswindow) SWELL_focused_oswindow = NULL;
@@ -861,7 +863,8 @@ void swell_oswindow_manage(HWND hwnd, bool wantfocus)
               gdk_window_set_transient_for(hwnd->m_oswindow,transient_for);
               if (modal)
 #ifdef SWELL_TARGET_WAYLAND
-                            gtk_window_set_modal(GTK_WINDOW(gtk_win), TRUE);
+                            // gtk_window_set_modal(GTK_WINDOW(gtk_win), TRUE);
+                            printf("SKIP MODAL SET\n");
 #else
                             gdk_window_set_modal_hint(hwnd->m_oswindow,true);
 #endif
@@ -2159,7 +2162,14 @@ static void swell_gdkEventHandler(GdkEvent *evt, gpointer data)
     break;
   }
 #ifdef SWELL_SUPPORT_GTK
-  gtk_main_do_event(evt);
+  // Do NOT hand GDK_DELETE to GTK's default handler: SWELL already processed it
+  // above (the WM_CLOSE path). GTK's default delete handler runs g_object_run_dispose
+  // on the window (hide/withdraw/destroy), which tears the window down itself —
+  // "window closes but process keeps running". On X11 the modal grab happened to
+  // stop GTK from routing the delete here; on Wayland (no grab) it reached this and
+  // disposed the window. Skipping it is correct on both.
+  if (evt->type != GDK_DELETE)
+    gtk_main_do_event(evt);
 #endif
   s_cur_evt = oldEvt;
 }
