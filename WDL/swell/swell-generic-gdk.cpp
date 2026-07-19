@@ -1572,12 +1572,26 @@ static void OnKeyEvent(GdkEventKey *k)
   // plugin (or its open popup) and consume it, so REAPER does not also act on it
   // (prevents Space/Esc etc. wedging while a plugin popup is open).
   {
+    // Modals FIRST. SWELL's focus is still the bridge while a plugin dialog is open,
+    // so the branch below would fire and XSendEvent the key to plugin_win -- and Wine
+    // routes that straight to its active dialog, which is how Tab kept moving between
+    // the dialog's buttons even though the dialog was not focused. Handing the modal
+    // case a chance to run first is what lets it raise-and-swallow instead.
+    if (xw_bridge_forward_key_to_modal(k->hardware_keycode, k->state,
+                                       k->type == GDK_KEY_PRESS))
+      return;
+
     HWND foc = GetFocusIncludeMenus();
     if (foc && foc->m_classname && !strcmp(foc->m_classname, "REAPERXBridge"))
     {
       xw_bridge_forward_key(foc, k->hardware_keycode, k->state, k->type == GDK_KEY_PRESS);
       return;
     }
+
+    // No modal, but a plugin popup may still be open. Nothing else dismisses it on the
+    // key path, so its grab stays and wedges further input.
+    if (k->type == GDK_KEY_PRESS && g_wm_dpy)
+      xw_bridge_swell_on_button_event_escape();
   }
 #endif
   int modifiers = 0;
@@ -1750,9 +1764,10 @@ static void OnButtonEvent(GdkEventButton *b)
   if (!hwnd) return;
 
 #ifdef SWELL_TARGET_WAYLAND
-  // Popup-dismiss workaround click sends Escape to :10 to unstick an open plugin popup
-    if (b->type == GDK_BUTTON_PRESS && g_wm_dpy)
-        xw_bridge_swell_on_button_event_escape();
+  // Popup-dismiss workaround and raise modals to unstick an open plugin popup
+    if (b->type == GDK_BUTTON_PRESS && g_wm_dpy){
+        if (xw_bridge_swell_on_button_event_escape()) return;
+    }
 #endif
 
   swell_lastMessagePos = MAKELONG(((int)b->x_root&0xffff),((int)b->y_root&0xffff));
