@@ -85,7 +85,21 @@ XWaylandWM* XWaylandWM::init_bridge_wm(const char *display_name)
     s_xwayland_pid = fork();
     if (s_xwayland_pid == 0) {
         prctl(PR_SET_PDEATHSIG, SIGTERM);
-        execl("/usr/bin/Xwayland", "Xwayland", display_name, "-rootless", NULL);
+        // Xvfb rather than Xwayland: a real Xorg server rendering into a memory
+        // framebuffer. Nothing is ever on-screen or occluded, so every plugin window
+        // is fully rendered and capturable regardless of where it sits -- and the
+        // pointer on this display is ours alone. Composite redirect also behaves
+        // normally here; the input dead zone was a nested-Xwayland defect, not a
+        // property of redirecting. The screen is deliberately huge so plugins can be
+        // laid out without overlapping (occlusion still costs pixels on a plain X
+        // server) and never clip at the edges.
+        execl("/usr/bin/Xvfb", "Xvfb", display_name,
+              "-screen", "0", "8192x8192x24",
+              "+extension", "MIT-SHM",
+              "+extension", "Composite",
+              "+bs",
+              "-nolisten", "tcp",
+              NULL);
         _exit(1);
     }
     if (s_xwayland_pid < 0) return nullptr;

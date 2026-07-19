@@ -4,9 +4,16 @@
 #define DEBUG_PRINT(...) ((void)0)
 #endif
 #include "xwayland-bridge.h"
+#include <X11/extensions/XShm.h>
+#include <sys/ipc.h>
+#include <sys/shm.h>
 
 XWaylandWM     *g_wm           = nullptr;
 Display *g_wm_dpy       = nullptr;
+
+// Layout slots on the virtual framebuffer (defined near xw_bridge_create).
+static int  xw_alloc_slot(int *sx, int *sy);
+static void xw_free_slot(int slot);
 
 // ─── State ───────────────────────────────────────────────────────────────────
 // One plugin = one capture. We composite-capture the plugin's X11 window into a
@@ -18,7 +25,16 @@ struct Capture {
     Window     parent_win  = 0;         // container we created on :10
     Window     plugin_win  = 0;         // the plugin's X11 window (child of parent)
     Window     gui_win     = 0;         // Wine child GUI (or == plugin_win for native)
-    Pixmap     pixmap      = 0;         // composite backing pixmap of plugin_win
+    Pixmap     pixmap      = 0;         // (composite pixmap: popups only now)
+    // Shared-memory capture of this plugin's slot in the Xvfb framebuffer. Replaces
+    // XCompositeRedirectWindow/NameWindowPixmap: the redirect blocked pointer input,
+    // and on a virtual framebuffer it is unnecessary -- nothing is ever occluded or
+    // off-screen, so the window's pixels can be read straight out of the root.
+    XImage         *shm_img      = nullptr;
+    XShmSegmentInfo shm_info     = {};
+    bool            shm_attached = false;
+    int             shm_w        = 0;
+    int             shm_h        = 0;
     GtkWidget *widget      = nullptr;   // SWELL draw area we blit into
     HWND       hwnd        = nullptr;   // back-reference
     //
@@ -38,7 +54,7 @@ struct Capture {
     int        gtk_x           = 0;     // plugin widget screen offset (X)
     int        gtk_y           = 0;     // plugin widget screen offset (Y)
     Window     root_popup      = 0;     // first popup in the chain
-    struct PopupWin { Window x11_win; Pixmap pixmap; int x,y,w,h; bool visible; };
+    struct PopupWin { Window x11_win; Pixmap pixmap; int x,y,w,h; bool visible; Damage damage; };
     std::vector<PopupWin> popups;
 
     // ── Modals (real dialog windows the plugin opens) ──
@@ -83,29 +99,87 @@ struct bridgeState {
     Window   parent = 0;         // container window on :10
     Capture *cap    = nullptr;
     bool     placed = false;     // has the SWELL widget been put in its container
+    int      slot   = -1;        // layout slot on :10, released on teardown
 };
+
+static void destroy_shm(Capture *c)
+{
+    if (c->shm_img) {
+        if (c->shm_attached && c->dpy) XShmDetach(c->dpy, &c->shm_info);
+        if (c->shm_info.shmaddr) shmdt(c->shm_info.shmaddr);
+        c->shm_img->data = nullptr;     // shm memory, not malloc'd -- don't let Xlib free it
+        XDestroyImage(c->shm_img);
+        c->shm_img = nullptr;
+    }
+    c->shm_info.shmaddr = nullptr;
+    c->shm_info.shmid   = -1;
+    c->shm_attached = false;
+    c->shm_w = c->shm_h = 0;
+}
+
+// (Re)allocate the shared-memory image when the plugin's size changes.
+static bool ensure_shm(Capture *c, int w, int h)
+{
+    if (c->shm_img && c->shm_w == w && c->shm_h == h) return true;
+    destroy_shm(c);
+    if (w <= 0 || h <= 0) return false;
+
+    const int screen = DefaultScreen(c->dpy);
+    Visual *vis      = DefaultVisual(c->dpy, screen);
+    const int depth  = DefaultDepth(c->dpy, screen);
+
+    c->shm_img = XShmCreateImage(c->dpy, vis, depth, ZPixmap, nullptr, &c->shm_info, w, h);
+    if (!c->shm_img) return false;
+
+    c->shm_info.shmid = shmget(IPC_PRIVATE,
+                               (size_t)c->shm_img->bytes_per_line * c->shm_img->height,
+                               IPC_CREAT | 0600);
+    if (c->shm_info.shmid < 0) { XDestroyImage(c->shm_img); c->shm_img = nullptr; return false; }
+
+    c->shm_info.shmaddr  = c->shm_img->data = (char*)shmat(c->shm_info.shmid, nullptr, 0);
+    c->shm_info.readOnly = False;
+    if (c->shm_info.shmaddr == (char*)-1) {
+        shmctl(c->shm_info.shmid, IPC_RMID, nullptr);
+        c->shm_info.shmaddr = nullptr;
+        c->shm_img->data = nullptr;
+        XDestroyImage(c->shm_img); c->shm_img = nullptr;
+        return false;
+    }
+    if (!XShmAttach(c->dpy, &c->shm_info)) { destroy_shm(c); return false; }
+    XSync(c->dpy, False);
+    // Mark for destruction now: it stays alive until everyone detaches, so this just
+    // guarantees it cannot leak if we crash.
+    shmctl(c->shm_info.shmid, IPC_RMID, nullptr);
+    c->shm_info.shmid = -1;
+
+    c->shm_attached = true;
+    c->shm_w = w;
+    c->shm_h = h;
+    return true;
+}
+
 
 static bool on_draw(GtkWidget *, cairo_t *cr, gpointer data)
 {
     Capture *c = (Capture*)data;
-    if (!c || !c->dpy || !c->pixmap) return FALSE;
+    // No XGetWindowAttributes, No ensure_shm, No XShmGetImage here!
+    if (!c || !c->shm_img || !c->shm_img->data) return FALSE;
 
-    Window root; int x, y; unsigned int w, h, border, depth;
-    if (!XGetGeometry(c->dpy, c->pixmap, &root, &x, &y, &w, &h, &border, &depth))
-        return FALSE;
-
-    XWindowAttributes wa;
-    Visual *visual = DefaultVisual(c->dpy, DefaultScreen(c->dpy));
-    if (XGetWindowAttributes(c->dpy, c->plugin_win, &wa)) visual = wa.visual;
-
-    cairo_surface_t *surf = cairo_xlib_surface_create(c->dpy, c->pixmap, visual, w, h);
+    cairo_surface_t *surf =
+        cairo_image_surface_create_for_data((unsigned char*)c->shm_img->data,
+                                            CAIRO_FORMAT_RGB24,
+                                            c->shm_img->width, c->shm_img->height,
+                                            c->shm_img->bytes_per_line);
     if (surf) {
-        cairo_set_source_surface(cr, surf, 0, 0);
-        cairo_paint(cr);
+        if (cairo_surface_status(surf) == CAIRO_STATUS_SUCCESS) {
+            cairo_set_source_surface(cr, surf, 0, 0);
+            cairo_paint(cr);
+        }
         cairo_surface_destroy(surf);
     }
-    return true;
+    return TRUE;
 }
+
 
 static void forward_motion(Capture *c, int wx, int wy)
 {
@@ -115,9 +189,6 @@ static void forward_motion(Capture *c, int wx, int wy)
     XTestFakeMotionEvent(c->dpy, DefaultScreen(c->dpy), rx, ry, CurrentTime);
 }
 
-// Present + keep-above every open modal. Called when a click lands on a background
-// window while a modal is up — with true modality this is rare, but if a grab
-// leaked this pulls the modal back to the front instead of leaving REAPER stuck.
 void xw_raise_modals()
 {
     for (auto &kv : g_captures)
@@ -134,7 +205,6 @@ void xw_raise_modals()
     }
 }
 
-// True if any captured plugin currently has an open modal.
 static bool any_modal_open()
 {
     for (auto &kv : g_captures)
@@ -142,22 +212,16 @@ static bool any_modal_open()
     return false;
 }
 
-
 static bool on_button_press(GtkWidget *widget, GdkEventButton *e, gpointer data)
 {
+    fprintf(stderr, "[DNDX] widget button PRESS btn=%d\n", e->button); fflush(stderr);
     Capture *c = (Capture*)data;
     if (!c || !c->dpy) return false;
-    // A modal is open: a click on the plugin GUI must bring the modal back to the
-    // front, not interact with the plugin. present()/keep_above don't work here
-    // (see force_modals_top) so we remap the modal, which the compositor always
-    // places on top. Don't SetFocus and don't forward the click.
     if (any_modal_open()){
         xw_raise_modals();
         return true;
     }
     if (c->hwnd) SetFocus(c->hwnd);
-    // if (!gtk_widget_has_focus(widget))
-    //     gtk_widget_grab_focus(widget);
     forward_motion(c, (int)e->x, (int)e->y);
     XTestFakeButtonEvent(c->dpy, e->button, True, CurrentTime);
     XFlush(c->dpy);
@@ -166,6 +230,7 @@ static bool on_button_press(GtkWidget *widget, GdkEventButton *e, gpointer data)
 
 static bool on_button_release(GtkWidget *, GdkEventButton *e, gpointer data)
 {
+    fprintf(stderr, "[DNDX] widget button RELEASE btn=%d\n", e->button); fflush(stderr);
     Capture *c = (Capture*)data;
     if (!c || !c->dpy) return false;
     forward_motion(c, (int)e->x, (int)e->y);
@@ -227,7 +292,6 @@ static void connect_widget(Capture *c)
     if (!c->widget) return;
     gtk_widget_add_events(c->widget,
                           GDK_ENTER_NOTIFY_MASK |
-                          GDK_LEAVE_NOTIFY_MASK |
                           GDK_POINTER_MOTION_MASK |
                           GDK_BUTTON_PRESS_MASK |
                           GDK_BUTTON_RELEASE_MASK |
@@ -250,7 +314,9 @@ static Capture* setup_capture(Display *dpy, Window parent_win, Window plugin_win
     c->plugin_win = plugin_win;
     c->hwnd       = hwnd;
 
-    XCompositeRedirectWindow(dpy, plugin_win, CompositeRedirectAutomatic);
+    XSetWindowAttributes swa;
+    swa.backing_store = Always;
+    XChangeWindowAttributes(dpy, plugin_win, CWBackingStore, &swa);
 
     int base, err;
     if (g_wm_dpy && XDamageQueryExtension(g_wm_dpy, &base, &err)) {
@@ -260,31 +326,17 @@ static Capture* setup_capture(Display *dpy, Window parent_win, Window plugin_win
 
     XFlush(dpy);
 
-    c->pixmap = XCompositeNameWindowPixmap(dpy, plugin_win);
-
     register_capture(c);
-    DEBUG_PRINT("[XW] setup parent=0x%lx plugin=0x%lx pixmap=0x%lx\n",
-                parent_win, plugin_win, c->pixmap);
+    DEBUG_PRINT("[XW] setup parent=0x%lx plugin=0x%lx (xshm)\n",
+                parent_win, plugin_win);
     return c;
-}
-
-static void refresh_pixmap(Capture *c)
-{
-    if (!c) return;
-    // Ensure any pending resize is applied server-side before we (re)name the
-    // composite pixmap — otherwise we grab a pixmap that the server immediately
-    // invalidates, and the next free hits BadPixmap.
-    XFlush(c->dpy);
-    Pixmap old = c->pixmap;
-    c->pixmap = XCompositeNameWindowPixmap(c->dpy, c->plugin_win);
-    if (old) XFreePixmap(c->dpy, old);
-    if (c->widget) gtk_widget_queue_draw(c->widget);
 }
 
 static void cleanup_capture(Capture *c)
 {
     if (!c) return;
     unregister_capture(c);
+    destroy_shm(c);
     if (c->pixmap) XFreePixmap(c->dpy, c->pixmap);
     Display *d = c->dpy;
     c->dpy = nullptr;
@@ -356,11 +408,6 @@ static bool canvas_button_press(GtkWidget *, GdkEventButton *e, gpointer data)
     // Clicked outside any popup — dismiss.
     if (!hit) {
         if (c->popup_canvas) gtk_widget_hide(c->popup_canvas);
-        // Position the :10 pointer at the click first. canvas_motion no longer warps
-        // the real pointer (it posts synthetic MotionNotify to avoid the XTest hover
-        // hang), so without this the button lands at the stale pointer position —
-        // typically the button that opened the menu, which just re-opens it. A
-        // single warp on click is fine; only continuous warping blocked.
         XTestFakeMotionEvent(c->dpy, DefaultScreen(c->dpy), x11_x, x11_y, CurrentTime);
         XFlush(c->dpy);
         XTestFakeButtonEvent(c->dpy, e->button, True,  CurrentTime);
@@ -396,37 +443,10 @@ static bool canvas_motion(GtkWidget *, GdkEventMotion *e, gpointer data)
     int x11_x = screen_x - c->gtk_x;
     int x11_y = screen_y - c->gtk_y;
 
-    // Deliver motion to the popup under the cursor with a synthetic MotionNotify
-    // instead of XTestFakeMotionEvent. Warping the pointer via XTest on a nested
-    // XWayland is unreliable and *blocks* — it round-trips to the parent compositor
-    // (see KDE #442846, and SDL disabling XTest on XWayland) — which is the popup
-    // hover hang. XSendEvent just posts the event to the popup: no warp, no
-    // round-trip, nothing to block on.
-    for (auto &p : c->popups) {
-        if (!p.visible) continue;
-        if (screen_x >= p.x && screen_x < p.x + p.w &&
-            screen_y >= p.y && screen_y < p.y + p.h) {
-            XEvent me; memset(&me, 0, sizeof(me));
-            me.type              = MotionNotify;
-            me.xmotion.display   = c->dpy;
-            me.xmotion.window    = p.x11_win;
-            me.xmotion.root      = DefaultRootWindow(c->dpy);
-            me.xmotion.subwindow = None;
-            me.xmotion.time      = CurrentTime;
-            me.xmotion.x         = screen_x - p.x;   // local to the popup
-            me.xmotion.y         = screen_y - p.y;
-            me.xmotion.x_root    = x11_x;
-            me.xmotion.y_root    = x11_y;
-            me.xmotion.same_screen = True;
-            XSendEvent(c->dpy, p.x11_win, True, PointerMotionMask, &me);
-            XFlush(c->dpy);
+    XTestFakeMotionEvent(c->dpy, DefaultScreen(c->dpy), x11_x, x11_y, CurrentTime);
+    XFlush(c->dpy);
 
-            if (p.pixmap != None) XFreePixmap(c->dpy, p.pixmap);
-            p.pixmap = XCompositeNameWindowPixmap(c->dpy, p.x11_win);
-            if (c->canvas_draw) gtk_widget_queue_draw(c->canvas_draw);
-            break;
-        }
-    }
+    // if (c->canvas_draw) gtk_widget_queue_draw(c->canvas_draw);
     return true;
 }
 
@@ -443,7 +463,6 @@ static void create_popup_canvas(Capture *c)
         gtk_window_set_transient_for(GTK_WINDOW(win), GTK_WINDOW(top));
 
     gtk_window_set_keep_above(GTK_WINDOW(win), TRUE);
-    gtk_window_set_modal(GTK_WINDOW(win), FALSE);
 
     GdkScreen *screen = gdk_screen_get_default();
     int sw = gdk_screen_get_width(screen);
@@ -457,8 +476,8 @@ static void create_popup_canvas(Capture *c)
     gtk_widget_set_size_request(da, sw, sh);
     gtk_container_add(GTK_CONTAINER(win), da);
 
-    g_signal_connect(da, "draw",                 G_CALLBACK(canvas_draw_cb),        c);
     gtk_widget_add_events(da, GDK_BUTTON_PRESS_MASK | GDK_BUTTON_RELEASE_MASK | GDK_POINTER_MOTION_MASK);
+    g_signal_connect(da, "draw",                 G_CALLBACK(canvas_draw_cb),        c);
     g_signal_connect(da, "button-press-event",   G_CALLBACK(canvas_button_press),   c);
     g_signal_connect(da, "button-release-event", G_CALLBACK(canvas_button_release), c);
     g_signal_connect(da, "motion-notify-event",  G_CALLBACK(canvas_motion),         c);
@@ -479,8 +498,9 @@ static void canvas_add_popup(Capture *c, Window x11_win, XWindowAttributes *attr
     // trusting c->gtk_x/gtk_y cached by xw_size. Those go stale when a popup opens
     // before xw_size has run with correct geometry — a startup race, and always
     // after a Super+Q reopen (fresh capture) — which is what puts popups at the
-    // wrong place. gdk_window_get_origin is always current; gtk_x = origin - px
-    // keeps the existing (px + attr + gtk_x) formula and the motion mapping correct.
+    // wrong place. gdk_window_get_origin is always current; gtk_x = origin - px is
+    // the plugin's :10 origin -> desktop translation used by both the popup placement
+    // below and the inverse mapping for input.
     if (c->widget) {
         GdkWindow *ww = gtk_widget_get_window(c->widget);
         if (ww) {
@@ -493,7 +513,9 @@ static void canvas_add_popup(Capture *c, Window x11_win, XWindowAttributes *attr
 
     if (!c->popup_canvas) create_popup_canvas(c);
 
-    XCompositeRedirectWindow(c->dpy, x11_win, CompositeRedirectAutomatic);
+    // Manual, not Automatic: Automatic also keeps the server painting the popup into
+    // its parent, which made menus open/close erratically on mouse movement.
+    XCompositeRedirectWindow(c->dpy, x11_win, CompositeRedirectManual);
     XFlush(c->dpy);   // non-blocking; don't stall the main loop on every popup
     Pixmap pixmap = XCompositeNameWindowPixmap(c->dpy, x11_win);
 
@@ -507,11 +529,22 @@ static void canvas_add_popup(Capture *c, Window x11_win, XWindowAttributes *attr
     } else {
         c->popups.emplace_back();
         pp = &c->popups.back();
+        // Report repaints of this popup so the canvas can redraw it (menu highlight
+        // following the cursor, for example) without re-naming its pixmap per motion.
+        if (g_wm_dpy && g_damage_event_base >= 0)
+            pp->damage = XDamageCreate(g_wm_dpy, x11_win, XDamageReportBoundingBox);
     }
     pp->x11_win = x11_win;
     pp->pixmap  = pixmap;
-    pp->x = px + attr->x + c->gtk_x;
-    pp->y = py + attr->y + c->gtk_y;
+    // attr->x/y are already root coordinates on :10, and gtk_x/gtk_y (= widget origin
+    // on the real desktop minus the plugin's :10 origin) carry the translation to the
+    // desktop. Adding px/py as well counted the plugin's :10 origin twice. That was
+    // harmless while every container sat at (0,0), but each plugin now lives in its
+    // own slot, so the double-count threw popups a whole slot origin away -- onto
+    // another monitor. The inverse mapping used for input (screen - gtk_x) already
+    // assumes this form.
+    pp->x = attr->x + c->gtk_x;
+    pp->y = attr->y + c->gtk_y;
     pp->w = attr->width;
     pp->h = attr->height;
     pp->visible = true;
@@ -528,6 +561,7 @@ static void canvas_remove_popup(Capture *c, Window x11_win)
     if (!c) return;
     for (auto it = c->popups.begin(); it != c->popups.end(); ) {
         if (it->x11_win == x11_win) {
+            if (it->damage && g_wm_dpy) { XDamageDestroy(g_wm_dpy, it->damage); it->damage = 0; }
             if (it->pixmap != None) { XFreePixmap(c->dpy, it->pixmap); it->pixmap = None; }
             it = c->popups.erase(it);
         } else ++it;
@@ -642,7 +676,7 @@ static void create_modal(Capture *state, Window win, XWindowAttributes *attr)
     for (auto &m : state->modals) if (m.x11_win == win) return;
 
     Display *dpy = state->dpy;
-    XCompositeRedirectWindow(dpy, win, CompositeRedirectAutomatic);
+    XCompositeRedirectWindow(dpy, win, CompositeRedirectManual);
     XFlush(dpy);
     Pixmap pm = XCompositeNameWindowPixmap(dpy, win);
 
@@ -717,18 +751,8 @@ static void handle_new_window(Window win, Capture *state, XWindowAttributes *att
 
     bool is_popup = classify_popup(state->dpy, win, attr);
     if (is_popup) {
-        if ((attr->width <= 1 || attr->height <= 1)) {
-            DEBUG_PRINT("Skipping 1x1 window: 0x%lx (%dx%d)\n", win, attr->width, attr->height);
-            return;
-        }
-
-        if ((attr->width == 12 || attr->height == 12)) {
-            DEBUG_PRINT("Skipping unnamed shadow JUCE window: 0x%lx (%dx%d)\n", win, attr->width, attr->height);
-            return;
-        }
         canvas_add_popup(state, win, attr);
     } else {
-        if (attr->width <= 1 || attr->height <= 1) return;
         create_modal(state, win, attr);
     }
 }
@@ -750,7 +774,6 @@ static void on_popup_mapped(Window w)
 
 static void on_popup_unmapped(Window w)
 {
-    fprintf(stderr, "[xwb] popup_unmapped w=0x%lx\n", w); fflush(stderr);
     for (auto &kv : g_captures) {
         Capture *c = kv.second;
         auto it = std::find_if(c->popups.begin(), c->popups.end(),
@@ -764,14 +787,23 @@ static void on_popup_unmapped(Window w)
 }
 
 // A popup moved/resized (drag-and-drop popup). Update its geometry from the raw
-// configure coords (already root-relative on :10) and re-capture its pixmap.
+// configure coords and re-capture its pixmap.
 static bool on_popup_configured(Window w, int cx, int cy, int cw, int ch)
 {
     for (auto &kv : g_captures) {
         Capture *c = kv.second;
         for (auto &p : c->popups) {
             if (p.x11_win != w) continue;
-            p.x = cx; p.y = cy; p.w = cw; p.h = ch;
+            // cx/cy are root coordinates on :10, so they need the same translation
+            // canvas_add_popup applies -- p.x/p.y are desktop coordinates for the
+            // canvas. Storing them raw put the popup a whole slot origin off (617 ->
+            // 2665), far outside the canvas, so a moving popup vanished on its first
+            // ConfigureNotify. Harmless before slots, when containers sat at (0,0)
+            // and the two coordinate spaces happened to coincide. Menus never hit
+            // this because they do not move; the drag preview moves constantly.
+            p.x = cx + c->gtk_x;
+            p.y = cy + c->gtk_y;
+            p.w = cw; p.h = ch;
             if (p.pixmap != None) XFreePixmap(c->dpy, p.pixmap);
             p.pixmap = XCompositeNameWindowPixmap(c->dpy, w);
             if (c->canvas_draw) {
@@ -793,35 +825,139 @@ static void bridge_handle_event(XEvent *ev)
     // Damage may target a plugin GUI or a modal dialog — resolve by the damaged
     // drawable (XDamageNotifyEvent.drawable overlaps xany.window). Modals aren't
     // in g_captures, so we test the event type first, then look up the drawable.
+    
     if (g_damage_event_base >= 0 && ev->type == g_damage_event_base + XDamageNotify) {
         XDamageNotifyEvent *de = (XDamageNotifyEvent *)ev;
         DEBUG_PRINT("damage: %dx%d+%d+%d\n",
             de->area.width, de->area.height, de->area.x, de->area.y);
+        
         // Subtract on g_wm_dpy — the connection that created the damage object and
         // receives its events — so the region actually clears and re-arms.
         XDamageSubtract(g_wm_dpy, de->damage, None, None);
+
+        // Helper lambda to safely update the shared memory image for a given capture context
+        auto update_capture_buffer = [](Capture *c) -> bool {
+            if (!c || !c->dpy || !c->plugin_win) return false;
+            
+            XWindowAttributes wa;
+            if (!XGetWindowAttributes(c->dpy, c->plugin_win, &wa)) return false;
+            if (wa.width <= 0 || wa.height <= 0) return false;
+            if (!ensure_shm(c, wa.width, wa.height)) return false;
+            
+            return XShmGetImage(c->dpy, c->plugin_win, c->shm_img, 0, 0, AllPlanes);
+        };
 
         // Plugin GUI: de->area is in plugin_win coords, which map 1:1 to the
         // widget (on_draw blits the pixmap at 0,0). cairo clips the paint to this
         // rect, so only this region blits. Modals work the same way against md.draw.
         Capture *c = find_capture(de->drawable);
         if (c && c->widget && GTK_IS_WIDGET(c->widget)) {
-            gtk_widget_queue_draw_area(c->widget, de->area.x, de->area.y,
-                                       de->area.width, de->area.height);
+            // Update the buffer from the X Server immediately before scheduling the GTK draw
+            if (update_capture_buffer(c)) {
+                gtk_widget_queue_draw_area(c->widget, de->area.x, de->area.y,
+                                           de->area.width, de->area.height);
+            }
             return;
         }
+
         for (auto &kv : g_captures) {
             Capture *cc = kv.second;
             if (!cc) continue;
+
+            // Popups: damage on a popup (menu highlight following the cursor, for
+            // instance) has to repaint the canvas it is composited into. Without
+            // this the canvas only updated as a side effect of pixmap churn in
+            // canvas_motion, which flickered.
+            for (auto &pp : cc->popups) {
+                if (pp.x11_win == de->drawable) {
+                    if (cc->canvas_draw && GTK_IS_WIDGET(cc->canvas_draw)) {
+                        if (update_capture_buffer(cc)) {
+                            gtk_widget_queue_draw(cc->canvas_draw);
+                        }
+                    }
+                    return;
+                }
+            }
+
             for (auto &md : cc->modals) {
                 if (md.x11_win == de->drawable) {
-                    if (md.draw && GTK_IS_WIDGET(md.draw))
-                        gtk_widget_queue_draw_area(md.draw, de->area.x, de->area.y,
-                                                   de->area.width, de->area.height);
+                    if (md.draw && GTK_IS_WIDGET(md.draw)) {
+                        if (update_capture_buffer(cc)) {
+                            gtk_widget_queue_draw_area(md.draw, de->area.x, de->area.y,
+                                                       de->area.width, de->area.height);
+                        }
+                    }
                     return;
                 }
             }
         }
+        return;
+    }
+
+
+    // ---- XDND coming FROM the plugin (dragging something out of it) ----
+    // Wine runs a nested drag loop while dragging. Inside it, it sends XdndEnter /
+    // XdndPosition to the window under the pointer -- our container -- and then WAITS
+    // for an XdndStatus reply. Nothing here answered: this switch only handled
+    // map/unmap/configure, and the find_capture() check below returns early for the
+    // container anyway. So the loop blocked forever, the plugin could not service
+    // yabridge, and REAPER's next host->plugin call parked its UI thread in recv() --
+    // the same deadlock shape as the modal-dialog hang.
+    //
+    // Answering is what matters, not accepting. We currently REFUSE (accept bit 0):
+    // the drag ends cleanly with a no-drop cursor instead of hanging. Accepting would
+    // additionally require handling XdndDrop plus the XdndSelection transfer, and
+    // leaving that half-done would hang again waiting for XdndFinished.
+    if (ev->type == ClientMessage)
+    {
+        Display *dpy   = ev->xclient.display;
+        const Atom mt  = ev->xclient.message_type;
+        {   // DIAG: does the plugin's drag handshake reach us at all?
+            char *n = XGetAtomName(dpy, mt);
+            fprintf(stderr, "[DNDX] ClientMessage %s win=0x%lx src=0x%lx\n",
+                    n ? n : "?", ev->xclient.window,
+                    (unsigned long)ev->xclient.data.l[0]);
+            fflush(stderr);
+            if (n) XFree(n);
+        }
+        const Window self = ev->xclient.window;
+        const Window src  = (Window)ev->xclient.data.l[0];
+
+        if (src && mt == XInternAtom(dpy, "XdndPosition", False))
+        {
+            XClientMessageEvent st; memset(&st, 0, sizeof(st));
+            st.type         = ClientMessage;
+            st.display      = dpy;
+            st.window       = src;
+            st.message_type = XInternAtom(dpy, "XdndStatus", False);
+            st.format       = 32;
+            st.data.l[0]    = (long)self;
+            st.data.l[1]    = 0;      // bit 0 clear = will not accept a drop
+            st.data.l[2]    = 0;      // no "silent" rectangle: keep sending positions
+            st.data.l[3]    = 0;
+            st.data.l[4]    = None;   // no action
+            XSendEvent(dpy, src, False, NoEventMask, (XEvent*)&st);
+            XFlush(dpy);
+            return;
+        }
+        if (src && mt == XInternAtom(dpy, "XdndDrop", False))
+        {
+            // Should not arrive while we refuse, but answer anyway -- an unanswered
+            // XdndDrop leaves the source waiting on XdndFinished, which is a hang.
+            XClientMessageEvent fin; memset(&fin, 0, sizeof(fin));
+            fin.type         = ClientMessage;
+            fin.display      = dpy;
+            fin.window       = src;
+            fin.message_type = XInternAtom(dpy, "XdndFinished", False);
+            fin.format       = 32;
+            fin.data.l[0]    = (long)self;
+            fin.data.l[1]    = 0;     // not accepted
+            fin.data.l[2]    = None;
+            XSendEvent(dpy, src, False, NoEventMask, (XEvent*)&fin);
+            XFlush(dpy);
+            return;
+        }
+        // XdndEnter and XdndLeave require no reply.
         return;
     }
 
@@ -849,22 +985,62 @@ static void bridge_handle_event(XEvent *ev)
 // True if any captured plugin currently has an open popup but NO open modal.
 // Used to scope the Escape-on-click popup-dismiss workaround so it never fires
 // while a modal is up (which would wrongly close the modal).
-void xw_bridge_swell_on_button_event_escape()
+// Dismiss any open plugin popup for this capture by clicking outside it on :10.
+//
+// This replaces sending Escape. A Wine menu holds a POINTER grab, and keyboard focus
+// on :10 is not on the menu, so the key event never reached it -- Escape silently did
+// nothing and the grab stayed, which is what locks REAPER's input up entirely. A click
+// outside the menu is what actually dismisses it; the grab owner consumes that click
+// to close itself, so no control underneath gets activated.
+static void dismiss_popups_by_click(Capture *c)
 {
+    if (!c || !c->dpy || c->popups.empty()) return;
+
+    Window rootw = DefaultRootWindow(c->dpy);
+    Window childw; int px = 0, py = 0;
+    XTranslateCoordinates(c->dpy, c->gui_win ? c->gui_win : c->plugin_win,
+                          rootw, 0, 0, &px, &py, &childw);
+
+    // Top-left corner of the plugin: a menu opened from a control is essentially
+    // never covering it. If one is, aim just below that popup instead.
+    int ax = px + 1, ay = py + 1;
+    for (const auto &p : c->popups) {
+        if (!p.visible) continue;
+        const int p10x = p.x - c->gtk_x, p10y = p.y - c->gtk_y;
+        if (ax >= p10x && ax < p10x + p.w && ay >= p10y && ay < p10y + p.h)
+            ay = p10y + p.h + 1;
+    }
+
+    XTestFakeMotionEvent(c->dpy, DefaultScreen(c->dpy), ax, ay, CurrentTime);
+    XFlush(c->dpy);
+    XTestFakeButtonEvent(c->dpy, Button1, True,  CurrentTime);
+    XTestFakeButtonEvent(c->dpy, Button1, False, CurrentTime);
+    XFlush(c->dpy);
+}
+
+bool xw_bridge_swell_on_button_event_escape()
+{
+    bool any = false;
     for (auto &kv : g_captures)
     {
         Capture *c = kv.second;
         if (!c) continue;
-        //NOTE: probably not necessary anymore since on enter modal is focused
-        // if (!c->modals.empty())
-        //     xw_raise_modals();
+        // Raise the modal so an outside click brings it back to the front rather than
+        // leaving it stranded behind the plugin.
+        if (!c->modals.empty()){
+            xw_raise_modals();
+            any = true;
+        }
         if (!c->popups.empty()){
-            KeyCode esc = XKeysymToKeycode(g_wm_dpy, XK_Escape);
-            XTestFakeKeyEvent(g_wm_dpy, esc, True, CurrentTime);
-            XTestFakeKeyEvent(g_wm_dpy, esc, False, CurrentTime);
-            XFlush(g_wm_dpy);
+            // Runs when the user clicks anywhere in REAPER, including left of or
+            // above the plugin where the overlay canvas does not reach (it is an
+            // xdg_popup anchored to the FX window, so it only extends right and down
+            // and those clicks never hit canvas_button_press).
+            dismiss_popups_by_click(c);
+            any = true;
         }
     }
+    return any;
 }
 
 // If any plugin popup is open, dismiss it and return true. Called from SWELL's
@@ -911,12 +1087,14 @@ bool xw_bridge_swell_on_gdk_delete_release()
     // with nothing open — is what corrupts the teardown and crashes Wine (the
     // plugin's GUI window gets destroyed from the outside -> BadWindow).
     if (any) {
-        gdk_display_flush(gdk_display_get_default());
-        if (g_wm_dpy) {
-            KeyCode esc = XKeysymToKeycode(g_wm_dpy, XK_Escape);
-            XTestFakeKeyEvent(g_wm_dpy, esc, True,  CurrentTime);
-            XTestFakeKeyEvent(g_wm_dpy, esc, False, CurrentTime);
-            XFlush(g_wm_dpy);
+        // gdk_display_flush(gdk_display_get_default());
+        // Click outside the popup rather than sending Escape: the menu holds a pointer
+        // grab and never receives the key, so Escape left the grab in place and locked
+        // input up. Modals are separate GTK windows with their own key handling and
+        // are unaffected by this.
+        for (auto &kv : g_captures) {
+            Capture *cc = kv.second;
+            if (cc && !cc->popups.empty()) dismiss_popups_by_click(cc);
         }
     }
     return any;
@@ -996,6 +1174,7 @@ void xw_destroy(HWND hwnd)
         if (parent) gtk_container_remove(GTK_CONTAINER(parent), hwnd->m_oswidget);
     }
     if (bs->cap) cleanup_capture(bs->cap);
+    xw_free_slot(bs->slot);
     hwnd->m_private_data = 0;
     delete bs;
 }
@@ -1044,7 +1223,6 @@ void xw_size(HWND hwnd)
     // bs->cap: WM_SIZE/SetWindowPos can fire before the plugin is captured (e.g.
     // during an FX-list swap), and the container resize also needs a live capture.
     if (bs->cap) {
-        refresh_pixmap(bs->cap);
         XResizeWindow(bs->cap->dpy, bs->cap->parent_win, w, h);
         XFlush(bs->cap->dpy);
     }
@@ -1091,6 +1269,44 @@ static LRESULT xw_bridgeProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam)
     return 0;
 }
 
+// Every plugin container used to be created at (0,0), so on :10 they all stacked on
+// top of each other. Input is delivered with XTest, which goes to whatever window is
+// under the pointer -- so with the containers overlapping, every click landed on the
+// topmost one and only the last-opened plugin responded. That is the input "dead
+// zone". On a real display there is nowhere else to put them; on Xvfb's large virtual
+// framebuffer each plugin simply gets its own slot, and then the pointer genuinely is
+// over the intended window. Nothing on this display is ever visible, so the layout
+// only has to avoid overlap -- which also matters because overlapping windows lose
+// the occluded pixels when captured.
+#define XW_SLOT_W      2048
+#define XW_SLOT_H      1536
+#define XW_SLOT_COLS   3
+// No slot touches the screen edges. A knob near a plugin's top-left needs the pointer
+// to keep travelling up/left while dragging, and at origin (0,0) it just clamps at the
+// edge and stops producing motion, so the knob freezes. The margin gives every plugin
+// room on all sides -- free on a framebuffer this size.
+#define XW_SLOT_MARGIN 2048
+static unsigned int g_slot_used;   // bitmask of occupied slots
+
+static int xw_alloc_slot(int *sx, int *sy)
+{
+    for (int i = 0; i < 32; i++)
+    {
+        if (g_slot_used & (1u << i)) continue;
+        g_slot_used |= (1u << i);
+        *sx = XW_SLOT_MARGIN + (i % XW_SLOT_COLS) * XW_SLOT_W;
+        *sy = XW_SLOT_MARGIN + (i / XW_SLOT_COLS) * XW_SLOT_H;
+        return i;
+    }
+    *sx = *sy = XW_SLOT_MARGIN;   // out of slots: at least stay off the edges
+    return -1;
+}
+
+static void xw_free_slot(int slot)
+{
+    if (slot >= 0 && slot < 32) g_slot_used &= ~(1u << slot);
+}
+
 HWND xw_bridge_create(HWND viewpar, void **wref, const RECT *r, const char *bridge_class_name)
 {
     HWND hwnd = nullptr;
@@ -1108,7 +1324,10 @@ HWND xw_bridge_create(HWND viewpar, void **wref, const RECT *r, const char *brid
     int w = wdl_max(r->right - r->left, 1);
     int h = wdl_max(r->bottom - r->top, 1);
 
-    Window container = XCreateSimpleWindow(disp, root, 0, 0, w, h, 0,
+    int slot_x = 0, slot_y = 0;
+    const int slot = xw_alloc_slot(&slot_x, &slot_y);
+
+    Window container = XCreateSimpleWindow(disp, root, slot_x, slot_y, w, h, 0,
                                            BlackPixel(disp, screen),
                                            WhitePixel(disp, screen));
     XMapWindow(disp, container);
@@ -1120,16 +1339,13 @@ HWND xw_bridge_create(HWND viewpar, void **wref, const RECT *r, const char *brid
     hwnd = new HWND__(viewpar, 0, r, NULL, true, xw_bridgeProc);
     hwnd->m_classname = bridge_class_name;
     hwnd->m_oswidget  = draw_area;
-    // Auto-null m_oswidget the moment the widget is destroyed (e.g. its container
-    // is torn down when the plugin/FX window closes). Without this the pointer
-    // dangles and later GTK calls (get_parent/container_remove during teardown or
-    // reopen) hit freed memory — GTK_IS_WIDGET can't catch that. With the weak
-    // pointer, m_oswidget != NULL reliably means the widget is alive.
+
     g_object_add_weak_pointer(G_OBJECT(draw_area), (gpointer*)&hwnd->m_oswidget);
 
     bridgeState *bs = new bridgeState();
     bs->disp   = disp;
     bs->parent = container;
+    bs->slot   = slot;
     hwnd->m_private_data = (INT_PTR)bs;
 
     *wref = (void*)container;
@@ -1138,6 +1354,32 @@ HWND xw_bridge_create(HWND viewpar, void **wref, const RECT *r, const char *brid
 }
 
 // Called from SWELL OnKeyEvent
+// See the header. Consumes keys while any plugin modal dialog is open.
+//
+// Backtrace of the hang this prevents:
+//   OnKeyEvent -> SWELLAppMain(WM_KEYDOWN) -> REAPER -> libyabridge-vst2 -> recv()
+// REAPER dispatches the key into the plugin, yabridge waits synchronously for the
+// Wine-side host to answer, and that host is inside its modal dialog's nested message
+// loop and never will. The UI thread blocks in recv() and REAPER has to be killed.
+// Focus, grabs and Escape were all irrelevant -- the key simply must not reach the
+// plugin while a modal is up. Sending it to the dialog instead also lets Escape close
+// the dialog, which releases the nested loop.
+bool xw_bridge_forward_key_to_modal(int keycode, int state, bool is_press)
+{
+    for (auto &kv : g_captures)
+    {
+        Capture *c = kv.second;
+        if (!c || !c->dpy || c->modals.empty()) continue;
+
+        Capture::ModalWin &md = c->modals.back();
+        Window target = md.x11_win;
+        if (!target) continue;
+        xw_raise_modals();
+        return true;
+    }
+    return false;
+}
+
 bool xw_bridge_forward_key(HWND hwnd, int keycode, int state, bool is_press)
 {
     if (!hwnd || !hwnd->m_private_data) return false;
