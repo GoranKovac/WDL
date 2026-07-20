@@ -87,7 +87,7 @@ CFLAGS += -O2 -DNDEBUG
   endif
 endif
 
-LINKEXTRA =  -lpthread -ldl -lX11 -lXcomposite -lXtst
+LINKEXTRA =  -lpthread -ldl -lX11 -lXcomposite -lXtst -lXfixes
 
 
 EXTRA_OBJS = 
