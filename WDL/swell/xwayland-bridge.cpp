@@ -385,11 +385,23 @@ static bool canvas_draw_cb(GtkWidget *, cairo_t *cr, gpointer data)
     cairo_paint(cr);
     cairo_set_operator(cr, CAIRO_OPERATOR_OVER);
 
+    double clip_x1, clip_y1, clip_x2, clip_y2;
+    cairo_clip_extents(cr, &clip_x1, &clip_y1, &clip_x2, &clip_y2);
+
     for (const auto &p : c->popups) {
         if (!p.visible || p.pixmap == None) continue;
 
         int draw_x = p.x - c->canvas_origin_x;
         int draw_y = p.y - c->canvas_origin_y;
+
+        // Cairo would clip this popup out correctly regardless, but only after paying
+        // for the XLib surface creation below -- skip that cost entirely for popups
+        // nowhere near what actually changed. With invalidation now scoped to just the
+        // affected rect(s), this is the common case whenever more than one popup is
+        // open (e.g. Virtual Mix Rack's several module windows).
+        if (draw_x + p.w <= clip_x1 || draw_x >= clip_x2 ||
+            draw_y + p.h <= clip_y1 || draw_y >= clip_y2)
+            continue;
 
         // w/h/visual are cached on the popup (set in canvas_add_popup, refreshed on
         // ConfigureNotify) -- an XGetGeometry + XGetWindowAttributes round-trip here,
@@ -520,7 +532,7 @@ static void create_popup_canvas(Capture *c)
 // widget's position inside its GTK container), which happened to agree back when every
 // plugin sat at :10 origin (0,0); with slots it is off by the slot origin, and a
 // resize mid-drag left the drag preview badly offset.
-static void refresh_gtk_offset(Capture *c)
+static void refresh_gtk_offset(Capture *c, int *out_px = nullptr, int *out_py = nullptr)
 {
     if (!c || !c->dpy || !c->widget) return;
 
@@ -535,6 +547,8 @@ static void refresh_gtk_offset(Capture *c)
     Window child; int px = 0, py = 0;
     XTranslateCoordinates(c->dpy, c->parent_win,
                           DefaultRootWindow(c->dpy), 0, 0, &px, &py, &child);
+    if (out_px) *out_px = px;
+    if (out_py) *out_py = py;
 
     GdkWindow *ww = gtk_widget_get_window(c->widget);
     if (!ww) return;
@@ -900,7 +914,8 @@ static bool on_popup_configured(Window w, int cx, int cy, int cw, int ch)
             // A moving popup can outlive a plugin resize (Virtual Mix Rack expands as
             // modules are added), so refresh before translating rather than trusting
             // whatever the offset was when the popup first appeared.
-            refresh_gtk_offset(c);
+            int ox = 0, oy = 0;
+            refresh_gtk_offset(c, &ox, &oy);
             // Some plugins mix coordinate frames. Virtual Mix Rack sends the drag
             // preview's x in ROOT space (it follows the cursor, which we warp into the
             // plugin's slot) but its y in its own CLIENT space, taken from the rack
@@ -912,23 +927,51 @@ static bool on_popup_configured(Window w, int cx, int cy, int cw, int ch)
             // A window living in this slot cannot legitimately be positioned above or
             // left of the container, so treat such a coordinate as client-relative and
             // rebase it. Root coordinates are left untouched.
+            //
+            // ox,oy here used to be a second, separate XTranslateCoordinates call
+            // duplicating exactly what refresh_gtk_offset() just computed above. A
+            // moving popup (the drag preview) fires this on every ConfigureNotify --
+            // one per mouse-move tick while dragging -- so that was two X round-trips
+            // doing the same translation, every single tick. refresh_gtk_offset() now
+            // hands its result back directly instead.
+            int old_x = p.x, old_y = p.y, old_w = p.w, old_h = p.h;
             {
-                Window ch3; int ox = 0, oy = 0;
-                XTranslateCoordinates(c->dpy, c->parent_win, DefaultRootWindow(c->dpy),
-                                      0, 0, &ox, &oy, &ch3);
                 int fx = cx, fy = cy;
                 if (fx < ox) fx += ox;
                 if (fy < oy) fy += oy;
                 p.x = fx + c->gtk_x;
                 p.y = fy + c->gtk_y;
             }
+            // A pure move (size unchanged) leaves the existing composite pixmap's
+            // content perfectly valid -- only re-name it when the size actually
+            // changes. Freeing and re-creating it unconditionally on every
+            // ConfigureNotify meant a moving drag-preview popup paid for an
+            // XFreePixmap + XCompositeNameWindowPixmap round-trip on every tick, for
+            // no visual benefit (the window's pixels didn't change, just its position).
+            bool size_changed = (p.w != cw || p.h != ch);
             p.w = cw; p.h = ch;
-            if (p.pixmap != None) XFreePixmap(c->dpy, p.pixmap);
-            p.pixmap = XCompositeNameWindowPixmap(c->dpy, w);
+            if (size_changed) {
+                if (p.pixmap != None) XFreePixmap(c->dpy, p.pixmap);
+                p.pixmap = XCompositeNameWindowPixmap(c->dpy, w);
+            }
             if (c->canvas_draw) {
                 GdkWindow *cwin = gtk_widget_get_window(c->canvas_draw);
-                if (cwin) gdk_window_invalidate_rect(cwin, NULL, FALSE);
-                else      gtk_widget_queue_draw(c->canvas_draw);
+                // This used to invalidate the whole canvas (NULL rect) -- a full
+                // monitor-sized clear-and-recomposite on every single position tick of
+                // a moving popup. The damage (content-change) handler got scoped to
+                // its actual rect last round; this position-change path, which is what
+                // actually fires continuously while dragging or during Virtual Mix
+                // Rack's reflow animation, was still invalidating everything. Scope it
+                // to the old rect (erase the stale paint at the previous position) and
+                // the new rect (paint the fresh content at the new one).
+                if (cwin) {
+                    GdkRectangle old_r = { old_x - c->canvas_origin_x, old_y - c->canvas_origin_y, old_w, old_h };
+                    GdkRectangle new_r = { p.x  - c->canvas_origin_x, p.y  - c->canvas_origin_y, p.w,   p.h   };
+                    gdk_window_invalidate_rect(cwin, &old_r, FALSE);
+                    gdk_window_invalidate_rect(cwin, &new_r, FALSE);
+                } else {
+                    gtk_widget_queue_draw(c->canvas_draw);
+                }
             }
             return true;
         }
