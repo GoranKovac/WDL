@@ -54,7 +54,7 @@ struct Capture {
     int        gtk_x           = 0;     // plugin widget screen offset (X)
     int        gtk_y           = 0;     // plugin widget screen offset (Y)
     Window     root_popup      = 0;     // first popup in the chain
-    struct PopupWin { Window x11_win; Pixmap pixmap; int x,y,w,h; bool visible; Damage damage; };
+    struct PopupWin { Window x11_win; Pixmap pixmap; int x,y,w,h; bool visible; Damage damage; Visual *visual; };
     std::vector<PopupWin> popups;
 
     // ── Modals (real dialog windows the plugin opens) ──
@@ -387,17 +387,16 @@ static bool canvas_draw_cb(GtkWidget *, cairo_t *cr, gpointer data)
 
     for (const auto &p : c->popups) {
         if (!p.visible || p.pixmap == None) continue;
-        Window rr; int gx, gy; unsigned int gw, gh, gb, gd;
-        if (!XGetGeometry(c->dpy, p.pixmap, &rr, &gx, &gy, &gw, &gh, &gb, &gd)) continue;
 
         int draw_x = p.x - c->canvas_origin_x;
         int draw_y = p.y - c->canvas_origin_y;
 
-        XWindowAttributes wa;
-        Visual *visual = DefaultVisual(c->dpy, DefaultScreen(c->dpy));
-        if (XGetWindowAttributes(c->dpy, p.x11_win, &wa)) visual = wa.visual;
-
-        cairo_surface_t *surf = cairo_xlib_surface_create(c->dpy, p.pixmap, visual, gw, gh);
+        // w/h/visual are cached on the popup (set in canvas_add_popup, refreshed on
+        // ConfigureNotify) -- an XGetGeometry + XGetWindowAttributes round-trip here,
+        // on every single redraw of every popup, was pure X-server latency for data
+        // that was already sitting in memory and does not change between redraws.
+        Visual *visual = p.visual ? p.visual : DefaultVisual(c->dpy, DefaultScreen(c->dpy));
+        cairo_surface_t *surf = cairo_xlib_surface_create(c->dpy, p.pixmap, visual, p.w, p.h);
         if (surf) {
             cairo_set_source_surface(cr, surf, draw_x, draw_y);
             cairo_paint(cr);
@@ -550,6 +549,11 @@ static void canvas_add_popup(Capture *c, Window x11_win, XWindowAttributes *attr
 {
     if (!c) return;
 
+    fprintf(stderr, "[DNDCOORD] canvas_add_popup win=0x%lx attr=(%d,%d,%d,%d) canvas_was_visible=%d\n",
+            (unsigned long)x11_win, attr->x, attr->y, attr->width, attr->height,
+            c->popup_canvas ? gtk_widget_get_visible(c->popup_canvas) : -1);
+    fflush(stderr);
+
     refresh_gtk_offset(c);
 
     if (!c->popup_canvas) create_popup_canvas(c);
@@ -577,6 +581,19 @@ static void canvas_add_popup(Capture *c, Window x11_win, XWindowAttributes *attr
     }
     pp->x11_win = x11_win;
     pp->pixmap  = pixmap;
+    // attr (and attr->visual) was fetched via g_wm_dpy in on_popup_mapped -- a
+    // different Display connection than c->dpy, which is what canvas_draw_cb's
+    // cairo_xlib_surface_create() actually uses. A Visual* from one Xlib connection
+    // is not valid to hand to a Cairo call bound to a different one, even though both
+    // connect to the same X server (Xlib keeps independent client-side copies per
+    // connection) -- that mismatch is what "invalid value for an input Visual*" was.
+    // Fetch it fresh via c->dpy specifically, once, here at creation time: still just
+    // one round-trip for this popup's entire lifetime, not one per frame.
+    {
+        XWindowAttributes wa_local;
+        pp->visual = XGetWindowAttributes(c->dpy, x11_win, &wa_local)
+                   ? wa_local.visual : DefaultVisual(c->dpy, DefaultScreen(c->dpy));
+    }
     // attr->x/y are already root coordinates on :10, and gtk_x/gtk_y (= widget origin
     // on the real desktop minus the plugin's :10 origin) carry the translation to the
     // desktop. Adding px/py as well counted the plugin's :10 origin twice. That was
@@ -600,6 +617,9 @@ static void canvas_add_popup(Capture *c, Window x11_win, XWindowAttributes *attr
 static void canvas_remove_popup(Capture *c, Window x11_win)
 {
     if (!c) return;
+    fprintf(stderr, "[DNDCOORD] canvas_remove_popup win=0x%lx remaining_before=%zu\n",
+            (unsigned long)x11_win, c->popups.size());
+    fflush(stderr);
     for (auto it = c->popups.begin(); it != c->popups.end(); ) {
         if (it->x11_win == x11_win) {
             if (it->damage && g_wm_dpy) { XDamageDestroy(g_wm_dpy, it->damage); it->damage = 0; }
@@ -780,6 +800,26 @@ static void modal_remove(Capture *c, Window win)
         }
 }
 
+static bool is_xdnd_icon_window(Display *dpy, Window win)
+{
+    Atom atom_window_type = XInternAtom(dpy, "_NET_WM_WINDOW_TYPE", False);
+    Atom atom_type_dnd    = XInternAtom(dpy, "_NET_WM_WINDOW_TYPE_DND", False);
+    Atom actual_type; int actual_format; unsigned long nitems = 0, bytes_after = 0;
+    unsigned char *prop = nullptr;
+    bool is_dnd = false;
+    if (XGetWindowProperty(dpy, win, atom_window_type, 0, 10, False, XA_ATOM,
+                           &actual_type, &actual_format, &nitems, &bytes_after, &prop) == Success && prop)
+    {
+        if (actual_format == 32 && nitems > 0) {
+            Atom *atoms = (Atom*)prop;
+            for (unsigned long i = 0; i < nitems; i++)
+                if (atoms[i] == atom_type_dnd) { is_dnd = true; break; }
+        }
+        XFree(prop);
+    }
+    return is_dnd;
+}
+
 static void handle_new_window(Window win, Capture *state, XWindowAttributes *attr) {
     if (!state->dpy || !win || !state) return;
 
@@ -789,6 +829,21 @@ static void handle_new_window(Window win, Capture *state, XWindowAttributes *att
         if (p.x11_win == win) { canvas_add_popup(state, win, attr); return; }
     for (auto &m : state->modals)
         if (m.x11_win == win) return;
+
+    // A _NET_WM_WINDOW_TYPE_DND window is an XDND drag-icon window -- yabridge keeps
+    // one mapped for the whole plugin-drag-out XDND session (see the catcher in
+    // xwayland-bridge-wm.cpp). classify_popup() correctly classifies it as a popup
+    // per EWMH, but routing it into canvas_add_popup mapped the full-screen,
+    // always-on-top overlay meant for the plugin's own dropdown/tooltip popups for
+    // the entire drag, which sat directly on top of REAPER's native drag-preview
+    // tooltip everywhere on screen. This window is never meant to be user-visible
+    // (:10 is a headless Xvfb server, and the drag feedback the user actually sees is
+    // REAPER's own native drag), so ignore it rather than composite it.
+    if (is_xdnd_icon_window(state->dpy, win)) {
+        fprintf(stderr, "[DNDCOORD] ignoring XDND icon window 0x%lx (not compositing as popup)\n", (unsigned long)win);
+        fflush(stderr);
+        return;
+    }
 
     bool is_popup = classify_popup(state->dpy, win, attr);
     if (is_popup) {
@@ -866,18 +921,6 @@ static bool on_popup_configured(Window w, int cx, int cy, int cw, int ch)
                 if (fy < oy) fy += oy;
                 p.x = fx + c->gtk_x;
                 p.y = fy + c->gtk_y;
-            }
-            {   // DIAG: every term in the translation, in one line.
-                Window ch2; int cx0 = 0, cy0 = 0;
-                XTranslateCoordinates(c->dpy, c->parent_win, DefaultRootWindow(c->dpy),
-                                      0, 0, &cx0, &cy0, &ch2);
-                int wox = 0, woy = 0;
-                GdkWindow *ww2 = c->widget ? gtk_widget_get_window(c->widget) : NULL;
-                if (ww2) gdk_window_get_origin(ww2, &wox, &woy);
-                fprintf(stderr,
-                    "[OFF] cfg=%d,%d container=%d,%d widget=%d,%d gtk=%d,%d -> popup=%d,%d\n",
-                    cx, cy, cx0, cy0, wox, woy, c->gtk_x, c->gtk_y, p.x, p.y);
-                fflush(stderr);
             }
             p.w = cw; p.h = ch;
             if (p.pixmap != None) XFreePixmap(c->dpy, p.pixmap);
@@ -962,12 +1005,28 @@ static void bridge_handle_event(XEvent *ev)
             // instance) has to repaint the canvas it is composited into. Without
             // this the canvas only updated as a side effect of pixmap churn in
             // canvas_motion, which flickered.
+            //
+            // update_capture_buffer() was being called here too, but it operates on
+            // c->plugin_win -- the MAIN plugin GUI's own SHM buffer, which has nothing
+            // to do with a popup. Every popup damage event (e.g. a menu highlight
+            // following the cursor, which can fire continuously while hovering) was
+            // paying for a full refresh of the main plugin canvas as an unrelated side
+            // effect. The popup's own content comes straight from its composited
+            // pixmap via Cairo/XLib in canvas_draw_cb -- no separate buffer to update.
+            //
+            // Likewise this used to invalidate the whole canvas widget, which is sized
+            // to the full screen (create_popup_canvas). A tiny highlight change inside
+            // a small dropdown was forcing GTK to clear-and-recomposite a full
+            // monitor-sized transparent surface every time. Map the damaged sub-rect
+            // into canvas-local coordinates instead, matching the precision already
+            // used for the plugin GUI and modal paths just above.
             for (auto &pp : cc->popups) {
                 if (pp.x11_win == de->drawable) {
                     if (cc->canvas_draw && GTK_IS_WIDGET(cc->canvas_draw)) {
-                        if (update_capture_buffer(cc)) {
-                            gtk_widget_queue_draw(cc->canvas_draw);
-                        }
+                        int inv_x = pp.x - cc->canvas_origin_x + de->area.x;
+                        int inv_y = pp.y - cc->canvas_origin_y + de->area.y;
+                        gtk_widget_queue_draw_area(cc->canvas_draw, inv_x, inv_y,
+                                                   de->area.width, de->area.height);
                     }
                     return;
                 }
@@ -1213,6 +1272,30 @@ bool xw_bridge_swell_on_gdk_delete_release()
         // (popup dismissal now happens above, before the list is cleared)
     }
     return any;
+}
+
+// Ground-truth dump of every capture's overlay/modal state -- what actually exists
+// right now, regardless of which code path we think created it. Callable from
+// anywhere via xwayland-bridge.h.
+void xw_bridge_debug_dump_overlays()
+{
+    fprintf(stderr, "[DNDCOORD] --- overlay dump: %zu captures ---\n", g_captures.size());
+    for (auto &kv : g_captures)
+    {
+        Capture *c = kv.second;
+        if (!c) continue;
+        bool canvas_vis = c->popup_canvas && GTK_IS_WIDGET(c->popup_canvas) && gtk_widget_get_visible(c->popup_canvas);
+        int cx = -1, cy = -1;
+        if (canvas_vis)
+        {
+            GdkWindow *gw = gtk_widget_get_window(c->popup_canvas);
+            if (gw) gdk_window_get_origin(gw, &cx, &cy);
+        }
+        fprintf(stderr, "[DNDCOORD]   capture hwnd=%p popup_canvas=%p visible=%d origin=(%d,%d) size=(%d,%d) popups=%zu modals=%zu\n",
+                (void*)c->hwnd, (void*)c->popup_canvas, canvas_vis, cx, cy,
+                c->canvas_w, c->canvas_h, c->popups.size(), c->modals.size());
+    }
+    fflush(stderr);
 }
 
 void init_private_xwayland()
