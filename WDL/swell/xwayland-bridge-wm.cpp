@@ -20,6 +20,7 @@
 #include "xwayland-bridge.h"          // g_wm, g_wm_dpy
 #include <X11/extensions/XTest.h>
 #include <X11/extensions/Xcomposite.h>
+#include <X11/extensions/Xfixes.h>
 #include <cstring>
 #include <cstdio>
 #include <cstdlib>
@@ -292,6 +293,7 @@ const WMWindowState* XWaylandWM::window_state(Window w) const {
 
 bool XWaylandWM::handle_event(XEvent *ev) {
     // DEBUG_PRINT("[WM] handle_event type=%d win=0x%lx\n", ev->type, ev->xany.window);
+    if (dnd_handle_event(ev)) return true;
     switch (ev->type) {
     case MapRequest:       DEBUG_PRINT("[WM] -> MapRequest\n");       return on_map_request(&ev->xmaprequest);
     case ConfigureRequest: DEBUG_PRINT("[WM] -> ConfigureRequest\n"); return on_configure_request(&ev->xconfigurerequest);
@@ -711,4 +713,297 @@ bool classify_popup(Display *dpy, Window win, XWindowAttributes *attr) {
         break;
     }
     return is_popup;
+}
+
+// ─── Drag-and-drop OUT of a plugin (yabridge -> REAPER) ──────────────────────
+//
+// yabridge implements plugin->host drag-and-drop itself, as an XDND drag on the X
+// display: it grabs the pointer and looks for an XdndAware window under the cursor to
+// hand the file to. Normally that would be the host's own X11 window, but REAPER is a
+// native Wayland client and has none -- so yabridge finds no target, sits in its drag
+// loop holding the pointer grab, and every XTest event sent afterwards goes to the
+// grab owner instead of the plugin. That is the "REAPER responds, plugin is frozen"
+// hang.
+//
+// The fix is the same one compositors use for X11->Wayland drags: a full-screen proxy
+// ("catcher") window that looks like a valid XDND target to the X side, and translates
+// the drop to the native side. XFixes tells us when a drag starts, because yabridge
+// takes ownership of the XdndSelection selection at that moment.
+//
+// Everything below is plain Xlib/XFixes protocol handling -- no GTK, GDK, or SWELL --
+// so it lives here rather than in the bridge. Turning the fetched payload into an
+// actual native drag (GTK/SWELL, or anything else) is the caller's job; see
+// dnd_take_pending_path() and dnd_release_source_button() in the header.
+
+void XWaylandWM::dnd_init()
+{
+    if (!dpy_ || dnd_catcher_) return;
+
+    int err_base = 0;
+    if (!XFixesQueryExtension(dpy_, &dnd_xfixes_evt_base_, &err_base)) {
+        fprintf(stderr, "[DNDX] XFixes unavailable -- plugin drag-out cannot be caught\n");
+        fflush(stderr);
+        return;
+    }
+
+    a_XdndSelection_  = XInternAtom(dpy_, "XdndSelection",  False);
+    a_XdndAware_      = XInternAtom(dpy_, "XdndAware",      False);
+    a_XdndEnter_      = XInternAtom(dpy_, "XdndEnter",      False);
+    a_XdndPosition_   = XInternAtom(dpy_, "XdndPosition",   False);
+    a_XdndStatus_     = XInternAtom(dpy_, "XdndStatus",     False);
+    a_XdndDrop_       = XInternAtom(dpy_, "XdndDrop",       False);
+    a_XdndFinished_   = XInternAtom(dpy_, "XdndFinished",   False);
+    a_XdndLeave_      = XInternAtom(dpy_, "XdndLeave",      False);
+    a_XdndActionCopy_ = XInternAtom(dpy_, "XdndActionCopy", False);
+    a_uri_list_       = XInternAtom(dpy_, "text/uri-list",  False);
+    a_dnd_prop_       = XInternAtom(dpy_, "XWB_DND_DATA",   False);
+
+    const int scr  = DefaultScreen(dpy_);
+    Window     root = RootWindow(dpy_, scr);
+
+    XSetWindowAttributes swa;
+    swa.override_redirect = True;   // the WM must not manage or reparent this
+    dnd_catcher_ = XCreateWindow(dpy_, root, 0, 0,
+                                  WidthOfScreen(ScreenOfDisplay(dpy_, scr)),
+                                  HeightOfScreen(ScreenOfDisplay(dpy_, scr)),
+                                  0, CopyFromParent, InputOnly, CopyFromParent,
+                                  CWOverrideRedirect, &swa);
+
+    const long ver = 5;   // XDND protocol version
+    XChangeProperty(dpy_, dnd_catcher_, a_XdndAware_, XA_ATOM, 32,
+                    PropModeReplace, (unsigned char*)&ver, 1);
+
+    // Tell us when someone takes the XdndSelection -- that is a drag starting.
+    XFixesSelectSelectionInput(dpy_, root, a_XdndSelection_,
+                               XFixesSetSelectionOwnerNotifyMask);
+    XFlush(dpy_);
+    fprintf(stderr, "[DNDX] catcher ready win=0x%lx\n", dnd_catcher_); fflush(stderr);
+}
+
+// Mapped only while a drag is in flight: an InputOnly window under the pointer would
+// otherwise swallow the XTest events used to drive plugins.
+void XWaylandWM::dnd_catcher_show(bool on)
+{
+    if (!dnd_catcher_ || !dpy_) return;
+    if (on) { XMapRaised(dpy_, dnd_catcher_); }
+    else    { XUnmapWindow(dpy_, dnd_catcher_); dnd_source_ = 0; }
+    XFlush(dpy_);
+}
+
+void XWaylandWM::dnd_send_status(Window src, bool accept)
+{
+    XClientMessageEvent m; memset(&m, 0, sizeof(m));
+    m.type         = ClientMessage;
+    m.display      = dpy_;
+    m.window       = src;
+    m.message_type = a_XdndStatus_;
+    m.format       = 32;
+    m.data.l[0]    = (long)dnd_catcher_;
+    m.data.l[1]    = accept ? 1 : 0;   // bit 0: will accept
+    m.data.l[2]    = 0;                // no silent rect: keep the positions coming
+    m.data.l[3]    = 0;
+    m.data.l[4]    = accept ? (long)a_XdndActionCopy_ : None;
+    XSendEvent(dpy_, src, False, NoEventMask, (XEvent*)&m);
+    XFlush(dpy_);
+}
+
+void XWaylandWM::dnd_send_finished(Window src, bool accepted)
+{
+    XClientMessageEvent m; memset(&m, 0, sizeof(m));
+    m.type         = ClientMessage;
+    m.display      = dpy_;
+    m.window       = src;
+    m.message_type = a_XdndFinished_;
+    m.format       = 32;
+    m.data.l[0]    = (long)dnd_catcher_;
+    m.data.l[1]    = accepted ? 1 : 0;
+    m.data.l[2]    = accepted ? (long)a_XdndActionCopy_ : None;
+    XSendEvent(dpy_, src, False, NoEventMask, (XEvent*)&m);
+    XFlush(dpy_);
+}
+
+// Clears the fetched/pending payload. Called whenever a drag concludes (Drop or
+// Leave) as well as when a new one starts, so a stale file from a finished drag can
+// never leak into whatever happens next.
+void XWaylandWM::dnd_reset_payload()
+{
+    dnd_requested_ = false;
+    dnd_have_uri_  = false;
+    dnd_pending_   = false;
+    dnd_uri_[0]    = 0;
+}
+
+// Returns true if the event was part of a plugin drag-out and is fully handled.
+bool XWaylandWM::dnd_handle_event(XEvent *ev)
+{
+    if (!dnd_catcher_ || !dpy_) return false;
+
+    // Drag started / ended: yabridge (un)claims XdndSelection.
+    if (dnd_xfixes_evt_base_ >= 0 &&
+        ev->type == dnd_xfixes_evt_base_ + XFixesSelectionNotify)
+    {
+        XFixesSelectionNotifyEvent *se = (XFixesSelectionNotifyEvent*)ev;
+        if (se->selection == a_XdndSelection_) {
+            fprintf(stderr, "[DNDX] XdndSelection owner=0x%lx\n", se->owner); fflush(stderr);
+            if (se->owner != None) dnd_reset_payload();
+            dnd_catcher_show(se->owner != None);
+        }
+        return true;
+    }
+
+    if (ev->type == ClientMessage) {
+        char *nm = XGetAtomName(dpy_, ev->xclient.message_type);
+        fprintf(stderr, "[DNDX] CM %s -> win=0x%lx (catcher=0x%lx) src=0x%lx\n",
+                nm ? nm : "?", ev->xclient.window, dnd_catcher_,
+                (unsigned long)ev->xclient.data.l[0]);
+        fflush(stderr);
+        if (nm) XFree(nm);
+    }
+
+    if (ev->type == ClientMessage && ev->xclient.window == dnd_catcher_)
+    {
+        const Atom   mt  = ev->xclient.message_type;
+        const Window src = (Window)ev->xclient.data.l[0];
+
+        if (mt == a_XdndEnter_) {
+            dnd_source_ = src;
+            fprintf(stderr, "[DNDX] XdndEnter src=0x%lx\n", src); fflush(stderr);
+            return true;
+        }
+        if (mt == a_XdndPosition_) {
+            // Accepting is what lets yabridge's drag loop proceed and release its
+            // pointer grab, which is what unfreezes the plugin.
+            dnd_send_status(src, true);
+
+            // Fetch the payload NOW, not at XdndDrop. yabridge owns XdndSelection from
+            // the moment the drag starts, and XdndDrop only arrives after the user has
+            // released the button -- too late to begin a drag on the Wayland side,
+            // which needs a button still held. These XdndPosition messages stream
+            // while the button is down, so this is the window to grab it in.
+            if (!dnd_requested_) {
+                dnd_requested_ = true;
+                dnd_source_    = src;
+                XConvertSelection(dpy_, a_XdndSelection_, a_uri_list_,
+                                  a_dnd_prop_, dnd_catcher_, CurrentTime);
+                XFlush(dpy_);
+            }
+            return true;
+        }
+        if (mt == a_XdndLeave_) {
+            fprintf(stderr, "[DNDX] XdndLeave\n"); fflush(stderr);
+            dnd_catcher_show(false);
+            dnd_reset_payload();
+            return true;
+        }
+        if (mt == a_XdndDrop_) {
+            fprintf(stderr, "[DNDX] XdndDrop (payload %s)\n",
+                    dnd_have_uri_ ? "already held" : "MISSING"); fflush(stderr);
+            if (!dnd_have_uri_) {   // fallback: ask now, late but better than never
+                const Time when = (Time)ev->xclient.data.l[2];
+                XConvertSelection(dpy_, a_XdndSelection_, a_uri_list_,
+                                  a_dnd_prop_, dnd_catcher_,
+                                  when ? when : CurrentTime);
+                XFlush(dpy_);
+                dnd_source_ = src;
+                return true;
+            }
+            dnd_send_finished(src, true);
+            dnd_catcher_show(false);
+            dnd_reset_payload();
+            return true;
+        }
+        return true;
+    }
+
+    if (ev->type == SelectionNotify && ev->xselection.requestor == dnd_catcher_)
+    {
+        Atom  actual = None; int fmt = 0;
+        unsigned long n = 0, after = 0; unsigned char *data = nullptr;
+        if (ev->xselection.property != None &&
+            XGetWindowProperty(dpy_, dnd_catcher_, a_dnd_prop_, 0, 65536, True,
+                               AnyPropertyType, &actual, &fmt, &n, &after, &data)
+            == Success && data)
+        {
+            size_t len = (size_t)n;
+            if (len >= sizeof(dnd_uri_)) len = sizeof(dnd_uri_) - 1;
+            memcpy(dnd_uri_, data, len);
+            dnd_uri_[len] = 0;
+            dnd_have_uri_ = true;
+            dnd_pending_  = true;
+            fprintf(stderr, "[DNDX] payload in hand (button still down): %s\n",
+                    dnd_uri_);
+            fflush(stderr);
+            XFree(data);
+            // The caller's dnd_has_pending()/dnd_take_pending_path() pick this up from
+            // a real input event handler to start its native drag while the button is
+            // still held.
+        } else {
+            fprintf(stderr, "[DNDX] selection conversion failed\n"); fflush(stderr);
+        }
+        return true;
+    }
+
+    return false;
+}
+
+// "file:///a/b%20c.mid\r\n" -> "/a/b c.mid". Toolkit drag sources typically re-encode
+// this when building their own text/uri-list, so callers want a plain path back.
+static void dnd_uri_to_path(const char *uri, char *out, size_t outsz)
+{
+    out[0] = 0;
+    if (!uri) return;
+    if (!strncmp(uri, "file://", 7)) uri += 7;
+    // Hand-rolled hex decode: kept dependency-free rather than pulling in
+    // <ctype.h>/<stdlib.h> for a WM layer that otherwise only needs Xlib.
+    auto hexval = [](char ch) -> int {
+        if (ch >= '0' && ch <= '9') return ch - '0';
+        if (ch >= 'a' && ch <= 'f') return ch - 'a' + 10;
+        if (ch >= 'A' && ch <= 'F') return ch - 'A' + 10;
+        return -1;
+    };
+    size_t o = 0;
+    while (*uri && *uri != '\r' && *uri != '\n' && o + 1 < outsz) {
+        int h1, h2;
+        if (uri[0] == '%' && uri[1] && uri[2] &&
+            (h1 = hexval(uri[1])) >= 0 && (h2 = hexval(uri[2])) >= 0) {
+            out[o++] = (char)((h1 << 4) | h2);
+            uri += 3;
+        } else {
+            out[o++] = *uri++;
+        }
+    }
+    out[o] = 0;
+}
+
+bool XWaylandWM::dnd_take_pending_path(char *out, size_t outsz)
+{
+    if (out && outsz) out[0] = 0;
+    if (!dnd_pending_) return false;
+    dnd_pending_ = false;
+    if (out) dnd_uri_to_path(dnd_uri_, out, outsz);
+    return true;
+}
+
+void XWaylandWM::dnd_release_source_button(Display *dpy)
+{
+    // SWELL's (or any toolkit's) native drag source takes the pointer capture, so the
+    // button release went to it and never reached :10 -- yabridge's drag loop waits
+    // for exactly that release, so without this it keeps its pointer grab forever and
+    // the NEXT drag wedges the plugin.
+    if (!dpy) return;
+    // The bridge's own motion forwarding stops once the toolkit's native drag grabs
+    // input, so :10's virtual pointer has been sitting frozen since before the drag
+    // started. Nudge it with a motion at its own current position first -- observed
+    // behaviour is yabridge's drag loop not noticing a release for a long stretch
+    // (more XdndPosition traffic keeps arriving afterwards) before eventually giving
+    // up via XdndLeave rather than resolving via XdndDrop; a coincident motion+release
+    // pair is closer to what a real release looks like than a release alone.
+    Window root_ret, child_ret; int rx, ry, wx, wy; unsigned int mask;
+    if (XQueryPointer(dpy, DefaultRootWindow(dpy), &root_ret, &child_ret,
+                      &rx, &ry, &wx, &wy, &mask))
+        XTestFakeMotionEvent(dpy, DefaultScreen(dpy), rx, ry, CurrentTime);
+    XTestFakeButtonEvent(dpy, 1, False, CurrentTime);
+    XSync(dpy, False);   // make sure it has actually landed before we move on
+    fprintf(stderr, "[DNDX] released :10 button after native drag\n");
+    fflush(stderr);
 }

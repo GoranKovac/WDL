@@ -133,6 +133,38 @@ public:
     // Honours a client ConfigureRequest and updates our bookkeeping.
     void honour_configure_request(XConfigureRequestEvent *ev);
 
+    // ── Drag-and-drop OUT of a plugin (XDND catcher) ──────────────────────────
+    // Catches XDND drags a Wine/native plugin starts that have no compositor-
+    // visible target to drop onto (REAPER is a native Wayland client and has no
+    // X11 window of its own). Pure Xlib/XFixes protocol handling -- see
+    // xwayland-bridge-wm.cpp for the full rationale. Call dnd_init() once the
+    // WM's X connection is up; handle_event() then folds the protocol handling
+    // in automatically. The rest of this API is how a toolkit-specific caller
+    // pulls the result out to drive its own native drag.
+    void dnd_init();
+
+    // True once a drag payload has been fetched via XConvertSelection and the
+    // source's button is still held -- the only time a Wayland-side drag can be
+    // started with a valid input serial. Poll from a real input event handler
+    // (e.g. a GTK motion callback) and use dnd_take_pending_path() to consume it.
+    bool dnd_has_pending() const { return dnd_pending_; }
+
+    // Consumes the pending drag payload, decoding a "file://…" URI-list entry
+    // into a plain path ("/a/b c.mid"). Returns false (and leaves *out empty)
+    // if nothing was pending. Caller still owns starting its own native drag.
+    bool dnd_take_pending_path(char *out, size_t outsz);
+
+    // A caller's native drag call takes the input capture for its duration, so
+    // the XDND source's button-release never reaches the WM's X display -- call
+    // this with the source plugin's own display connection once that native
+    // drag call returns, or yabridge's XDND loop is left waiting forever for a
+    // release that already happened elsewhere.
+    void dnd_release_source_button(Display *dpy);
+
+    // Window id of the invisible XDND proxy. Callers should ignore Map/Unmap
+    // for this window rather than mistake it for real plugin content.
+    Window dnd_catcher_window() const { return dnd_catcher_; }
+
     // ── Utility ───────────────────────────────────────────────────────────────
     WMAtoms& atoms() { return atoms_; }
     const WMWindowState* window_state(Window w) const;
@@ -163,12 +195,34 @@ private:
     bool on_button_press(XButtonEvent *ev);
     bool on_property_notify(XPropertyEvent *ev);
 
+    // DND catcher internals (see xwayland-bridge-wm.cpp for the protocol walk).
+    bool dnd_handle_event(XEvent *ev);
+    void dnd_catcher_show(bool on);
+    void dnd_send_status(Window src, bool accept);
+    void dnd_send_finished(Window src, bool accepted);
+    void dnd_reset_payload();
+
     Display    *dpy_;
     WMAtoms     atoms_;
     std::map<Window, WMWindowState> states_;
     std::set<Window> containers_;
     GrabState   grab_;
     Window      support_win_ = None;
+
+    // ── DND catcher state ───────────────────────────────────────────────────
+    Window   dnd_catcher_        = 0;
+    int      dnd_xfixes_evt_base_ = -1;
+    Window   dnd_source_         = 0;    // yabridge's drag source window
+    bool     dnd_requested_      = false; // selection conversion already asked for
+    // Payload, fetched while the button is still down. Plain buffer rather than
+    // std::string: some callers' headers define min/max as macros, so pulling in
+    // <string> alongside them is risky -- keep this layer header-light.
+    char     dnd_uri_[8192]      = {};
+    bool     dnd_have_uri_       = false;
+    bool     dnd_pending_        = false;
+    Atom     a_XdndSelection_ = None, a_XdndAware_ = None, a_XdndEnter_ = None, a_XdndPosition_ = None;
+    Atom     a_XdndStatus_ = None, a_XdndDrop_ = None, a_XdndFinished_ = None, a_XdndLeave_ = None;
+    Atom     a_XdndActionCopy_ = None, a_uri_list_ = None, a_dnd_prop_ = None;
 };
 
 // ─── Free helpers used by swell-generic-gdk.cpp ──────────────────────────────
