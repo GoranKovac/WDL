@@ -241,6 +241,31 @@ static bool on_button_release(GtkWidget *, GdkEventButton *e, gpointer data)
 
 static bool on_motion(GtkWidget *, GdkEventMotion *e, gpointer data)
 {
+    // A plugin drag-out is in flight and the WM's XDND catcher has its file. Start the
+    // native drag here, inside a real GTK input handler, while the button is still
+    // held -- this is the only context where gtk_drag_begin gets the input serial
+    // Wayland requires. SWELL_InitiateDragDropOfFileList drives the Wayland drag
+    // source itself (dropSourceWndProc's SWELL_TARGET_WAYLAND branch) and blocks until
+    // the drag ends; it pumps the message loop while it spins, so X events keep
+    // flowing and yabridge keeps getting its XdndStatus replies.
+    if (g_wm && g_wm->dnd_has_pending()) {
+        static char path[8192];
+        g_wm->dnd_take_pending_path(path, sizeof(path));
+        if (path[0]) {
+            fprintf(stderr, "[DNDX] starting native drag: %s\n", path); fflush(stderr);
+            const char *lst[1] = { path };
+            SWELL_InitiateDragDropOfFileList(NULL, NULL, lst, 1, NULL);
+            fprintf(stderr, "[DNDX] native drag finished\n"); fflush(stderr);
+
+            // SWELL's drag source took the capture, so the button release went to it
+            // and never reached this widget -- which means on_button_release never ran
+            // and :10 never saw a ButtonRelease. Release it via the plugin's own :10
+            // connection or yabridge's XDND loop is left waiting for one forever.
+            Capture *cc = (Capture*)data;
+            if (cc && cc->dpy) g_wm->dnd_release_source_button(cc->dpy);
+        }
+    }
+
     Capture *c = (Capture*)data;
     if (!c || !c->dpy) return false;
     forward_motion(c, (int)e->x, (int)e->y);
@@ -486,30 +511,46 @@ static void create_popup_canvas(Capture *c)
     c->canvas_draw  = da;
 }
 
+// The plugin's :10 origin -> desktop translation, used both to place popups and to map
+// input back the other way (screen - gtk_x).
+//
+// Always recomputed, never cached: the plugin's origin on :10 is its slot origin, and
+// the widget's origin on the desktop moves whenever the FX window moves, is docked or
+// undocked, or the PLUGIN RESIZES ITSELF -- which Virtual Mix Rack does every time it
+// grows to fit another module. xw_size used to store a different quantity here (the
+// widget's position inside its GTK container), which happened to agree back when every
+// plugin sat at :10 origin (0,0); with slots it is off by the slot origin, and a
+// resize mid-drag left the drag preview badly offset.
+static void refresh_gtk_offset(Capture *c)
+{
+    if (!c || !c->dpy || !c->widget) return;
+
+    // Anchor to the CONTAINER, not to gui_win/plugin_win. The container is ours, sits
+    // at the plugin's slot origin, and lives for the whole session. The plugin's own
+    // windows do not: Virtual Mix Rack destroys and recreates its GUI windows when the
+    // rack grows to fit another module (visible as a burst of RegisterTouchWindow in
+    // the Wine log), after which gui_win/plugin_win are stale or moved and this
+    // translation returns a bogus origin -- which is what threw popups off by a whole
+    // window after an expansion. The container's top-left is also exactly what the
+    // widget displays, so it is the correct reference regardless.
+    Window child; int px = 0, py = 0;
+    XTranslateCoordinates(c->dpy, c->parent_win,
+                          DefaultRootWindow(c->dpy), 0, 0, &px, &py, &child);
+
+    GdkWindow *ww = gtk_widget_get_window(c->widget);
+    if (!ww) return;
+
+    int wox = 0, woy = 0;
+    gdk_window_get_origin(ww, &wox, &woy);
+    c->gtk_x = wox - px;
+    c->gtk_y = woy - py;
+}
+
 static void canvas_add_popup(Capture *c, Window x11_win, XWindowAttributes *attr)
 {
     if (!c) return;
 
-    Window child; int px, py;
-    XTranslateCoordinates(c->dpy, c->gui_win ? c->gui_win : c->plugin_win,
-                          DefaultRootWindow(c->dpy), 0, 0, &px, &py, &child);
-
-    // Refresh the screen offset from the plugin widget's LIVE origin instead of
-    // trusting c->gtk_x/gtk_y cached by xw_size. Those go stale when a popup opens
-    // before xw_size has run with correct geometry — a startup race, and always
-    // after a Super+Q reopen (fresh capture) — which is what puts popups at the
-    // wrong place. gdk_window_get_origin is always current; gtk_x = origin - px is
-    // the plugin's :10 origin -> desktop translation used by both the popup placement
-    // below and the inverse mapping for input.
-    if (c->widget) {
-        GdkWindow *ww = gtk_widget_get_window(c->widget);
-        if (ww) {
-            int wox = 0, woy = 0;
-            gdk_window_get_origin(ww, &wox, &woy);
-            c->gtk_x = wox - px;
-            c->gtk_y = woy - py;
-        }
-    }
+    refresh_gtk_offset(c);
 
     if (!c->popup_canvas) create_popup_canvas(c);
 
@@ -801,8 +842,43 @@ static bool on_popup_configured(Window w, int cx, int cy, int cw, int ch)
             // ConfigureNotify. Harmless before slots, when containers sat at (0,0)
             // and the two coordinate spaces happened to coincide. Menus never hit
             // this because they do not move; the drag preview moves constantly.
-            p.x = cx + c->gtk_x;
-            p.y = cy + c->gtk_y;
+            // A moving popup can outlive a plugin resize (Virtual Mix Rack expands as
+            // modules are added), so refresh before translating rather than trusting
+            // whatever the offset was when the popup first appeared.
+            refresh_gtk_offset(c);
+            // Some plugins mix coordinate frames. Virtual Mix Rack sends the drag
+            // preview's x in ROOT space (it follows the cursor, which we warp into the
+            // plugin's slot) but its y in its own CLIENT space, taken from the rack
+            // layout: cfg=2207,75 against a container at 2048,2048. On a normal host
+            // the window sits near screen origin so the two frames coincide and nobody
+            // notices; in a slot at 2048,2048 the y lands a whole slot origin above the
+            // widget and the preview vanishes off-screen.
+            //
+            // A window living in this slot cannot legitimately be positioned above or
+            // left of the container, so treat such a coordinate as client-relative and
+            // rebase it. Root coordinates are left untouched.
+            {
+                Window ch3; int ox = 0, oy = 0;
+                XTranslateCoordinates(c->dpy, c->parent_win, DefaultRootWindow(c->dpy),
+                                      0, 0, &ox, &oy, &ch3);
+                int fx = cx, fy = cy;
+                if (fx < ox) fx += ox;
+                if (fy < oy) fy += oy;
+                p.x = fx + c->gtk_x;
+                p.y = fy + c->gtk_y;
+            }
+            {   // DIAG: every term in the translation, in one line.
+                Window ch2; int cx0 = 0, cy0 = 0;
+                XTranslateCoordinates(c->dpy, c->parent_win, DefaultRootWindow(c->dpy),
+                                      0, 0, &cx0, &cy0, &ch2);
+                int wox = 0, woy = 0;
+                GdkWindow *ww2 = c->widget ? gtk_widget_get_window(c->widget) : NULL;
+                if (ww2) gdk_window_get_origin(ww2, &wox, &woy);
+                fprintf(stderr,
+                    "[OFF] cfg=%d,%d container=%d,%d widget=%d,%d gtk=%d,%d -> popup=%d,%d\n",
+                    cx, cy, cx0, cy0, wox, woy, c->gtk_x, c->gtk_y, p.x, p.y);
+                fflush(stderr);
+            }
             p.w = cw; p.h = ch;
             if (p.pixmap != None) XFreePixmap(c->dpy, p.pixmap);
             p.pixmap = XCompositeNameWindowPixmap(c->dpy, w);
@@ -818,10 +894,28 @@ static bool on_popup_configured(Window w, int cx, int cy, int cw, int ch)
 }
 
 // Bridge per-event handling, registered as g_wm->on_unhandled_event. The WM has
-// already processed the event (MapRequest/ConfigureRequest/etc); here we deal
-// only with our own concerns: popup/modal lifecycle.
+// already processed the event (MapRequest/ConfigureRequest/etc, plus the XDND
+// catcher protocol -- see xwayland-bridge-wm.cpp); here we deal only with our
+// own concerns: popup/modal lifecycle, damage-driven capture, and starting the
+// native SWELL drag once the WM has a drag-out payload (see on_motion above).
 static void bridge_handle_event(XEvent *ev)
 {
+    // The WM's handle_event() already consumed the XDND catcher's own protocol
+    // traffic (XFixes/ClientMessage/SelectionNotify) for anything addressed to the
+    // catcher window. That consumption doesn't stop on_unhandled_event from firing
+    // regardless -- it fires for every event -- so we still have to actively skip
+    // the catcher's own events here ourselves, or two things end up answering the
+    // same XDND message: the WM's catcher (accept / finished-success) and the
+    // legacy refuse-everything ClientMessage handler further down in this function
+    // (refuse / finished-not-accepted). yabridge got both replies to the same
+    // XdndPosition/XdndDrop, which is what left it unable to start a second drag.
+    Window dnd_catcher = g_wm ? g_wm->dnd_catcher_window() : 0;
+    if (dnd_catcher &&
+        ((ev->type == MapNotify   && ev->xmap.window   == dnd_catcher) ||
+         (ev->type == UnmapNotify && ev->xunmap.window == dnd_catcher) ||
+         (ev->type == ClientMessage && ev->xclient.window == dnd_catcher)))
+        return;   // our own proxy window: the WM layer already answered this
+
     // Damage may target a plugin GUI or a modal dialog — resolve by the damaged
     // drawable (XDamageNotifyEvent.drawable overlaps xany.window). Modals aren't
     // in g_captures, so we test the event type first, then look up the drawable.
@@ -1061,6 +1155,13 @@ bool xw_bridge_swell_on_gdk_delete_release()
         if (!c) continue;
         if (!c->popups.empty()) {
             any = true;
+            // Tell the plugin to close its menu FIRST, while we still have the popup
+            // list -- dismiss_popups_by_click() returns immediately if popups is empty,
+            // so doing this after the clear below (as the `if (any)` block used to) was
+            // a no-op. Wine was left holding the menu's pointer grab as its window was
+            // destroyed, which wedges the plugin and hangs REAPER. Modals are fine
+            // because they take no pointer grab.
+            dismiss_popups_by_click(c);
             for (auto &p : c->popups)
                 if (p.pixmap != None && c->dpy) XFreePixmap(c->dpy, p.pixmap);
             c->popups.clear();
@@ -1071,15 +1172,32 @@ bool xw_bridge_swell_on_gdk_delete_release()
                 c->canvas_draw  = nullptr;
             }
         }
-        if (!c->modals.empty()) {
-            // any = true;   // a modal also needs the Escapefor (auto &md : c->modals) {
+        if (!c->modals.empty() && c->dpy) {
+            // Modals must be dismissed too. Previously this branch only *checked* for
+            // an active modal, so Super+Q left the dialog open and, because the check
+            // also gated `any`, the close did nothing at all -- leaving a plugin with
+            // an open dialog that hangs the moment REAPER regains focus.
+            //
+            // A dialog cannot be dismissed the way a popup is: a synthetic click would
+            // press whatever button has focus, and Escape needs :10 keyboard focus we
+            // cannot guarantee. WM_DELETE_WINDOW is the protocol-correct "please
+            // close" and Wine dialogs honour it regardless of focus.
+            const Atom a_prot = XInternAtom(c->dpy, "WM_PROTOCOLS", False);
+            const Atom a_del  = XInternAtom(c->dpy, "WM_DELETE_WINDOW", False);
             for (auto &md : c->modals) {
-                if (md.gtk_win &&
-                    gtk_window_is_active(GTK_WINDOW(md.gtk_win))) {
-                    any = true;
-                    break;
-                }
+                if (!md.x11_win) continue;
+                any = true;
+                XClientMessageEvent m; memset(&m, 0, sizeof(m));
+                m.type         = ClientMessage;
+                m.display      = c->dpy;
+                m.window       = md.x11_win;
+                m.message_type = a_prot;
+                m.format       = 32;
+                m.data.l[0]    = (long)a_del;
+                m.data.l[1]    = CurrentTime;
+                XSendEvent(c->dpy, md.x11_win, False, NoEventMask, (XEvent*)&m);
             }
+            XFlush(c->dpy);
         }
     }
     // Only touch :10 / send Escape when there was actually a popup or modal to
@@ -1092,10 +1210,7 @@ bool xw_bridge_swell_on_gdk_delete_release()
         // grab and never receives the key, so Escape left the grab in place and locked
         // input up. Modals are separate GTK windows with their own key handling and
         // are unaffected by this.
-        for (auto &kv : g_captures) {
-            Capture *cc = kv.second;
-            if (cc && !cc->popups.empty()) dismiss_popups_by_click(cc);
-        }
+        // (popup dismissal now happens above, before the list is cleared)
     }
     return any;
 }
@@ -1119,6 +1234,7 @@ void init_private_xwayland()
     }
 
     g_wm->on_unhandled_event = bridge_handle_event;
+    g_wm->dnd_init();
 }
 
 static bool try_create_plugin(HWND hwnd)
@@ -1214,9 +1330,11 @@ void xw_size(HWND hwnd)
     }
     int w = r.right - r.left, h = r.bottom - r.top;
 
-    // Feed the same GTK offset to the popup canvas so popups position correctly
-    // in both floating and FX-list embedded modes.
-    if (bs->cap) { bs->cap->gtk_x = pos_x; bs->cap->gtk_y = pos_y; }
+    // Refresh the popup offset so popups position correctly in both floating and
+    // FX-list embedded modes. Must use the same computation as everywhere else --
+    // assigning pos_x/pos_y here (the widget's position inside its container) stored a
+    // different quantity and offset every popup after a resize.
+    // if (bs->cap) refresh_gtk_offset(bs->cap);
 
     // Re-capture the pixmap at the new size — xw_size runs exactly when the window
     // is being resized, so the backing pixmap must be refreshed here. Guard on
@@ -1226,6 +1344,8 @@ void xw_size(HWND hwnd)
         XResizeWindow(bs->cap->dpy, bs->cap->parent_win, w, h);
         XFlush(bs->cap->dpy);
     }
+
+    if (bs->cap) refresh_gtk_offset(bs->cap);
     if (GTK_IS_FIXED(container)) {
         if (!bs->placed) {
             gtk_fixed_put(GTK_FIXED(container), hwnd->m_oswidget, pos_x, pos_y);
