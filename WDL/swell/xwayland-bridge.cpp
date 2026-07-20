@@ -563,6 +563,30 @@ static void canvas_add_popup(Capture *c, Window x11_win, XWindowAttributes *attr
 {
     if (!c) return;
 
+    // Update-or-insert: if this window already has an entry, reuse it and free the
+    // stale pixmap (Wine reuses window IDs; a duplicate would leave a freed pixmap
+    // being composited). One entry per window.
+    Capture::PopupWin *pp = nullptr;
+    for (auto &e : c->popups) if (e.x11_win == x11_win) { pp = &e; break; }
+
+    // A repeated MapNotify for a window we already track, at identical geometry, is a
+    // no-op re-notification (Wine re-maps, or a plugin re-confirming an in-progress
+    // drag every frame while it's held over other reflowing content -- Virtual Mix
+    // Rack does this while a new module is being dragged in). Treat it as one: doing
+    // the full redirect/pixmap-rename/visual-fetch/offset-refresh dance on every one
+    // of those, potentially many per second, was the difference between inserting a
+    // module while others reflow (a burst of these) stalling and a plain move (which
+    // only ever hits the already-cheap on_popup_configured) not stalling.
+    if (pp && pp->pixmap != None &&
+        pp->x == attr->x + c->gtk_x && pp->y == attr->y + c->gtk_y &&
+        pp->w == attr->width && pp->h == attr->height)
+    {
+        pp->visible = true;
+        if (c->popup_canvas && !gtk_widget_get_visible(c->popup_canvas))
+            gtk_widget_show_all(c->popup_canvas);
+        return;
+    }
+
     fprintf(stderr, "[DNDCOORD] canvas_add_popup win=0x%lx attr=(%d,%d,%d,%d) canvas_was_visible=%d\n",
             (unsigned long)x11_win, attr->x, attr->y, attr->width, attr->height,
             c->popup_canvas ? gtk_widget_get_visible(c->popup_canvas) : -1);
@@ -578,11 +602,6 @@ static void canvas_add_popup(Capture *c, Window x11_win, XWindowAttributes *attr
     XFlush(c->dpy);   // non-blocking; don't stall the main loop on every popup
     Pixmap pixmap = XCompositeNameWindowPixmap(c->dpy, x11_win);
 
-    // Update-or-insert: if this window already has an entry, reuse it and free the
-    // stale pixmap (Wine reuses window IDs; a duplicate would leave a freed pixmap
-    // being composited). One entry per window.
-    Capture::PopupWin *pp = nullptr;
-    for (auto &e : c->popups) if (e.x11_win == x11_win) { pp = &e; break; }
     if (pp) {
         if (pp->pixmap != None && pp->pixmap != pixmap) XFreePixmap(c->dpy, pp->pixmap);
     } else {
