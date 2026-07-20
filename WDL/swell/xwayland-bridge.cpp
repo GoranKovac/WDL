@@ -253,15 +253,15 @@ static bool on_motion(GtkWidget *, GdkEventMotion *e, gpointer data)
         g_wm->dnd_take_pending_path(path, sizeof(path));
         if (path[0]) {
             fprintf(stderr, "[DNDX] starting native drag: %s\n", path); fflush(stderr);
+            Capture *cc = (Capture*)data;
             const char *lst[1] = { path };
-            SWELL_InitiateDragDropOfFileList(NULL, NULL, lst, 1, NULL);
+            SWELL_InitiateDragDropOfFileList(cc ? cc->hwnd : NULL, NULL, lst, 1, NULL);
             fprintf(stderr, "[DNDX] native drag finished\n"); fflush(stderr);
 
             // SWELL's drag source took the capture, so the button release went to it
             // and never reached this widget -- which means on_button_release never ran
             // and :10 never saw a ButtonRelease. Release it via the plugin's own :10
             // connection or yabridge's XDND loop is left waiting for one forever.
-            Capture *cc = (Capture*)data;
             if (cc && cc->dpy) g_wm->dnd_release_source_button(cc->dpy);
         }
     }
