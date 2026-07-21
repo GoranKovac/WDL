@@ -14,6 +14,8 @@ Display *g_wm_dpy       = nullptr;
 // Layout slots on the virtual framebuffer (defined near xw_bridge_create).
 static int  xw_alloc_slot(int *sx, int *sy);
 static void xw_free_slot(int slot);
+static bool point_in_slot(int slot, int x, int y);
+static void slot_rect(int slot, int *sx, int *sy, int *sw, int *sh);
 
 // ─── State ───────────────────────────────────────────────────────────────────
 // One plugin = one capture. We composite-capture the plugin's X11 window into a
@@ -54,16 +56,20 @@ struct Capture {
     int        gtk_x           = 0;     // plugin widget screen offset (X)
     int        gtk_y           = 0;     // plugin widget screen offset (Y)
     Window     root_popup      = 0;     // first popup in the chain
+    int        slot            = -1;    // layout slot on :10 (mirrors bridgeState::slot),
+                                          // used to attribute a popup to its owning
+                                          // instance when multiple share one Wine PID
     struct PopupWin { Window x11_win; Pixmap pixmap; int x,y,w,h; bool visible; Damage damage; Visual *visual; };
     std::vector<PopupWin> popups;
 
     // ── Modals (real dialog windows the plugin opens) ──
-    struct ModalWin { Window x11_win; Pixmap pixmap; GtkWidget *gtk_win; GtkWidget *draw; Damage damage; };
+    struct ModalWin { Window x11_win; Pixmap pixmap; GtkWidget *gtk_win; GtkWidget *draw; Damage damage; int w; int h; Visual *visual; };
     std::vector<ModalWin> modals;
 };
 
 // Route :10 events (on g_wm_dpy) to the owning capture.
 static std::map<Window, Capture*> g_captures;
+
 
 // Damage event base on g_wm_dpy (queried once). Same for every damage object we
 // create, so we test event type against this rather than a per-capture copy —
@@ -214,6 +220,7 @@ static bool any_modal_open()
 
 static bool on_button_press(GtkWidget *widget, GdkEventButton *e, gpointer data)
 {
+    DEBUG_PRINT("[DNDX] widget button PRESS btn=%d\n", e->button);
     Capture *c = (Capture*)data;
     if (!c || !c->dpy) return false;
     if (any_modal_open()){
@@ -229,6 +236,7 @@ static bool on_button_press(GtkWidget *widget, GdkEventButton *e, gpointer data)
 
 static bool on_button_release(GtkWidget *, GdkEventButton *e, gpointer data)
 {
+    DEBUG_PRINT("[DNDX] widget button RELEASE btn=%d\n", e->button);
     Capture *c = (Capture*)data;
     if (!c || !c->dpy) return false;
     forward_motion(c, (int)e->x, (int)e->y);
@@ -250,9 +258,11 @@ static bool on_motion(GtkWidget *, GdkEventMotion *e, gpointer data)
         static char path[8192];
         g_wm->dnd_take_pending_path(path, sizeof(path));
         if (path[0]) {
+            DEBUG_PRINT("[DNDX] starting native drag: %s\n", path);
             Capture *cc = (Capture*)data;
             const char *lst[1] = { path };
             SWELL_InitiateDragDropOfFileList(cc ? cc->hwnd : NULL, NULL, lst, 1, NULL);
+            DEBUG_PRINT("[DNDX] native drag finished\n");
 
             // SWELL's drag source took the capture, so the button release went to it
             // and never reached this widget -- which means on_button_release never ran
@@ -392,9 +402,7 @@ static bool canvas_draw_cb(GtkWidget *, cairo_t *cr, gpointer data)
 
         // Cairo would clip this popup out correctly regardless, but only after paying
         // for the XLib surface creation below -- skip that cost entirely for popups
-        // nowhere near what actually changed. With invalidation now scoped to just the
-        // affected rect(s), this is the common case whenever more than one popup is
-        // open (e.g. Virtual Mix Rack's several module windows).
+        // nowhere near what actually changed.
         if (draw_x + p.w <= clip_x1 || draw_x >= clip_x2 ||
             draw_y + p.h <= clip_y1 || draw_y >= clip_y2)
             continue;
@@ -478,7 +486,6 @@ static bool canvas_motion(GtkWidget *, GdkEventMotion *e, gpointer data)
     XTestFakeMotionEvent(c->dpy, DefaultScreen(c->dpy), x11_x, x11_y, CurrentTime);
     XFlush(c->dpy);
 
-    // if (c->canvas_draw) gtk_widget_queue_draw(c->canvas_draw);
     return true;
 }
 
@@ -583,7 +590,12 @@ static void canvas_add_popup(Capture *c, Window x11_win, XWindowAttributes *attr
         return;
     }
 
-    refresh_gtk_offset(c);
+    DEBUG_PRINT("[DNDCOORD] canvas_add_popup win=0x%lx attr=(%d,%d,%d,%d) canvas_was_visible=%d\n",
+                (unsigned long)x11_win, attr->x, attr->y, attr->width, attr->height,
+                c->popup_canvas ? gtk_widget_get_visible(c->popup_canvas) : -1);
+
+    int slot_px = 0, slot_py = 0;
+    refresh_gtk_offset(c, &slot_px, &slot_py);
 
     if (!c->popup_canvas) create_popup_canvas(c);
 
@@ -627,6 +639,9 @@ static void canvas_add_popup(Capture *c, Window x11_win, XWindowAttributes *attr
     // assumes this form.
     pp->x = attr->x + c->gtk_x;
     pp->y = attr->y + c->gtk_y;
+    DEBUG_PRINT("[POPOFF] win=0x%lx attr=(%d,%d) slot_origin=(%d,%d) gtk=(%d,%d) -> pp=(%d,%d)\n",
+                (unsigned long)x11_win, attr->x, attr->y, slot_px, slot_py,
+                c->gtk_x, c->gtk_y, pp->x, pp->y);
     pp->w = attr->width;
     pp->h = attr->height;
     pp->visible = true;
@@ -641,6 +656,8 @@ static void canvas_add_popup(Capture *c, Window x11_win, XWindowAttributes *attr
 static void canvas_remove_popup(Capture *c, Window x11_win)
 {
     if (!c) return;
+    DEBUG_PRINT("[DNDCOORD] canvas_remove_popup win=0x%lx remaining_before=%zu\n",
+                (unsigned long)x11_win, c->popups.size());
     for (auto it = c->popups.begin(); it != c->popups.end(); ) {
         if (it->x11_win == x11_win) {
             if (it->damage && g_wm_dpy) { XDamageDestroy(g_wm_dpy, it->damage); it->damage = 0; }
@@ -669,16 +686,16 @@ static bool modal_draw_cb(GtkWidget *, cairo_t *cr, gpointer data)
     if (!m || !m->cap || !m->cap->dpy) return false;
     Display *dpy = m->cap->dpy;
     Pixmap pm = 0;
+    Visual *visual = nullptr;
+    int gw = 0, gh = 0;
     for (auto &md : m->cap->modals)
-        if (md.x11_win == m->x11_win) { pm = md.pixmap; break; }
+        if (md.x11_win == m->x11_win) { pm = md.pixmap; visual = md.visual; gw = md.w; gh = md.h; break; }
     if (!pm) return false;
 
-    Window rr; int gx, gy; unsigned int gw, gh, gb, gd;
-    if (!XGetGeometry(dpy, pm, &rr, &gx, &gy, &gw, &gh, &gb, &gd)) return FALSE;
-
-    XWindowAttributes wa;
-    Visual *visual = DefaultVisual(dpy, DefaultScreen(dpy));
-    if (XGetWindowAttributes(dpy, m->x11_win, &wa)) visual = wa.visual;
+    // w/h/visual are cached on the ModalWin (set once in create_modal) -- this used to
+    // redo an XGetGeometry + XGetWindowAttributes round-trip on every single redraw,
+    // the same bug already found and fixed for popups (see canvas_draw_cb).
+    if (!visual) visual = DefaultVisual(dpy, DefaultScreen(dpy));
 
     cairo_surface_t *surf = cairo_xlib_surface_create(dpy, pm, visual, gw, gh);
     if (surf) {
@@ -799,6 +816,17 @@ static void create_modal(Capture *state, Window win, XWindowAttributes *attr)
 
     Capture::ModalWin md;
     md.x11_win = win; md.pixmap = pm; md.gtk_win = gtk_win; md.draw = draw; md.damage = dmg;
+    md.w = attr->width; md.h = attr->height;
+    // attr (and attr->visual) was fetched via g_wm_dpy in on_popup_mapped -- a
+    // different Xlib connection than dpy, which is what modal_draw_cb's
+    // cairo_xlib_surface_create() actually uses. A Visual* from one connection isn't
+    // valid on another (same mismatch found and fixed for popups earlier -- see
+    // canvas_add_popup). Fetch it fresh via dpy specifically, once, here.
+    {
+        XWindowAttributes wa_local;
+        md.visual = XGetWindowAttributes(dpy, win, &wa_local)
+                  ? wa_local.visual : DefaultVisual(dpy, DefaultScreen(dpy));
+    }
     state->modals.push_back(md);
 }
 
@@ -861,11 +889,20 @@ static void handle_new_window(Window win, Capture *state, XWindowAttributes *att
     // (:10 is a headless Xvfb server, and the drag feedback the user actually sees is
     // REAPER's own native drag), so ignore it rather than composite it.
     if (is_xdnd_icon_window(state->dpy, win)) {
+        DEBUG_PRINT("[DNDCOORD] ignoring XDND icon window 0x%lx (not compositing as popup)\n", (unsigned long)win);
         return;
     }
 
     bool is_popup = classify_popup(state->dpy, win, attr);
     if (is_popup) {
+        if (attr->width <= 1 || attr->height <= 1) {
+            DEBUG_PRINT("skipping 1x1 window: 0x%lx (%dx%d)\n", (unsigned long)win, attr->width, attr->height);
+            return;
+        }
+        if (attr->width == 12 || attr->height == 12) {
+            DEBUG_PRINT("skipping unnamed shadow juce window: 0x%lx (%dx%d)\n", (unsigned long)win, attr->width, attr->height);
+            return;
+        }
         canvas_add_popup(state, win, attr);
     } else {
         create_modal(state, win, attr);
@@ -878,6 +915,40 @@ static void on_popup_mapped(Window w)
     if (!XGetWindowAttributes(g_wm_dpy, w, &attr) || attr.map_state != IsViewable)
         return;
 
+    DEBUG_PRINT("[SLOTATTR] win=0x%lx attr=(%d,%d)\n", (unsigned long)w, attr.x, attr.y);
+    for (auto &kv : g_captures) {
+        Capture *cand = kv.second;
+        if (!cand) continue;
+        int sx, sy, sw, sh;
+        slot_rect(cand->slot, &sx, &sy, &sw, &sh);
+        DEBUG_PRINT("[SLOTATTR]   candidate slot=%d rect=(%d,%d,%d,%d) contains=%d\n",
+                    cand->slot, sx, sy, sw, sh, point_in_slot(cand->slot, attr.x, attr.y));
+    }
+
+    // Prefer geometric attribution: which instance's slot does this popup's position
+    // actually fall inside? PID matching alone can't tell apart multiple instances of
+    // the same plugin sharing one Wine host process (a real yabridge/Wine behaviour,
+    // used to save memory/startup time) -- every popup from every such instance
+    // shares the same PID, so PID-only attribution always picked whichever instance
+    // happened to be first in g_captures, regardless of which one the popup actually
+    // came from. Override-redirect popups (what these are, by ICCCM convention) are
+    // reparented directly under root rather than under the plugin's own container,
+    // so there's no X11 hierarchy to walk back through either -- but the slot system
+    // already guarantees each instance a unique, non-overlapping rectangle on :10.
+    for (auto &kv : g_captures) {
+        Capture *cand = kv.second;
+        if (cand && point_in_slot(cand->slot, attr.x, attr.y) &&
+            is_window_from_owned_plugin(cand->dpy, w, cand->gui_win)) {
+            DEBUG_PRINT("[SLOTATTR]   -> matched by slot, cand->slot=%d\n", cand->slot);
+            handle_new_window(w, cand, &attr);
+            return;
+        }
+    }
+    // Fallback: no candidate's slot contains this position -- e.g. slot allocation
+    // exhausted (more than 32 instances open) and several instances share the
+    // (XW_SLOT_MARGIN, XW_SLOT_MARGIN) fallback position from xw_alloc_slot. Fall
+    // back to PID-only matching rather than dropping the popup entirely.
+    DEBUG_PRINT("[SLOTATTR]   -> no slot matched, falling back to PID-only\n");
     for (auto &kv : g_captures) {
         Capture *cand = kv.second;
         if (cand && is_window_from_owned_plugin(cand->dpy, w, cand->gui_win)) {
@@ -1023,12 +1094,12 @@ static void bridge_handle_event(XEvent *ev)
         // Helper lambda to safely update the shared memory image for a given capture context
         auto update_capture_buffer = [](Capture *c) -> bool {
             if (!c || !c->dpy || !c->plugin_win) return false;
-            
+
             XWindowAttributes wa;
             if (!XGetWindowAttributes(c->dpy, c->plugin_win, &wa)) return false;
             if (wa.width <= 0 || wa.height <= 0) return false;
             if (!ensure_shm(c, wa.width, wa.height)) return false;
-            
+
             return XShmGetImage(c->dpy, c->plugin_win, c->shm_img, 0, 0, AllPlanes);
         };
 
@@ -1113,10 +1184,15 @@ static void bridge_handle_event(XEvent *ev)
     {
         Display *dpy   = ev->xclient.display;
         const Atom mt  = ev->xclient.message_type;
+#ifdef _DEBUG
         {   // DIAG: does the plugin's drag handshake reach us at all?
             char *n = XGetAtomName(dpy, mt);
+            DEBUG_PRINT("[DNDX] ClientMessage %s win=0x%lx src=0x%lx\n",
+                        n ? n : "?", ev->xclient.window,
+                        (unsigned long)ev->xclient.data.l[0]);
             if (n) XFree(n);
         }
+#endif
         const Window self = ev->xclient.window;
         const Window src  = (Window)ev->xclient.data.l[0];
 
@@ -1323,6 +1399,7 @@ bool xw_bridge_swell_on_gdk_delete_release()
 // anywhere via xwayland-bridge.h.
 void xw_bridge_debug_dump_overlays()
 {
+    DEBUG_PRINT("[DNDCOORD] --- overlay dump: %zu captures ---\n", g_captures.size());
     for (auto &kv : g_captures)
     {
         Capture *c = kv.second;
@@ -1334,6 +1411,9 @@ void xw_bridge_debug_dump_overlays()
             GdkWindow *gw = gtk_widget_get_window(c->popup_canvas);
             if (gw) gdk_window_get_origin(gw, &cx, &cy);
         }
+        DEBUG_PRINT("[DNDCOORD]   capture hwnd=%p popup_canvas=%p visible=%d origin=(%d,%d) size=(%d,%d) popups=%zu modals=%zu\n",
+                    (void*)c->hwnd, (void*)c->popup_canvas, canvas_vis, cx, cy,
+                    c->canvas_w, c->canvas_h, c->popups.size(), c->modals.size());
     }
 }
 
@@ -1380,6 +1460,7 @@ static bool try_create_plugin(HWND hwnd)
 
              Capture *c = setup_capture(bs->disp, bs->parent, plugin_win, hwnd);
              c->widget = hwnd->m_oswidget;
+             c->slot = bs->slot;
 
              // Wine plugins nest a child GUI window; native plugins draw directly.
              Window gr, gp, *gk = nullptr; unsigned int gn = 0;
@@ -1560,6 +1641,30 @@ static int xw_alloc_slot(int *sx, int *sy)
 static void xw_free_slot(int slot)
 {
     if (slot >= 0 && slot < 32) g_slot_used &= ~(1u << slot);
+}
+
+// Does a raw :10 position fall inside the rectangle a given slot owns? Used to tell
+// which instance a newly-mapped popup actually belongs to, since PID alone can't
+// distinguish multiple instances of the same plugin sharing one Wine host process
+// (see is_window_from_owned_plugin's caller in on_popup_mapped) and override-redirect
+// popups aren't reparented under the plugin's own container, so there's no X11
+// hierarchy to walk back either. The slot system already guarantees every instance a
+// unique, non-overlapping rectangle, so this is a reliable discriminator using
+// information we already have.
+static void slot_rect(int slot, int *sx, int *sy, int *sw, int *sh)
+{
+    *sx = (slot >= 0) ? (XW_SLOT_MARGIN + (slot % XW_SLOT_COLS) * XW_SLOT_W) : -1;
+    *sy = (slot >= 0) ? (XW_SLOT_MARGIN + (slot / XW_SLOT_COLS) * XW_SLOT_H) : -1;
+    *sw = XW_SLOT_W;
+    *sh = XW_SLOT_H;
+}
+
+static bool point_in_slot(int slot, int x, int y)
+{
+    if (slot < 0) return false;
+    int sx, sy, sw, sh;
+    slot_rect(slot, &sx, &sy, &sw, &sh);
+    return x >= sx && x < sx + sw && y >= sy && y < sy + sh;
 }
 
 HWND xw_bridge_create(HWND viewpar, void **wref, const RECT *r, const char *bridge_class_name)
