@@ -1416,6 +1416,19 @@ static bool try_create_plugin(HWND hwnd)
 
              connect_widget(c);
              bs->cap = c;
+
+             // See ensure_shm/on_draw/update_capture_buffer above: our very first
+             // paint just blits whatever is already in the SHM buffer, which only
+             // gets populated reactively from a real DamageNotify. Xvfb is headless,
+             // so the automatic "you're now visible, please paint yourself" Expose a
+             // real display generates may never reach Wine, leaving some widgets
+             // never actually painted (hence never damaged, hence never captured)
+             // until an incidental resize or hover nudges that specific area into
+             // repainting itself. Force it explicitly instead of relying on that.
+             XClearArea(bs->disp, plugin_win, 0, 0, 0, 0, True);
+             if (c->gui_win != plugin_win)
+                 XClearArea(bs->disp, c->gui_win, 0, 0, 0, 0, True);
+             XFlush(bs->disp);
          }
          else if (list) XFree(list);
      }
