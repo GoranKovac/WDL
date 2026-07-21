@@ -214,7 +214,6 @@ static bool any_modal_open()
 
 static bool on_button_press(GtkWidget *widget, GdkEventButton *e, gpointer data)
 {
-    fprintf(stderr, "[DNDX] widget button PRESS btn=%d\n", e->button); fflush(stderr);
     Capture *c = (Capture*)data;
     if (!c || !c->dpy) return false;
     if (any_modal_open()){
@@ -230,7 +229,6 @@ static bool on_button_press(GtkWidget *widget, GdkEventButton *e, gpointer data)
 
 static bool on_button_release(GtkWidget *, GdkEventButton *e, gpointer data)
 {
-    fprintf(stderr, "[DNDX] widget button RELEASE btn=%d\n", e->button); fflush(stderr);
     Capture *c = (Capture*)data;
     if (!c || !c->dpy) return false;
     forward_motion(c, (int)e->x, (int)e->y);
@@ -252,11 +250,9 @@ static bool on_motion(GtkWidget *, GdkEventMotion *e, gpointer data)
         static char path[8192];
         g_wm->dnd_take_pending_path(path, sizeof(path));
         if (path[0]) {
-            fprintf(stderr, "[DNDX] starting native drag: %s\n", path); fflush(stderr);
             Capture *cc = (Capture*)data;
             const char *lst[1] = { path };
             SWELL_InitiateDragDropOfFileList(cc ? cc->hwnd : NULL, NULL, lst, 1, NULL);
-            fprintf(stderr, "[DNDX] native drag finished\n"); fflush(stderr);
 
             // SWELL's drag source took the capture, so the button release went to it
             // and never reached this widget -- which means on_button_release never ran
@@ -587,11 +583,6 @@ static void canvas_add_popup(Capture *c, Window x11_win, XWindowAttributes *attr
         return;
     }
 
-    fprintf(stderr, "[DNDCOORD] canvas_add_popup win=0x%lx attr=(%d,%d,%d,%d) canvas_was_visible=%d\n",
-            (unsigned long)x11_win, attr->x, attr->y, attr->width, attr->height,
-            c->popup_canvas ? gtk_widget_get_visible(c->popup_canvas) : -1);
-    fflush(stderr);
-
     refresh_gtk_offset(c);
 
     if (!c->popup_canvas) create_popup_canvas(c);
@@ -650,9 +641,6 @@ static void canvas_add_popup(Capture *c, Window x11_win, XWindowAttributes *attr
 static void canvas_remove_popup(Capture *c, Window x11_win)
 {
     if (!c) return;
-    fprintf(stderr, "[DNDCOORD] canvas_remove_popup win=0x%lx remaining_before=%zu\n",
-            (unsigned long)x11_win, c->popups.size());
-    fflush(stderr);
     for (auto it = c->popups.begin(); it != c->popups.end(); ) {
         if (it->x11_win == x11_win) {
             if (it->damage && g_wm_dpy) { XDamageDestroy(g_wm_dpy, it->damage); it->damage = 0; }
@@ -873,8 +861,6 @@ static void handle_new_window(Window win, Capture *state, XWindowAttributes *att
     // (:10 is a headless Xvfb server, and the drag feedback the user actually sees is
     // REAPER's own native drag), so ignore it rather than composite it.
     if (is_xdnd_icon_window(state->dpy, win)) {
-        fprintf(stderr, "[DNDCOORD] ignoring XDND icon window 0x%lx (not compositing as popup)\n", (unsigned long)win);
-        fflush(stderr);
         return;
     }
 
@@ -1129,10 +1115,6 @@ static void bridge_handle_event(XEvent *ev)
         const Atom mt  = ev->xclient.message_type;
         {   // DIAG: does the plugin's drag handshake reach us at all?
             char *n = XGetAtomName(dpy, mt);
-            fprintf(stderr, "[DNDX] ClientMessage %s win=0x%lx src=0x%lx\n",
-                    n ? n : "?", ev->xclient.window,
-                    (unsigned long)ev->xclient.data.l[0]);
-            fflush(stderr);
             if (n) XFree(n);
         }
         const Window self = ev->xclient.window;
@@ -1341,7 +1323,6 @@ bool xw_bridge_swell_on_gdk_delete_release()
 // anywhere via xwayland-bridge.h.
 void xw_bridge_debug_dump_overlays()
 {
-    fprintf(stderr, "[DNDCOORD] --- overlay dump: %zu captures ---\n", g_captures.size());
     for (auto &kv : g_captures)
     {
         Capture *c = kv.second;
@@ -1353,11 +1334,7 @@ void xw_bridge_debug_dump_overlays()
             GdkWindow *gw = gtk_widget_get_window(c->popup_canvas);
             if (gw) gdk_window_get_origin(gw, &cx, &cy);
         }
-        fprintf(stderr, "[DNDCOORD]   capture hwnd=%p popup_canvas=%p visible=%d origin=(%d,%d) size=(%d,%d) popups=%zu modals=%zu\n",
-                (void*)c->hwnd, (void*)c->popup_canvas, canvas_vis, cx, cy,
-                c->canvas_w, c->canvas_h, c->popups.size(), c->modals.size());
     }
-    fflush(stderr);
 }
 
 void init_private_xwayland()
