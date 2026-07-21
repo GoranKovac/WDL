@@ -741,8 +741,6 @@ void XWaylandWM::dnd_init()
 
     int err_base = 0;
     if (!XFixesQueryExtension(dpy_, &dnd_xfixes_evt_base_, &err_base)) {
-        fprintf(stderr, "[DNDX] XFixes unavailable -- plugin drag-out cannot be caught\n");
-        fflush(stderr);
         return;
     }
 
@@ -777,7 +775,6 @@ void XWaylandWM::dnd_init()
     XFixesSelectSelectionInput(dpy_, root, a_XdndSelection_,
                                XFixesSetSelectionOwnerNotifyMask);
     XFlush(dpy_);
-    fprintf(stderr, "[DNDX] catcher ready win=0x%lx\n", dnd_catcher_); fflush(stderr);
 }
 
 // Mapped only while a drag is in flight: an InputOnly window under the pointer would
@@ -844,7 +841,6 @@ bool XWaylandWM::dnd_handle_event(XEvent *ev)
     {
         XFixesSelectionNotifyEvent *se = (XFixesSelectionNotifyEvent*)ev;
         if (se->selection == a_XdndSelection_) {
-            fprintf(stderr, "[DNDX] XdndSelection owner=0x%lx\n", se->owner); fflush(stderr);
             if (se->owner != None) dnd_reset_payload();
             dnd_catcher_show(se->owner != None);
         }
@@ -853,10 +849,6 @@ bool XWaylandWM::dnd_handle_event(XEvent *ev)
 
     if (ev->type == ClientMessage) {
         char *nm = XGetAtomName(dpy_, ev->xclient.message_type);
-        fprintf(stderr, "[DNDX] CM %s -> win=0x%lx (catcher=0x%lx) src=0x%lx\n",
-                nm ? nm : "?", ev->xclient.window, dnd_catcher_,
-                (unsigned long)ev->xclient.data.l[0]);
-        fflush(stderr);
         if (nm) XFree(nm);
     }
 
@@ -867,7 +859,6 @@ bool XWaylandWM::dnd_handle_event(XEvent *ev)
 
         if (mt == a_XdndEnter_) {
             dnd_source_ = src;
-            fprintf(stderr, "[DNDX] XdndEnter src=0x%lx\n", src); fflush(stderr);
             return true;
         }
         if (mt == a_XdndPosition_) {
@@ -890,14 +881,11 @@ bool XWaylandWM::dnd_handle_event(XEvent *ev)
             return true;
         }
         if (mt == a_XdndLeave_) {
-            fprintf(stderr, "[DNDX] XdndLeave\n"); fflush(stderr);
             dnd_catcher_show(false);
             dnd_reset_payload();
             return true;
         }
         if (mt == a_XdndDrop_) {
-            fprintf(stderr, "[DNDX] XdndDrop (payload %s)\n",
-                    dnd_have_uri_ ? "already held" : "MISSING"); fflush(stderr);
             if (!dnd_have_uri_) {   // fallback: ask now, late but better than never
                 const Time when = (Time)ev->xclient.data.l[2];
                 XConvertSelection(dpy_, a_XdndSelection_, a_uri_list_,
@@ -930,15 +918,10 @@ bool XWaylandWM::dnd_handle_event(XEvent *ev)
             dnd_uri_[len] = 0;
             dnd_have_uri_ = true;
             dnd_pending_  = true;
-            fprintf(stderr, "[DNDX] payload in hand (button still down): %s\n",
-                    dnd_uri_);
-            fflush(stderr);
             XFree(data);
             // The caller's dnd_has_pending()/dnd_take_pending_path() pick this up from
             // a real input event handler to start its native drag while the button is
             // still held.
-        } else {
-            fprintf(stderr, "[DNDX] selection conversion failed\n"); fflush(stderr);
         }
         return true;
     }
@@ -1004,6 +987,4 @@ void XWaylandWM::dnd_release_source_button(Display *dpy)
         XTestFakeMotionEvent(dpy, DefaultScreen(dpy), rx, ry, CurrentTime);
     XTestFakeButtonEvent(dpy, 1, False, CurrentTime);
     XSync(dpy, False);   // make sure it has actually landed before we move on
-    fprintf(stderr, "[DNDX] released :10 button after native drag\n");
-    fflush(stderr);
 }
