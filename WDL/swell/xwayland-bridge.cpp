@@ -39,6 +39,7 @@ struct Capture {
     int             shm_h        = 0;
     GtkWidget *widget      = nullptr;   // SWELL draw area we blit into
     HWND       hwnd        = nullptr;   // back-reference
+    bool       has_painted = false;     // true once a real DamageNotify has ever been received for this capture -- see on_draw and the damage handler
     //
     Damage     damage      = 0;         // damage on parent_win (via g_wm_dpy)
     int        damage_base = 0;
@@ -183,6 +184,21 @@ static bool on_draw(GtkWidget *, cairo_t *cr, gpointer data)
         }
         cairo_surface_destroy(surf);
     }
+
+    // Some plugins still haven't painted anything into the SHM buffer by the time
+    // we draw it (Xvfb is headless -- see the nudge in try_create_plugin), showing
+    // up as a blank frame instead of the real UI. has_painted is a genuine signal
+    // (a real DamageNotify has been received at least once), not a guess from pixel
+    // color, so this nudges only while Wine truly hasn't painted anything yet, and
+    // never again once it has -- a plugin whose legitimate first frame happens to be
+    // dark-themed is never mistaken for still-loading.
+    if (!c->has_painted && c->dpy && c->plugin_win) {
+        XClearArea(c->dpy, c->plugin_win, 0, 0, 0, 0, True);
+        if (c->gui_win != c->plugin_win)
+            XClearArea(c->dpy, c->gui_win, 0, 0, 0, 0, True);
+        XFlush(c->dpy);
+    }
+
     return TRUE;
 }
 
@@ -1110,6 +1126,7 @@ static void bridge_handle_event(XEvent *ev)
         if (c && c->widget && GTK_IS_WIDGET(c->widget)) {
             // Update the buffer from the X Server immediately before scheduling the GTK draw
             if (update_capture_buffer(c)) {
+                c->has_painted = true;
                 gtk_widget_queue_draw_area(c->widget, de->area.x, de->area.y,
                                            de->area.width, de->area.height);
             }
