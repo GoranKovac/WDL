@@ -175,12 +175,14 @@ static bool ensure_shm(Capture *c, int w, int h)
 // nudge, which only ever generated a synthetic Expose -- an event we don't even
 // listen for ourselves (we only react to Damage), so its effect depended entirely
 // on whether Wine's toolkit happened to repaint in response to Expose at all.
-static void toggle_resize_nudge(Display *dpy, Window w)
+// Takes the current size as a parameter rather than querying it -- both call sites
+// already have it cached, so a fresh XGetWindowAttributes here would just be a
+// redundant round-trip.
+static void toggle_resize_nudge(Display *dpy, Window w, int width, int height)
 {
-    XWindowAttributes wa;
-    if (!XGetWindowAttributes(dpy, w, &wa)) return;
-    XResizeWindow(dpy, w, wa.width + 1, wa.height + 1);
-    XResizeWindow(dpy, w, wa.width, wa.height);
+    if (width <= 0 || height <= 0) return;
+    XResizeWindow(dpy, w, width + 1, height + 1);
+    XResizeWindow(dpy, w, width, height);
 }
 
 static bool on_draw(GtkWidget *, cairo_t *cr, gpointer data)
@@ -208,9 +210,9 @@ static bool on_draw(GtkWidget *, cairo_t *cr, gpointer data)
     // DamageNotify has been received at least once), so this nudges only while
     // Wine truly hasn't painted anything yet, and never again once it has.
     if (!c->has_painted && c->dpy && c->plugin_win) {
-        toggle_resize_nudge(c->dpy, c->plugin_win);
+        toggle_resize_nudge(c->dpy, c->plugin_win, c->shm_w, c->shm_h);
         if (c->gui_win != c->plugin_win)
-            toggle_resize_nudge(c->dpy, c->gui_win);
+            toggle_resize_nudge(c->dpy, c->gui_win, c->shm_w, c->shm_h);
         XFlush(c->dpy);
     }
 
@@ -1518,9 +1520,12 @@ static bool try_create_plugin(HWND hwnd)
              // See toggle_resize_nudge above for the actual mechanism and why: this
              // is a documented Xvfb bug (server-side, confirmed independently
              // elsewhere), not something specific to Wine or our own code.
-             toggle_resize_nudge(bs->disp, plugin_win);
-             if (c->gui_win != plugin_win)
-                 toggle_resize_nudge(bs->disp, c->gui_win);
+             toggle_resize_nudge(bs->disp, plugin_win, attr.width, attr.height);
+             if (c->gui_win != plugin_win) {
+                 XWindowAttributes gattr;
+                 if (XGetWindowAttributes(bs->disp, c->gui_win, &gattr))
+                     toggle_resize_nudge(bs->disp, c->gui_win, gattr.width, gattr.height);
+             }
              XFlush(bs->disp);
          }
          else if (list) XFree(list);
