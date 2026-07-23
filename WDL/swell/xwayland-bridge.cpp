@@ -166,6 +166,23 @@ static bool ensure_shm(Capture *c, int w, int h)
 }
 
 
+// Xvfb has a documented bug (confirmed independently elsewhere, e.g. Mozilla bug
+// 1387585): its backing store doesn't properly initialize newly-exposed regions
+// when a window grows -- that area can simply stay black at the server level,
+// regardless of what the client draws afterward. A genuine resize forces Xvfb to
+// re-establish the backing store correctly; toggling by 1px and back does this
+// without visibly changing anything. This replaces the previous XClearArea-based
+// nudge, which only ever generated a synthetic Expose -- an event we don't even
+// listen for ourselves (we only react to Damage), so its effect depended entirely
+// on whether Wine's toolkit happened to repaint in response to Expose at all.
+static void toggle_resize_nudge(Display *dpy, Window w)
+{
+    XWindowAttributes wa;
+    if (!XGetWindowAttributes(dpy, w, &wa)) return;
+    XResizeWindow(dpy, w, wa.width + 1, wa.height + 1);
+    XResizeWindow(dpy, w, wa.width, wa.height);
+}
+
 static bool on_draw(GtkWidget *, cairo_t *cr, gpointer data)
 {
     Capture *c = (Capture*)data;
@@ -186,16 +203,14 @@ static bool on_draw(GtkWidget *, cairo_t *cr, gpointer data)
     }
 
     // Some plugins still haven't painted anything into the SHM buffer by the time
-    // we draw it (Xvfb is headless -- see the nudge in try_create_plugin), showing
-    // up as a blank frame instead of the real UI. has_painted is a genuine signal
-    // (a real DamageNotify has been received at least once), not a guess from pixel
-    // color, so this nudges only while Wine truly hasn't painted anything yet, and
-    // never again once it has -- a plugin whose legitimate first frame happens to be
-    // dark-themed is never mistaken for still-loading.
+    // we draw it (see toggle_resize_nudge above for why), showing up as a blank
+    // frame instead of the real UI. has_painted is a genuine signal (a real
+    // DamageNotify has been received at least once), so this nudges only while
+    // Wine truly hasn't painted anything yet, and never again once it has.
     if (!c->has_painted && c->dpy && c->plugin_win) {
-        XClearArea(c->dpy, c->plugin_win, 0, 0, 0, 0, True);
+        toggle_resize_nudge(c->dpy, c->plugin_win);
         if (c->gui_win != c->plugin_win)
-            XClearArea(c->dpy, c->gui_win, 0, 0, 0, 0, True);
+            toggle_resize_nudge(c->dpy, c->gui_win);
         XFlush(c->dpy);
     }
 
@@ -1500,17 +1515,12 @@ static bool try_create_plugin(HWND hwnd)
              connect_widget(c);
              bs->cap = c;
 
-             // See ensure_shm/on_draw/update_capture_buffer above: our very first
-             // paint just blits whatever is already in the SHM buffer, which only
-             // gets populated reactively from a real DamageNotify. Xvfb is headless,
-             // so the automatic "you're now visible, please paint yourself" Expose a
-             // real display generates may never reach Wine, leaving some widgets
-             // never actually painted (hence never damaged, hence never captured)
-             // until an incidental resize or hover nudges that specific area into
-             // repainting itself. Force it explicitly instead of relying on that.
-             XClearArea(bs->disp, plugin_win, 0, 0, 0, 0, True);
+             // See toggle_resize_nudge above for the actual mechanism and why: this
+             // is a documented Xvfb bug (server-side, confirmed independently
+             // elsewhere), not something specific to Wine or our own code.
+             toggle_resize_nudge(bs->disp, plugin_win);
              if (c->gui_win != plugin_win)
-                 XClearArea(bs->disp, c->gui_win, 0, 0, 0, 0, True);
+                 toggle_resize_nudge(bs->disp, c->gui_win);
              XFlush(bs->disp);
          }
          else if (list) XFree(list);
