@@ -505,6 +505,7 @@ static bool canvas_motion(GtkWidget *, GdkEventMotion *e, gpointer data)
     return true;
 }
 
+
 static void create_popup_canvas(Capture *c)
 {
     if (c->popup_canvas) return;
@@ -513,13 +514,19 @@ static void create_popup_canvas(Capture *c)
     gtk_window_set_decorated(GTK_WINDOW(win), FALSE);
     gtk_window_set_type_hint(GTK_WINDOW(win), GDK_WINDOW_TYPE_HINT_POPUP_MENU);
 
+    GdkScreen *screen = gdk_screen_get_default();
+    GdkVisual *visual = gdk_screen_get_rgba_visual(screen);
+    if (visual != nullptr) {
+        gtk_widget_set_visual(win, visual);
+    }
+    gtk_widget_set_app_paintable(win, TRUE);
+
     GtkWidget *top = c->widget ? gtk_widget_get_toplevel(c->widget) : nullptr;
     if (top && GTK_IS_WINDOW(top))
         gtk_window_set_transient_for(GTK_WINDOW(win), GTK_WINDOW(top));
 
     gtk_window_set_keep_above(GTK_WINDOW(win), TRUE);
 
-    GdkScreen *screen = gdk_screen_get_default();
     int sw = gdk_screen_get_width(screen);
     int sh = gdk_screen_get_height(screen);
     c->canvas_origin_x = 0;
@@ -540,6 +547,7 @@ static void create_popup_canvas(Capture *c)
     c->popup_canvas = win;
     c->canvas_draw  = da;
 }
+
 
 // The plugin's :10 origin -> desktop translation, used both to place popups and to map
 // input back the other way (screen - gtk_x).
