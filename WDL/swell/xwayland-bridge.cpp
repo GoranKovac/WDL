@@ -1080,6 +1080,158 @@ static bool on_popup_configured(Window w, int cx, int cy, int cw, int ch)
 // catcher protocol -- see xwayland-bridge-wm.cpp); here we deal only with our
 // own concerns: popup/modal lifecycle, damage-driven capture, and starting the
 // native SWELL drag once the WM has a drag-out payload (see on_motion above).
+// Damage may target a plugin GUI or a modal dialog — resolve by the damaged
+// drawable (XDamageNotifyEvent.drawable overlaps xany.window). Modals aren't
+// in g_captures, so we test the event type first, then look up the drawable.
+static void handle_damage_notify(XDamageNotifyEvent *de)
+{
+    DEBUG_PRINT("damage: %dx%d+%d+%d\n",
+        de->area.width, de->area.height, de->area.x, de->area.y);
+
+    // Subtract on g_wm_dpy — the connection that created the damage object and
+    // receives its events — so the region actually clears and re-arms.
+    XDamageSubtract(g_wm_dpy, de->damage, None, None);
+
+    // Helper lambda to safely update the shared memory image for a given capture context
+    auto update_capture_buffer = [](Capture *c) -> bool {
+        if (!c || !c->dpy || !c->plugin_win) return false;
+
+        XWindowAttributes wa;
+        if (!XGetWindowAttributes(c->dpy, c->plugin_win, &wa)) return false;
+        if (wa.width <= 0 || wa.height <= 0) return false;
+        if (!ensure_shm(c, wa.width, wa.height)) return false;
+
+        return XShmGetImage(c->dpy, c->plugin_win, c->shm_img, 0, 0, AllPlanes);
+    };
+
+    // Plugin GUI: de->area is in plugin_win coords, which map 1:1 to the
+    // widget (on_draw blits the pixmap at 0,0). cairo clips the paint to this
+    // rect, so only this region blits. Modals work the same way against md.draw.
+    Capture *c = find_capture(de->drawable);
+    if (c && c->widget && GTK_IS_WIDGET(c->widget)) {
+        // Update the buffer from the X Server immediately before scheduling the GTK draw
+        if (update_capture_buffer(c)) {
+            gtk_widget_queue_draw_area(c->widget, de->area.x, de->area.y,
+                                       de->area.width, de->area.height);
+        }
+        return;
+    }
+
+    for (auto &kv : g_captures) {
+        Capture *cc = kv.second;
+        if (!cc) continue;
+
+        // Popups: damage on a popup (menu highlight following the cursor, for
+        // instance) has to repaint the canvas it is composited into. Without
+        // this the canvas only updated as a side effect of pixmap churn in
+        // canvas_motion, which flickered.
+        //
+        // update_capture_buffer() was being called here too, but it operates on
+        // c->plugin_win -- the MAIN plugin GUI's own SHM buffer, which has nothing
+        // to do with a popup. Every popup damage event (e.g. a menu highlight
+        // following the cursor, which can fire continuously while hovering) was
+        // paying for a full refresh of the main plugin canvas as an unrelated side
+        // effect. The popup's own content comes straight from its composited
+        // pixmap via Cairo/XLib in canvas_draw_cb -- no separate buffer to update.
+        //
+        // Likewise this used to invalidate the whole canvas widget, which is sized
+        // to the full screen (create_popup_canvas). A tiny highlight change inside
+        // a small dropdown was forcing GTK to clear-and-recomposite a full
+        // monitor-sized transparent surface every time. Map the damaged sub-rect
+        // into canvas-local coordinates instead, matching the precision already
+        // used for the plugin GUI and modal paths just above.
+        for (auto &pp : cc->popups) {
+            if (pp.x11_win == de->drawable) {
+                if (cc->canvas_draw && GTK_IS_WIDGET(cc->canvas_draw)) {
+                    int inv_x = pp.x - cc->canvas_origin_x + de->area.x;
+                    int inv_y = pp.y - cc->canvas_origin_y + de->area.y;
+                    gtk_widget_queue_draw_area(cc->canvas_draw, inv_x, inv_y,
+                                               de->area.width, de->area.height);
+                }
+                return;
+            }
+        }
+
+        for (auto &md : cc->modals) {
+            if (md.x11_win == de->drawable) {
+                if (md.draw && GTK_IS_WIDGET(md.draw)) {
+                    if (update_capture_buffer(cc)) {
+                        gtk_widget_queue_draw_area(md.draw, de->area.x, de->area.y,
+                                                   de->area.width, de->area.height);
+                    }
+                }
+                return;
+            }
+        }
+    }
+}
+
+// ---- XDND coming FROM the plugin (dragging something out of it) ----
+// Wine runs a nested drag loop while dragging. Inside it, it sends XdndEnter /
+// XdndPosition to the window under the pointer -- our container -- and then WAITS
+// for an XdndStatus reply. Nothing here answered: this switch only handled
+// map/unmap/configure, and the find_capture() check below returns early for the
+// container anyway. So the loop blocked forever, the plugin could not service
+// yabridge, and REAPER's next host->plugin call parked its UI thread in recv() --
+// the same deadlock shape as the modal-dialog hang.
+//
+// Answering is what matters, not accepting. We currently REFUSE (accept bit 0):
+// the drag ends cleanly with a no-drop cursor instead of hanging. Accepting would
+// additionally require handling XdndDrop plus the XdndSelection transfer, and
+// leaving that half-done would hang again waiting for XdndFinished.
+static void handle_xdnd_from_plugin(XClientMessageEvent *xce)
+{
+    Display *dpy   = xce->display;
+    const Atom mt  = xce->message_type;
+#ifdef _DEBUG
+    {   // DIAG: does the plugin's drag handshake reach us at all?
+        char *n = XGetAtomName(dpy, mt);
+        DEBUG_PRINT("[DNDX] ClientMessage %s win=0x%lx src=0x%lx\n",
+                    n ? n : "?", xce->window,
+                    (unsigned long)xce->data.l[0]);
+        if (n) XFree(n);
+    }
+#endif
+    const Window self = xce->window;
+    const Window src  = (Window)xce->data.l[0];
+
+    if (src && mt == XInternAtom(dpy, "XdndPosition", False))
+    {
+        XClientMessageEvent st; memset(&st, 0, sizeof(st));
+        st.type         = ClientMessage;
+        st.display      = dpy;
+        st.window       = src;
+        st.message_type = XInternAtom(dpy, "XdndStatus", False);
+        st.format       = 32;
+        st.data.l[0]    = (long)self;
+        st.data.l[1]    = 0;      // bit 0 clear = will not accept a drop
+        st.data.l[2]    = 0;      // no "silent" rectangle: keep sending positions
+        st.data.l[3]    = 0;
+        st.data.l[4]    = None;   // no action
+        XSendEvent(dpy, src, False, NoEventMask, (XEvent*)&st);
+        XFlush(dpy);
+        return;
+    }
+    if (src && mt == XInternAtom(dpy, "XdndDrop", False))
+    {
+        // Should not arrive while we refuse, but answer anyway -- an unanswered
+        // XdndDrop leaves the source waiting on XdndFinished, which is a hang.
+        XClientMessageEvent fin; memset(&fin, 0, sizeof(fin));
+        fin.type         = ClientMessage;
+        fin.display      = dpy;
+        fin.window       = src;
+        fin.message_type = XInternAtom(dpy, "XdndFinished", False);
+        fin.format       = 32;
+        fin.data.l[0]    = (long)self;
+        fin.data.l[1]    = 0;     // not accepted
+        fin.data.l[2]    = None;
+        XSendEvent(dpy, src, False, NoEventMask, (XEvent*)&fin);
+        XFlush(dpy);
+        return;
+    }
+    // XdndEnter and XdndLeave require no reply.
+}
+
 static void bridge_handle_event(XEvent *ev)
 {
     // The WM's handle_event() already consumed the XDND catcher's own protocol
@@ -1098,159 +1250,14 @@ static void bridge_handle_event(XEvent *ev)
          (ev->type == ClientMessage && ev->xclient.window == dnd_catcher)))
         return;   // our own proxy window: the WM layer already answered this
 
-    // Damage may target a plugin GUI or a modal dialog — resolve by the damaged
-    // drawable (XDamageNotifyEvent.drawable overlaps xany.window). Modals aren't
-    // in g_captures, so we test the event type first, then look up the drawable.
-    
     if (g_damage_event_base >= 0 && ev->type == g_damage_event_base + XDamageNotify) {
-        XDamageNotifyEvent *de = (XDamageNotifyEvent *)ev;
-        DEBUG_PRINT("damage: %dx%d+%d+%d\n",
-            de->area.width, de->area.height, de->area.x, de->area.y);
-        
-        // Subtract on g_wm_dpy — the connection that created the damage object and
-        // receives its events — so the region actually clears and re-arms.
-        XDamageSubtract(g_wm_dpy, de->damage, None, None);
-
-        // Helper lambda to safely update the shared memory image for a given capture context
-        auto update_capture_buffer = [](Capture *c) -> bool {
-            if (!c || !c->dpy || !c->plugin_win) return false;
-
-            XWindowAttributes wa;
-            if (!XGetWindowAttributes(c->dpy, c->plugin_win, &wa)) return false;
-            if (wa.width <= 0 || wa.height <= 0) return false;
-            if (!ensure_shm(c, wa.width, wa.height)) return false;
-
-            return XShmGetImage(c->dpy, c->plugin_win, c->shm_img, 0, 0, AllPlanes);
-        };
-
-        // Plugin GUI: de->area is in plugin_win coords, which map 1:1 to the
-        // widget (on_draw blits the pixmap at 0,0). cairo clips the paint to this
-        // rect, so only this region blits. Modals work the same way against md.draw.
-        Capture *c = find_capture(de->drawable);
-        if (c && c->widget && GTK_IS_WIDGET(c->widget)) {
-            // Update the buffer from the X Server immediately before scheduling the GTK draw
-            if (update_capture_buffer(c)) {
-                gtk_widget_queue_draw_area(c->widget, de->area.x, de->area.y,
-                                           de->area.width, de->area.height);
-            }
-            return;
-        }
-
-        for (auto &kv : g_captures) {
-            Capture *cc = kv.second;
-            if (!cc) continue;
-
-            // Popups: damage on a popup (menu highlight following the cursor, for
-            // instance) has to repaint the canvas it is composited into. Without
-            // this the canvas only updated as a side effect of pixmap churn in
-            // canvas_motion, which flickered.
-            //
-            // update_capture_buffer() was being called here too, but it operates on
-            // c->plugin_win -- the MAIN plugin GUI's own SHM buffer, which has nothing
-            // to do with a popup. Every popup damage event (e.g. a menu highlight
-            // following the cursor, which can fire continuously while hovering) was
-            // paying for a full refresh of the main plugin canvas as an unrelated side
-            // effect. The popup's own content comes straight from its composited
-            // pixmap via Cairo/XLib in canvas_draw_cb -- no separate buffer to update.
-            //
-            // Likewise this used to invalidate the whole canvas widget, which is sized
-            // to the full screen (create_popup_canvas). A tiny highlight change inside
-            // a small dropdown was forcing GTK to clear-and-recomposite a full
-            // monitor-sized transparent surface every time. Map the damaged sub-rect
-            // into canvas-local coordinates instead, matching the precision already
-            // used for the plugin GUI and modal paths just above.
-            for (auto &pp : cc->popups) {
-                if (pp.x11_win == de->drawable) {
-                    if (cc->canvas_draw && GTK_IS_WIDGET(cc->canvas_draw)) {
-                        int inv_x = pp.x - cc->canvas_origin_x + de->area.x;
-                        int inv_y = pp.y - cc->canvas_origin_y + de->area.y;
-                        gtk_widget_queue_draw_area(cc->canvas_draw, inv_x, inv_y,
-                                                   de->area.width, de->area.height);
-                    }
-                    return;
-                }
-            }
-
-            for (auto &md : cc->modals) {
-                if (md.x11_win == de->drawable) {
-                    if (md.draw && GTK_IS_WIDGET(md.draw)) {
-                        if (update_capture_buffer(cc)) {
-                            gtk_widget_queue_draw_area(md.draw, de->area.x, de->area.y,
-                                                       de->area.width, de->area.height);
-                        }
-                    }
-                    return;
-                }
-            }
-        }
+        handle_damage_notify((XDamageNotifyEvent *)ev);
         return;
     }
 
-
-    // ---- XDND coming FROM the plugin (dragging something out of it) ----
-    // Wine runs a nested drag loop while dragging. Inside it, it sends XdndEnter /
-    // XdndPosition to the window under the pointer -- our container -- and then WAITS
-    // for an XdndStatus reply. Nothing here answered: this switch only handled
-    // map/unmap/configure, and the find_capture() check below returns early for the
-    // container anyway. So the loop blocked forever, the plugin could not service
-    // yabridge, and REAPER's next host->plugin call parked its UI thread in recv() --
-    // the same deadlock shape as the modal-dialog hang.
-    //
-    // Answering is what matters, not accepting. We currently REFUSE (accept bit 0):
-    // the drag ends cleanly with a no-drop cursor instead of hanging. Accepting would
-    // additionally require handling XdndDrop plus the XdndSelection transfer, and
-    // leaving that half-done would hang again waiting for XdndFinished.
     if (ev->type == ClientMessage)
     {
-        Display *dpy   = ev->xclient.display;
-        const Atom mt  = ev->xclient.message_type;
-#ifdef _DEBUG
-        {   // DIAG: does the plugin's drag handshake reach us at all?
-            char *n = XGetAtomName(dpy, mt);
-            DEBUG_PRINT("[DNDX] ClientMessage %s win=0x%lx src=0x%lx\n",
-                        n ? n : "?", ev->xclient.window,
-                        (unsigned long)ev->xclient.data.l[0]);
-            if (n) XFree(n);
-        }
-#endif
-        const Window self = ev->xclient.window;
-        const Window src  = (Window)ev->xclient.data.l[0];
-
-        if (src && mt == XInternAtom(dpy, "XdndPosition", False))
-        {
-            XClientMessageEvent st; memset(&st, 0, sizeof(st));
-            st.type         = ClientMessage;
-            st.display      = dpy;
-            st.window       = src;
-            st.message_type = XInternAtom(dpy, "XdndStatus", False);
-            st.format       = 32;
-            st.data.l[0]    = (long)self;
-            st.data.l[1]    = 0;      // bit 0 clear = will not accept a drop
-            st.data.l[2]    = 0;      // no "silent" rectangle: keep sending positions
-            st.data.l[3]    = 0;
-            st.data.l[4]    = None;   // no action
-            XSendEvent(dpy, src, False, NoEventMask, (XEvent*)&st);
-            XFlush(dpy);
-            return;
-        }
-        if (src && mt == XInternAtom(dpy, "XdndDrop", False))
-        {
-            // Should not arrive while we refuse, but answer anyway -- an unanswered
-            // XdndDrop leaves the source waiting on XdndFinished, which is a hang.
-            XClientMessageEvent fin; memset(&fin, 0, sizeof(fin));
-            fin.type         = ClientMessage;
-            fin.display      = dpy;
-            fin.window       = src;
-            fin.message_type = XInternAtom(dpy, "XdndFinished", False);
-            fin.format       = 32;
-            fin.data.l[0]    = (long)self;
-            fin.data.l[1]    = 0;     // not accepted
-            fin.data.l[2]    = None;
-            XSendEvent(dpy, src, False, NoEventMask, (XEvent*)&fin);
-            XFlush(dpy);
-            return;
-        }
-        // XdndEnter and XdndLeave require no reply.
+        handle_xdnd_from_plugin(&ev->xclient);
         return;
     }
 
