@@ -8,6 +8,8 @@
 #include <sys/ipc.h>
 #include <sys/shm.h>
 
+void xw_size(HWND hwnd); // forward decl -- defined below, called earlier by try_create_plugin
+
 XWaylandWM     *g_wm           = nullptr;
 Display *g_wm_dpy       = nullptr;
 
@@ -1486,6 +1488,8 @@ static bool try_create_plugin(HWND hwnd)
     if (!hwnd || !hwnd->m_private_data) return true;
     bridgeState *bs = (bridgeState*)hwnd->m_private_data;
 
+    if (!bs->placed) xw_size(hwnd);
+
      // First tick(s): the plugin creates its window as a child of our container.
      if (!bs->cap && bs->disp && bs->parent)
      {
@@ -1608,6 +1612,15 @@ void xw_size(HWND hwnd)
             gtk_widget_set_size_request(hwnd->m_oswidget, w, h);
             gtk_widget_show(hwnd->m_oswidget);
             bs->placed = true;
+
+            // Confirm the embedding actually reached a real toplevel -- gtk_fixed_put
+            // succeeding doesn't guarantee this if `container` itself wasn't yet
+            // anchored to a GtkWindow. If it's not, don't trust bs->placed: reset it
+            // so a later call (the timer retries this every tick too) can try again
+            // once the parent chain is actually ready, instead of permanently
+            // skipping the only code path that ever embeds this widget.
+            GtkWidget *tl = gtk_widget_get_toplevel(hwnd->m_oswidget);
+            if (!(tl && GTK_IS_WINDOW(tl))) bs->placed = false;
         } else {
             gtk_fixed_move(GTK_FIXED(container), hwnd->m_oswidget, pos_x, pos_y);
             gtk_widget_set_size_request(hwnd->m_oswidget, w, h);
@@ -1631,6 +1644,9 @@ void xw_size(HWND hwnd)
         gtk_container_add(GTK_CONTAINER(container), hwnd->m_oswidget);
         gtk_widget_show(hwnd->m_oswidget);
         bs->placed = true;
+
+        GtkWidget *tl = gtk_widget_get_toplevel(hwnd->m_oswidget);
+        if (!(tl && GTK_IS_WINDOW(tl))) bs->placed = false;
     }
 }
 
@@ -1749,6 +1765,20 @@ HWND xw_bridge_create(HWND viewpar, void **wref, const RECT *r, const char *brid
     hwnd->m_private_data = (INT_PTR)bs;
 
     *wref = (void*)container;
+
+    // Embed the widget into REAPER's real widget tree immediately, rather than
+    // waiting for a WM_SIZE message to trigger xw_size naturally -- confirmed via
+    // "assertion 'widget->priv->anchored' failed" that under KWin specifically,
+    // WM_SIZE doesn't reliably fire early enough, leaving draw_area created but
+    // never actually parented (never "anchored" to a toplevel) by the time Xvfb/Wine
+    // starts sending damage events for the plugin's own content. This has nothing to
+    // do with Wine or Xvfb timing at all -- it's a race between two independent
+    // subsystems (Xvfb/Wine painting vs. REAPER/SWELL embedding) with no
+    // synchronization between them. Calling this here makes embedding happen
+    // synchronously at creation time instead of depending on an external trigger
+    // whose timing varies by compositor.
+    xw_size(hwnd);
+
     SetTimer(hwnd, 1, 100, NULL);
     return hwnd;
 }
