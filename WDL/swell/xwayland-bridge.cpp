@@ -1555,12 +1555,6 @@ void xw_size(HWND hwnd)
     }
     int w = r.right - r.left, h = r.bottom - r.top;
 
-    // Refresh the popup offset so popups position correctly in both floating and
-    // FX-list embedded modes. Must use the same computation as everywhere else --
-    // assigning pos_x/pos_y here (the widget's position inside its container) stored a
-    // different quantity and offset every popup after a resize.
-    // if (bs->cap) refresh_gtk_offset(bs->cap);
-
     // Re-capture the pixmap at the new size — xw_size runs exactly when the window
     // is being resized, so the backing pixmap must be refreshed here. Guard on
     // bs->cap: WM_SIZE/SetWindowPos can fire before the plugin is captured (e.g.
@@ -1570,6 +1564,10 @@ void xw_size(HWND hwnd)
         XFlush(bs->cap->dpy);
     }
 
+    // Refresh the popup offset so popups position correctly in both floating and
+    // FX-list embedded modes. Must use the same computation as everywhere else --
+    // assigning pos_x/pos_y here (the widget's position inside its container) stored a
+    // different quantity and offset every popup after a resize.
     if (bs->cap) refresh_gtk_offset(bs->cap);
     if (GTK_IS_FIXED(container)) {
         if (!bs->placed) {
