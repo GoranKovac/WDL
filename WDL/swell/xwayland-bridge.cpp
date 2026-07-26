@@ -108,6 +108,9 @@ struct bridgeState {
     Capture *cap    = nullptr;
     bool     placed = false;     // has the SWELL widget been put in its container
     int      slot   = -1;        // layout slot on :10, released on teardown
+    RECT     last_size_pos = {0,0,0,0}; // last hwnd->m_position xw_size actually acted on, see xw_size
+    bool     has_last_size_pos = false;
+    GtkWidget *embed_container = nullptr; // resolved once via xw_ensure_embed_widget, see xw_bridge_create/xw_size
 };
 
 static void destroy_shm(Capture *c)
@@ -1466,67 +1469,6 @@ void init_private_xwayland()
     g_wm->dnd_init();
 }
 
-static bool try_create_plugin(HWND hwnd)
-{
-    if (!hwnd || !hwnd->m_private_data) return true;
-    bridgeState *bs = (bridgeState*)hwnd->m_private_data;
-
-    if (!bs->placed) xw_size(hwnd);
-
-     // First tick(s): the plugin creates its window as a child of our container.
-     if (!bs->cap && bs->disp && bs->parent)
-     {
-         Window root, par, *list = nullptr; unsigned int n = 0;
-         if (XQueryTree(bs->disp, bs->parent, &root, &par, &list, &n) && list && n)
-         {
-             Window plugin_win = list[0];
-             XFree(list);
-
-             XWindowAttributes attr;
-             if (XGetWindowAttributes(bs->disp, plugin_win, &attr))
-                 XResizeWindow(bs->disp, bs->parent, attr.width, attr.height);
-             XFlush(bs->disp);
-
-             Capture *c = setup_capture(bs->disp, bs->parent, plugin_win, hwnd);
-             c->widget = hwnd->m_oswidget;
-             c->slot = bs->slot;
-
-             // Wine plugins nest a child GUI window; native plugins draw directly.
-             Window gr, gp, *gk = nullptr; unsigned int gn = 0;
-             if (XQueryTree(bs->disp, plugin_win, &gr, &gp, &gk, &gn) && gn) {
-                 c->gui_win = gk[0];
-                 g_captures[c->gui_win] = c;
-                 XFree(gk);
-             } else {
-                 c->gui_win = plugin_win;
-             }
-
-             connect_widget(c);
-             bs->cap = c;
-         }
-         else if (list) XFree(list);
-     }
-
-    return true;
-}
-
-void xw_destroy(HWND hwnd)
-{
-    if (!hwnd || !hwnd->m_private_data) return;
-    bridgeState *bs = (bridgeState*)hwnd->m_private_data;
-    // m_oswidget is non-NULL here only if the widget is still alive (the weak
-    // pointer nulls it on destroy), so this is safe.
-    if (hwnd->m_oswidget && GTK_IS_WIDGET(hwnd->m_oswidget)) {
-        g_object_remove_weak_pointer(G_OBJECT(hwnd->m_oswidget), (gpointer*)&hwnd->m_oswidget);
-        GtkWidget *parent = gtk_widget_get_parent(hwnd->m_oswidget);
-        if (parent) gtk_container_remove(GTK_CONTAINER(parent), hwnd->m_oswidget);
-    }
-    if (bs->cap) cleanup_capture(bs->cap);
-    xw_free_slot(bs->slot);
-    hwnd->m_private_data = 0;
-    delete bs;
-}
-
 // Recursively ensures h has its own real, positioned GtkFixed widget, creating one
 // (and recursively ensuring its own parent has one first) if it doesn't already.
 // A true toplevel (h->m_oswidget already set by SWELL itself) is the recursion's
@@ -1591,12 +1533,82 @@ static GtkWidget* xw_ensure_embed_widget(HWND h)
     return fixed;
 }
 
+static bool try_create_plugin(HWND hwnd)
+{
+    if (!hwnd || !hwnd->m_private_data) return true;
+    bridgeState *bs = (bridgeState*)hwnd->m_private_data;
+
+    if (!bs->placed) {
+        bs->embed_container = xw_ensure_embed_widget(hwnd->m_parent);
+        xw_size(hwnd);
+    }
+
+     // First tick(s): the plugin creates its window as a child of our container.
+     if (!bs->cap && bs->disp && bs->parent)
+     {
+         Window root, par, *list = nullptr; unsigned int n = 0;
+         if (XQueryTree(bs->disp, bs->parent, &root, &par, &list, &n) && list && n)
+         {
+             Window plugin_win = list[0];
+             XFree(list);
+
+             XWindowAttributes attr;
+             if (XGetWindowAttributes(bs->disp, plugin_win, &attr))
+                 XResizeWindow(bs->disp, bs->parent, attr.width, attr.height);
+             XFlush(bs->disp);
+
+             Capture *c = setup_capture(bs->disp, bs->parent, plugin_win, hwnd);
+             c->widget = hwnd->m_oswidget;
+             c->slot = bs->slot;
+
+             // Wine plugins nest a child GUI window; native plugins draw directly.
+             Window gr, gp, *gk = nullptr; unsigned int gn = 0;
+             if (XQueryTree(bs->disp, plugin_win, &gr, &gp, &gk, &gn) && gn) {
+                 c->gui_win = gk[0];
+                 g_captures[c->gui_win] = c;
+                 XFree(gk);
+             } else {
+                 c->gui_win = plugin_win;
+             }
+
+             connect_widget(c);
+             bs->cap = c;
+         }
+         else if (list) XFree(list);
+     }
+
+    return true;
+}
+
+void xw_destroy(HWND hwnd)
+{
+    if (!hwnd || !hwnd->m_private_data) return;
+    bridgeState *bs = (bridgeState*)hwnd->m_private_data;
+    // m_oswidget is non-NULL here only if the widget is still alive (the weak
+    // pointer nulls it on destroy), so this is safe.
+    if (hwnd->m_oswidget && GTK_IS_WIDGET(hwnd->m_oswidget)) {
+        g_object_remove_weak_pointer(G_OBJECT(hwnd->m_oswidget), (gpointer*)&hwnd->m_oswidget);
+        GtkWidget *parent = gtk_widget_get_parent(hwnd->m_oswidget);
+        if (parent) gtk_container_remove(GTK_CONTAINER(parent), hwnd->m_oswidget);
+    }
+    if (bs->cap) cleanup_capture(bs->cap);
+    xw_free_slot(bs->slot);
+    hwnd->m_private_data = 0;
+    delete bs;
+}
+
 void xw_size(HWND hwnd)
 {
     if (!hwnd || !hwnd->m_private_data || !hwnd->m_oswidget) return;
     bridgeState *bs = (bridgeState*)hwnd->m_private_data;
 
-    GtkWidget *container = xw_ensure_embed_widget(hwnd->m_parent);
+    // Resolution/realization retry happens exclusively in try_create_plugin (the
+    // 100ms timer's retry phase) -- see xw_ensure_embed_widget there. This function
+    // is purely "update position on an already-resolved widget": it must never walk
+    // or re-verify the ancestor chain itself, since it also fires continuously
+    // during a live resize drag, far more often than the timer -- doing that work on
+    // every single tick is what caused resize-dragging to lag behind the mouse.
+    GtkWidget *container = bs->embed_container;
     if (!container || !GTK_IS_FIXED(container)) return;
 
     RECT r = hwnd->m_position;
@@ -1657,10 +1669,21 @@ void xw_size(HWND hwnd)
     // correct size_request on every widget in the chain recursively, so GTK's own
     // layout already knows the right size -- this just triggers it to actually
     // apply, rather than manually computing an absolute needed-size by hand.
-    {
+    //
+    // Only when the size has actually changed since last time: xw_size fires
+    // continuously during a live resize drag, and gtk_widget_queue_resize on the
+    // toplevel forces GTK to recompute the ENTIRE window's layout -- doing that
+    // unconditionally on every single tick, even when nothing changed, is what
+    // caused resize-dragging to lag noticeably behind the mouse.
+    bool size_changed = !bs->has_last_size_pos ||
+        r.left != bs->last_size_pos.left || r.top != bs->last_size_pos.top ||
+        r.right != bs->last_size_pos.right || r.bottom != bs->last_size_pos.bottom;
+    if (size_changed) {
         GtkWidget *tl = gtk_widget_get_toplevel(container);
         if (tl && GTK_IS_WINDOW(tl))
             gtk_widget_queue_resize(tl);
+        bs->last_size_pos = r;
+        bs->has_last_size_pos = true;
     }
 
     // Refresh the popup offset so popups position correctly in both floating and
