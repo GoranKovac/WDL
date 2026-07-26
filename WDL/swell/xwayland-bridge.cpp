@@ -8,59 +8,45 @@
 #include <sys/ipc.h>
 #include <sys/shm.h>
 
-void xw_size(HWND hwnd); // forward decl -- defined below, called earlier by try_create_plugin
+void xw_size(HWND hwnd);
 
 XWaylandWM     *g_wm           = nullptr;
 Display *g_wm_dpy       = nullptr;
 
-// Layout slots on the virtual framebuffer (defined near xw_bridge_create).
 static int  xw_alloc_slot(int *sx, int *sy);
 static void xw_free_slot(int slot);
 static bool point_in_slot(int slot, int x, int y);
 static void slot_rect(int slot, int *sx, int *sy, int *sw, int *sh);
 
-// ─── State ───────────────────────────────────────────────────────────────────
-// One plugin = one capture. We composite-capture the plugin's X11 window into a
-// pixmap and blit it into the SWELL GtkWidget (draw area). Input is forwarded
-// back to the plugin via XTest.
-
 struct Capture {
-    Display   *dpy         = nullptr;   // per-plugin connection to :10
-    Window     parent_win  = 0;         // container we created on :10
-    Window     plugin_win  = 0;         // the plugin's X11 window (child of parent)
-    Window     gui_win     = 0;         // Wine child GUI (or == plugin_win for native)
-    Pixmap     pixmap      = 0;         // (composite pixmap: popups only now)
-    // Shared-memory capture of this plugin's slot in the Xvfb framebuffer. Replaces
-    // XCompositeRedirectWindow/NameWindowPixmap: the redirect blocked pointer input,
-    // and on a virtual framebuffer it is unnecessary -- nothing is ever occluded or
-    // off-screen, so the window's pixels can be read straight out of the root.
+    Display   *dpy         = nullptr;
+    Window     parent_win  = 0;
+    Window     plugin_win  = 0;
+    Window     gui_win     = 0;
+    Pixmap     pixmap      = 0;
     XImage         *shm_img      = nullptr;
     XShmSegmentInfo shm_info     = {};
     bool            shm_attached = false;
     int             shm_w        = 0;
     int             shm_h        = 0;
-    GtkWidget *widget      = nullptr;   // SWELL draw area we blit into
-    HWND       hwnd        = nullptr;   // back-reference
+    GtkWidget *widget      = nullptr;
+    HWND       hwnd        = nullptr;
     //
-    Damage     damage      = 0;         // damage on parent_win (via g_wm_dpy)
+    Damage     damage      = 0;
     int        damage_base = 0;
 
-    // ── Popups (plugin dropdown menus / override-redirect windows) ──
-    // Drawn into a single transparent full-screen overlay canvas, exactly like
-    // the proven old implementation: each popup is composite-captured and blitted
-    // into the canvas at its screen position.
     GtkWidget *popup_canvas    = nullptr;
     GtkWidget *canvas_draw     = nullptr;
     int        canvas_origin_x = 0;
     int        canvas_origin_y = 0;
     int        canvas_w        = 0;
     int        canvas_h        = 0;
-    int        gtk_x           = 0;     // plugin widget screen offset (X)
-    int        gtk_y           = 0;     // plugin widget screen offset (Y)
-    Window     root_popup      = 0;     // first popup in the chain
-    int        slot            = -1;    // layout slot on :10 (mirrors bridgeState::slot),
-                                          // used to attribute a popup to its owning
-                                          // instance when multiple share one Wine PID
+    int        gtk_x           = 0;
+    int        gtk_y           = 0;
+    Window     root_popup      = 0;
+    int        slot            = -1;
+
+
     struct PopupWin { Window x11_win; Pixmap pixmap; int x,y,w,h; bool visible; Damage damage; Visual *visual; };
     std::vector<PopupWin> popups;
 
@@ -69,18 +55,8 @@ struct Capture {
     std::vector<ModalWin> modals;
 };
 
-// Route :10 events (on g_wm_dpy) to the owning capture.
 static std::map<Window, Capture*> g_captures;
-
-
-// Damage event base on g_wm_dpy (queried once). Same for every damage object we
-// create, so we test event type against this rather than a per-capture copy —
-// modal windows aren't in g_captures, so we can't resolve them before the type
-// check.
 static int g_damage_event_base = -1;
-
-// Damage error base (XDamageQueryExtension), non-static so the WM's X error
-// handler can ignore BadDamage teardown races. -1 until queried in init.
 int g_bridge_damage_error_base = -1;
 
 static void register_capture(Capture *c)
@@ -101,7 +77,6 @@ static Capture* find_capture(Window w)
     return it != g_captures.end() ? it->second : nullptr;
 }
 
-// Bridge instance stored on the SWELL HWND.
 struct bridgeState {
     Display *disp   = nullptr;   // this plugin's connection to :10
     Window   parent = 0;         // container window on :10
@@ -158,8 +133,6 @@ static bool ensure_shm(Capture *c, int w, int h)
     }
     if (!XShmAttach(c->dpy, &c->shm_info)) { destroy_shm(c); return false; }
     XSync(c->dpy, False);
-    // Mark for destruction now: it stays alive until everyone detaches, so this just
-    // guarantees it cannot leak if we crash.
     shmctl(c->shm_info.shmid, IPC_RMID, nullptr);
     c->shm_info.shmid = -1;
 
@@ -169,20 +142,9 @@ static bool ensure_shm(Capture *c, int w, int h)
     return true;
 }
 
-
-// Xvfb has a documented bug (confirmed independently elsewhere, e.g. Mozilla bug
-// 1387585): its backing store doesn't properly initialize newly-exposed regions
-// when a window grows -- that area can simply stay black at the server level,
-// regardless of what the client draws afterward. A genuine resize forces Xvfb to
-// re-establish the backing store correctly; toggling by 1px and back does this
-// without visibly changing anything. This replaces the previous XClearArea-based
-// nudge, which only ever generated a synthetic Expose -- an event we don't even
-// listen for ourselves (we only react to Damage), so its effect depended entirely
-// on whether Wine's toolkit happened to repaint in response to Expose at all.
 static bool on_draw(GtkWidget *, cairo_t *cr, gpointer data)
 {
     Capture *c = (Capture*)data;
-    // No XGetWindowAttributes, No ensure_shm, No XShmGetImage here!
     if (!c || !c->shm_img || !c->shm_img->data) return FALSE;
 
     cairo_surface_t *surf =
@@ -200,7 +162,6 @@ static bool on_draw(GtkWidget *, cairo_t *cr, gpointer data)
 
     return TRUE;
 }
-
 
 static void forward_motion(Capture *c, int wx, int wy)
 {
@@ -262,13 +223,6 @@ static bool on_button_release(GtkWidget *, GdkEventButton *e, gpointer data)
 
 static bool on_motion(GtkWidget *, GdkEventMotion *e, gpointer data)
 {
-    // A plugin drag-out is in flight and the WM's XDND catcher has its file. Start the
-    // native drag here, inside a real GTK input handler, while the button is still
-    // held -- this is the only context where gtk_drag_begin gets the input serial
-    // Wayland requires. SWELL_InitiateDragDropOfFileList drives the Wayland drag
-    // source itself (dropSourceWndProc's SWELL_TARGET_WAYLAND branch) and blocks until
-    // the drag ends; it pumps the message loop while it spins, so X events keep
-    // flowing and yabridge keeps getting its XdndStatus replies.
     if (g_wm && g_wm->dnd_has_pending()) {
         static char path[8192];
         g_wm->dnd_take_pending_path(path, sizeof(path));
@@ -279,10 +233,6 @@ static bool on_motion(GtkWidget *, GdkEventMotion *e, gpointer data)
             SWELL_InitiateDragDropOfFileList(cc ? cc->hwnd : NULL, NULL, lst, 1, NULL);
             DEBUG_PRINT("[DNDX] native drag finished\n");
 
-            // SWELL's drag source took the capture, so the button release went to it
-            // and never reached this widget -- which means on_button_release never ran
-            // and :10 never saw a ButtonRelease. Release it via the plugin's own :10
-            // connection or yabridge's XDND loop is left waiting for one forever.
             if (cc && cc->dpy) g_wm->dnd_release_source_button(cc->dpy);
         }
     }
@@ -316,10 +266,6 @@ static bool on_scroll(GtkWidget *, GdkEventScroll *e, gpointer data)
 bool on_enter(GtkWidget *widget, GdkEventCrossing *event, gpointer data)
 {
     Capture *c = (Capture*)data;
-    // DEBUG_PRINT("[GTK] enter widget=%p\n", widget);
-    // Reset the cursor. Otherwise the draw area inherits the toplevel's cursor,
-    // so REAPER's FX-list resize cursor (set while hovering the splitter) sticks
-    // as you move into the plugin GUI. Force the default arrow on entry.
     GdkWindow *gw = gtk_widget_get_window(widget);
     if (gw) {
         GdkCursor *cur = gdk_cursor_new_from_name(gdk_window_get_display(gw), "default");
@@ -332,7 +278,6 @@ bool on_enter(GtkWidget *widget, GdkEventCrossing *event, gpointer data)
     return false;
 }
 
-// Wire the SWELL draw area to blit + forward input.
 static void connect_widget(Capture *c)
 {
     if (!c->widget) return;
@@ -390,17 +335,11 @@ static void cleanup_capture(Capture *c)
     delete c;
 }
 
-// ─── Popup overlay canvas (ported from proven implementation) ────────────────
-// A single transparent full-screen GTK_WINDOW_POPUP overlay. Each plugin popup
-// (override-redirect menu) is composite-captured and blitted into the canvas at
-// its screen position. Input on the canvas is forwarded back to the plugin.
-
 static bool canvas_draw_cb(GtkWidget *, cairo_t *cr, gpointer data)
 {
     Capture *c = (Capture*)data;
     if (!c || !c->dpy) return false;
 
-    // Transparent clear.
     cairo_set_source_rgba(cr, 0, 0, 0, 0);
     cairo_set_operator(cr, CAIRO_OPERATOR_SOURCE);
     cairo_paint(cr);
@@ -415,17 +354,10 @@ static bool canvas_draw_cb(GtkWidget *, cairo_t *cr, gpointer data)
         int draw_x = p.x - c->canvas_origin_x;
         int draw_y = p.y - c->canvas_origin_y;
 
-        // Cairo would clip this popup out correctly regardless, but only after paying
-        // for the XLib surface creation below -- skip that cost entirely for popups
-        // nowhere near what actually changed.
         if (draw_x + p.w <= clip_x1 || draw_x >= clip_x2 ||
             draw_y + p.h <= clip_y1 || draw_y >= clip_y2)
             continue;
 
-        // w/h/visual are cached on the popup (set in canvas_add_popup, refreshed on
-        // ConfigureNotify) -- an XGetGeometry + XGetWindowAttributes round-trip here,
-        // on every single redraw of every popup, was pure X-server latency for data
-        // that was already sitting in memory and does not change between redraws.
         Visual *visual = p.visual ? p.visual : DefaultVisual(c->dpy, DefaultScreen(c->dpy));
         cairo_surface_t *surf = cairo_xlib_surface_create(c->dpy, p.pixmap, visual, p.w, p.h);
         if (surf) {
@@ -504,7 +436,6 @@ static bool canvas_motion(GtkWidget *, GdkEventMotion *e, gpointer data)
     return true;
 }
 
-
 static void create_popup_canvas(Capture *c)
 {
     if (c->popup_canvas) return;
@@ -547,29 +478,10 @@ static void create_popup_canvas(Capture *c)
     c->canvas_draw  = da;
 }
 
-
-// The plugin's :10 origin -> desktop translation, used both to place popups and to map
-// input back the other way (screen - gtk_x).
-//
-// Always recomputed, never cached: the plugin's origin on :10 is its slot origin, and
-// the widget's origin on the desktop moves whenever the FX window moves, is docked or
-// undocked, or the PLUGIN RESIZES ITSELF -- which Virtual Mix Rack does every time it
-// grows to fit another module. xw_size used to store a different quantity here (the
-// widget's position inside its GTK container), which happened to agree back when every
-// plugin sat at :10 origin (0,0); with slots it is off by the slot origin, and a
-// resize mid-drag left the drag preview badly offset.
 static void refresh_gtk_offset(Capture *c, int *out_px = nullptr, int *out_py = nullptr)
 {
     if (!c || !c->dpy || !c->widget) return;
 
-    // Anchor to the CONTAINER, not to gui_win/plugin_win. The container is ours, sits
-    // at the plugin's slot origin, and lives for the whole session. The plugin's own
-    // windows do not: Virtual Mix Rack destroys and recreates its GUI windows when the
-    // rack grows to fit another module (visible as a burst of RegisterTouchWindow in
-    // the Wine log), after which gui_win/plugin_win are stale or moved and this
-    // translation returns a bogus origin -- which is what threw popups off by a whole
-    // window after an expansion. The container's top-left is also exactly what the
-    // widget displays, so it is the correct reference regardless.
     Window child; int px = 0, py = 0;
     XTranslateCoordinates(c->dpy, c->parent_win,
                           DefaultRootWindow(c->dpy), 0, 0, &px, &py, &child);
@@ -589,20 +501,9 @@ static void canvas_add_popup(Capture *c, Window x11_win, XWindowAttributes *attr
 {
     if (!c) return;
 
-    // Update-or-insert: if this window already has an entry, reuse it and free the
-    // stale pixmap (Wine reuses window IDs; a duplicate would leave a freed pixmap
-    // being composited). One entry per window.
     Capture::PopupWin *pp = nullptr;
     for (auto &e : c->popups) if (e.x11_win == x11_win) { pp = &e; break; }
 
-    // A repeated MapNotify for a window we already track, at identical geometry, is a
-    // no-op re-notification (Wine re-maps, or a plugin re-confirming an in-progress
-    // drag every frame while it's held over other reflowing content -- Virtual Mix
-    // Rack does this while a new module is being dragged in). Treat it as one: doing
-    // the full redirect/pixmap-rename/visual-fetch/offset-refresh dance on every one
-    // of those, potentially many per second, was the difference between inserting a
-    // module while others reflow (a burst of these) stalling and a plain move (which
-    // only ever hits the already-cheap on_popup_configured) not stalling.
     if (pp && pp->pixmap != None &&
         pp->x == attr->x + c->gtk_x && pp->y == attr->y + c->gtk_y &&
         pp->w == attr->width && pp->h == attr->height)
@@ -622,10 +523,8 @@ static void canvas_add_popup(Capture *c, Window x11_win, XWindowAttributes *attr
 
     if (!c->popup_canvas) create_popup_canvas(c);
 
-    // Manual, not Automatic: Automatic also keeps the server painting the popup into
-    // its parent, which made menus open/close erratically on mouse movement.
     XCompositeRedirectWindow(c->dpy, x11_win, CompositeRedirectManual);
-    XFlush(c->dpy);   // non-blocking; don't stall the main loop on every popup
+    XFlush(c->dpy);
     Pixmap pixmap = XCompositeNameWindowPixmap(c->dpy, x11_win);
 
     if (pp) {
@@ -633,33 +532,16 @@ static void canvas_add_popup(Capture *c, Window x11_win, XWindowAttributes *attr
     } else {
         c->popups.emplace_back();
         pp = &c->popups.back();
-        // Report repaints of this popup so the canvas can redraw it (menu highlight
-        // following the cursor, for example) without re-naming its pixmap per motion.
         if (g_wm_dpy && g_damage_event_base >= 0)
             pp->damage = XDamageCreate(g_wm_dpy, x11_win, XDamageReportBoundingBox);
     }
     pp->x11_win = x11_win;
     pp->pixmap  = pixmap;
-    // attr (and attr->visual) was fetched via g_wm_dpy in on_popup_mapped -- a
-    // different Display connection than c->dpy, which is what canvas_draw_cb's
-    // cairo_xlib_surface_create() actually uses. A Visual* from one Xlib connection
-    // is not valid to hand to a Cairo call bound to a different one, even though both
-    // connect to the same X server (Xlib keeps independent client-side copies per
-    // connection) -- that mismatch is what "invalid value for an input Visual*" was.
-    // Fetch it fresh via c->dpy specifically, once, here at creation time: still just
-    // one round-trip for this popup's entire lifetime, not one per frame.
     {
         XWindowAttributes wa_local;
         pp->visual = XGetWindowAttributes(c->dpy, x11_win, &wa_local)
                    ? wa_local.visual : DefaultVisual(c->dpy, DefaultScreen(c->dpy));
     }
-    // attr->x/y are already root coordinates on :10, and gtk_x/gtk_y (= widget origin
-    // on the real desktop minus the plugin's :10 origin) carry the translation to the
-    // desktop. Adding px/py as well counted the plugin's :10 origin twice. That was
-    // harmless while every container sat at (0,0), but each plugin now lives in its
-    // own slot, so the double-count threw popups a whole slot origin away -- onto
-    // another monitor. The inverse mapping used for input (screen - gtk_x) already
-    // assumes this form.
     pp->x = attr->x + c->gtk_x;
     pp->y = attr->y + c->gtk_y;
     DEBUG_PRINT("[POPOFF] win=0x%lx attr=(%d,%d) slot_origin=(%d,%d) gtk=(%d,%d) -> pp=(%d,%d)\n",
@@ -715,9 +597,6 @@ static bool modal_draw_cb(GtkWidget *, cairo_t *cr, gpointer data)
         if (md.x11_win == m->x11_win) { pm = md.pixmap; visual = md.visual; gw = md.w; gh = md.h; break; }
     if (!pm) return false;
 
-    // w/h/visual are cached on the ModalWin (set once in create_modal) -- this used to
-    // redo an XGetGeometry + XGetWindowAttributes round-trip on every single redraw,
-    // the same bug already found and fixed for popups (see canvas_draw_cb).
     if (!visual) visual = DefaultVisual(dpy, DefaultScreen(dpy));
 
     cairo_surface_t *surf = cairo_xlib_surface_create(dpy, pm, visual, gw, gh);
@@ -771,9 +650,6 @@ static bool modal_key(GtkWidget *, GdkEventKey *e, gpointer data)
     ModalRender *m = (ModalRender*)data;
     if (!m || !m->cap->dpy) return false;
 
-    // Modals are separate top-level GTK windows, so they bypass the bridge's
-    // OnKeyEvent/xw_forward_key path. Forward keys straight to the modal's own
-    // X11 window on :10, or it never gets keyboard input (Enter/Esc/text) and wedges.
     XKeyEvent xev; memset(&xev, 0, sizeof(xev));
     xev.type        = (e->type == GDK_KEY_PRESS) ? KeyPress : KeyRelease;
     xev.display     = m->cap->dpy;
@@ -840,11 +716,6 @@ static void create_modal(Capture *state, Window win, XWindowAttributes *attr)
     Capture::ModalWin md;
     md.x11_win = win; md.pixmap = pm; md.gtk_win = gtk_win; md.draw = draw; md.damage = dmg;
     md.w = attr->width; md.h = attr->height;
-    // attr (and attr->visual) was fetched via g_wm_dpy in on_popup_mapped -- a
-    // different Xlib connection than dpy, which is what modal_draw_cb's
-    // cairo_xlib_surface_create() actually uses. A Visual* from one connection isn't
-    // valid on another (same mismatch found and fixed for popups earlier -- see
-    // canvas_add_popup). Fetch it fresh via dpy specifically, once, here.
     {
         XWindowAttributes wa_local;
         md.visual = XGetWindowAttributes(dpy, win, &wa_local)
@@ -857,10 +728,6 @@ static void modal_remove(Capture *c, Window win)
 {
     for (auto it = c->modals.begin(); it != c->modals.end(); ++it)
         if (it->x11_win == win) {
-            // Pull resources out and drop the entry BEFORE destroying the widget:
-            // gtk_widget_destroy can dispatch events (re-entrancy), and on Super+Q
-            // GTK may already have destroyed the modal — so guard with GTK_IS_WIDGET
-            // to avoid the 'GTK_IS_WIDGET (widget)' assertion on a dead widget.
             Damage     dmg = it->damage;
             Pixmap     pm  = it->pixmap;
             GtkWidget *w   = it->gtk_win;
@@ -895,22 +762,11 @@ static bool is_xdnd_icon_window(Display *dpy, Window win)
 static void handle_new_window(Window win, Capture *state, XWindowAttributes *attr) {
     if (!state->dpy || !win || !state) return;
 
-    // Already tracked? A repeated MapNotify (Wine re-maps) must not spawn a second
-    // popup/modal. Refresh an existing popup; leave an existing modal alone.
     for (auto &p : state->popups)
         if (p.x11_win == win) { canvas_add_popup(state, win, attr); return; }
     for (auto &m : state->modals)
         if (m.x11_win == win) return;
 
-    // A _NET_WM_WINDOW_TYPE_DND window is an XDND drag-icon window -- yabridge keeps
-    // one mapped for the whole plugin-drag-out XDND session (see the catcher in
-    // xwayland-bridge-wm.cpp). classify_popup() correctly classifies it as a popup
-    // per EWMH, but routing it into canvas_add_popup mapped the full-screen,
-    // always-on-top overlay meant for the plugin's own dropdown/tooltip popups for
-    // the entire drag, which sat directly on top of REAPER's native drag-preview
-    // tooltip everywhere on screen. This window is never meant to be user-visible
-    // (:10 is a headless Xvfb server, and the drag feedback the user actually sees is
-    // REAPER's own native drag), so ignore it rather than composite it.
     if (is_xdnd_icon_window(state->dpy, win)) {
         DEBUG_PRINT("[DNDCOORD] ignoring XDND icon window 0x%lx (not compositing as popup)\n", (unsigned long)win);
         return;
@@ -948,16 +804,6 @@ static void on_popup_mapped(Window w)
                     cand->slot, sx, sy, sw, sh, point_in_slot(cand->slot, attr.x, attr.y));
     }
 
-    // Prefer geometric attribution: which instance's slot does this popup's position
-    // actually fall inside? PID matching alone can't tell apart multiple instances of
-    // the same plugin sharing one Wine host process (a real yabridge/Wine behaviour,
-    // used to save memory/startup time) -- every popup from every such instance
-    // shares the same PID, so PID-only attribution always picked whichever instance
-    // happened to be first in g_captures, regardless of which one the popup actually
-    // came from. Override-redirect popups (what these are, by ICCCM convention) are
-    // reparented directly under root rather than under the plugin's own container,
-    // so there's no X11 hierarchy to walk back through either -- but the slot system
-    // already guarantees each instance a unique, non-overlapping rectangle on :10.
     for (auto &kv : g_captures) {
         Capture *cand = kv.second;
         if (cand && point_in_slot(cand->slot, attr.x, attr.y) &&
@@ -967,10 +813,6 @@ static void on_popup_mapped(Window w)
             return;
         }
     }
-    // Fallback: no candidate's slot contains this position -- e.g. slot allocation
-    // exhausted (more than 32 instances open) and several instances share the
-    // (XW_SLOT_MARGIN, XW_SLOT_MARGIN) fallback position from xw_alloc_slot. Fall
-    // back to PID-only matching rather than dropping the popup entirely.
     DEBUG_PRINT("[SLOTATTR]   -> no slot matched, falling back to PID-only\n");
     for (auto &kv : g_captures) {
         Capture *cand = kv.second;
@@ -995,44 +837,14 @@ static void on_popup_unmapped(Window w)
     }
 }
 
-// A popup moved/resized (drag-and-drop popup). Update its geometry from the raw
-// configure coords and re-capture its pixmap.
 static bool on_popup_configured(Window w, int cx, int cy, int cw, int ch)
 {
     for (auto &kv : g_captures) {
         Capture *c = kv.second;
         for (auto &p : c->popups) {
             if (p.x11_win != w) continue;
-            // cx/cy are root coordinates on :10, so they need the same translation
-            // canvas_add_popup applies -- p.x/p.y are desktop coordinates for the
-            // canvas. Storing them raw put the popup a whole slot origin off (617 ->
-            // 2665), far outside the canvas, so a moving popup vanished on its first
-            // ConfigureNotify. Harmless before slots, when containers sat at (0,0)
-            // and the two coordinate spaces happened to coincide. Menus never hit
-            // this because they do not move; the drag preview moves constantly.
-            // A moving popup can outlive a plugin resize (Virtual Mix Rack expands as
-            // modules are added), so refresh before translating rather than trusting
-            // whatever the offset was when the popup first appeared.
             int ox = 0, oy = 0;
             refresh_gtk_offset(c, &ox, &oy);
-            // Some plugins mix coordinate frames. Virtual Mix Rack sends the drag
-            // preview's x in ROOT space (it follows the cursor, which we warp into the
-            // plugin's slot) but its y in its own CLIENT space, taken from the rack
-            // layout: cfg=2207,75 against a container at 2048,2048. On a normal host
-            // the window sits near screen origin so the two frames coincide and nobody
-            // notices; in a slot at 2048,2048 the y lands a whole slot origin above the
-            // widget and the preview vanishes off-screen.
-            //
-            // A window living in this slot cannot legitimately be positioned above or
-            // left of the container, so treat such a coordinate as client-relative and
-            // rebase it. Root coordinates are left untouched.
-            //
-            // ox,oy here used to be a second, separate XTranslateCoordinates call
-            // duplicating exactly what refresh_gtk_offset() just computed above. A
-            // moving popup (the drag preview) fires this on every ConfigureNotify --
-            // one per mouse-move tick while dragging -- so that was two X round-trips
-            // doing the same translation, every single tick. refresh_gtk_offset() now
-            // hands its result back directly instead.
             int old_x = p.x, old_y = p.y, old_w = p.w, old_h = p.h;
             {
                 int fx = cx, fy = cy;
@@ -1041,12 +853,6 @@ static bool on_popup_configured(Window w, int cx, int cy, int cw, int ch)
                 p.x = fx + c->gtk_x;
                 p.y = fy + c->gtk_y;
             }
-            // A pure move (size unchanged) leaves the existing composite pixmap's
-            // content perfectly valid -- only re-name it when the size actually
-            // changes. Freeing and re-creating it unconditionally on every
-            // ConfigureNotify meant a moving drag-preview popup paid for an
-            // XFreePixmap + XCompositeNameWindowPixmap round-trip on every tick, for
-            // no visual benefit (the window's pixels didn't change, just its position).
             bool size_changed = (p.w != cw || p.h != ch);
             p.w = cw; p.h = ch;
             if (size_changed) {
@@ -1055,14 +861,6 @@ static bool on_popup_configured(Window w, int cx, int cy, int cw, int ch)
             }
             if (c->canvas_draw) {
                 GdkWindow *cwin = gtk_widget_get_window(c->canvas_draw);
-                // This used to invalidate the whole canvas (NULL rect) -- a full
-                // monitor-sized clear-and-recomposite on every single position tick of
-                // a moving popup. The damage (content-change) handler got scoped to
-                // its actual rect last round; this position-change path, which is what
-                // actually fires continuously while dragging or during Virtual Mix
-                // Rack's reflow animation, was still invalidating everything. Scope it
-                // to the old rect (erase the stale paint at the previous position) and
-                // the new rect (paint the fresh content at the new one).
                 if (cwin) {
                     GdkRectangle old_r = { old_x - c->canvas_origin_x, old_y - c->canvas_origin_y, old_w, old_h };
                     GdkRectangle new_r = { p.x  - c->canvas_origin_x, p.y  - c->canvas_origin_y, p.w,   p.h   };
@@ -1078,24 +876,13 @@ static bool on_popup_configured(Window w, int cx, int cy, int cw, int ch)
     return false;
 }
 
-// Bridge per-event handling, registered as g_wm->on_unhandled_event. The WM has
-// already processed the event (MapRequest/ConfigureRequest/etc, plus the XDND
-// catcher protocol -- see xwayland-bridge-wm.cpp); here we deal only with our
-// own concerns: popup/modal lifecycle, damage-driven capture, and starting the
-// native SWELL drag once the WM has a drag-out payload (see on_motion above).
-// Damage may target a plugin GUI or a modal dialog — resolve by the damaged
-// drawable (XDamageNotifyEvent.drawable overlaps xany.window). Modals aren't
-// in g_captures, so we test the event type first, then look up the drawable.
 static void handle_damage_notify(XDamageNotifyEvent *de)
 {
     DEBUG_PRINT("damage: %dx%d+%d+%d\n",
         de->area.width, de->area.height, de->area.x, de->area.y);
 
-    // Subtract on g_wm_dpy — the connection that created the damage object and
-    // receives its events — so the region actually clears and re-arms.
     XDamageSubtract(g_wm_dpy, de->damage, None, None);
 
-    // Helper lambda to safely update the shared memory image for a given capture context
     auto update_capture_buffer = [](Capture *c) -> bool {
         if (!c || !c->dpy || !c->plugin_win) return false;
 
@@ -1107,9 +894,6 @@ static void handle_damage_notify(XDamageNotifyEvent *de)
         return XShmGetImage(c->dpy, c->plugin_win, c->shm_img, 0, 0, AllPlanes);
     };
 
-    // Plugin GUI: de->area is in plugin_win coords, which map 1:1 to the
-    // widget (on_draw blits the pixmap at 0,0). cairo clips the paint to this
-    // rect, so only this region blits. Modals work the same way against md.draw.
     Capture *c = find_capture(de->drawable);
     if (c && c->widget && GTK_IS_WIDGET(c->widget)) {
         // Update the buffer from the X Server immediately before scheduling the GTK draw
@@ -1124,25 +908,6 @@ static void handle_damage_notify(XDamageNotifyEvent *de)
         Capture *cc = kv.second;
         if (!cc) continue;
 
-        // Popups: damage on a popup (menu highlight following the cursor, for
-        // instance) has to repaint the canvas it is composited into. Without
-        // this the canvas only updated as a side effect of pixmap churn in
-        // canvas_motion, which flickered.
-        //
-        // update_capture_buffer() was being called here too, but it operates on
-        // c->plugin_win -- the MAIN plugin GUI's own SHM buffer, which has nothing
-        // to do with a popup. Every popup damage event (e.g. a menu highlight
-        // following the cursor, which can fire continuously while hovering) was
-        // paying for a full refresh of the main plugin canvas as an unrelated side
-        // effect. The popup's own content comes straight from its composited
-        // pixmap via Cairo/XLib in canvas_draw_cb -- no separate buffer to update.
-        //
-        // Likewise this used to invalidate the whole canvas widget, which is sized
-        // to the full screen (create_popup_canvas). A tiny highlight change inside
-        // a small dropdown was forcing GTK to clear-and-recomposite a full
-        // monitor-sized transparent surface every time. Map the damaged sub-rect
-        // into canvas-local coordinates instead, matching the precision already
-        // used for the plugin GUI and modal paths just above.
         for (auto &pp : cc->popups) {
             if (pp.x11_win == de->drawable) {
                 if (cc->canvas_draw && GTK_IS_WIDGET(cc->canvas_draw)) {
@@ -1169,32 +934,10 @@ static void handle_damage_notify(XDamageNotifyEvent *de)
     }
 }
 
-// ---- XDND coming FROM the plugin (dragging something out of it) ----
-// Wine runs a nested drag loop while dragging. Inside it, it sends XdndEnter /
-// XdndPosition to the window under the pointer -- our container -- and then WAITS
-// for an XdndStatus reply. Nothing here answered: this switch only handled
-// map/unmap/configure, and the find_capture() check below returns early for the
-// container anyway. So the loop blocked forever, the plugin could not service
-// yabridge, and REAPER's next host->plugin call parked its UI thread in recv() --
-// the same deadlock shape as the modal-dialog hang.
-//
-// Answering is what matters, not accepting. We currently REFUSE (accept bit 0):
-// the drag ends cleanly with a no-drop cursor instead of hanging. Accepting would
-// additionally require handling XdndDrop plus the XdndSelection transfer, and
-// leaving that half-done would hang again waiting for XdndFinished.
 static void handle_xdnd_from_plugin(XClientMessageEvent *xce)
 {
     Display *dpy   = xce->display;
     const Atom mt  = xce->message_type;
-#ifdef _DEBUG
-    {   // DIAG: does the plugin's drag handshake reach us at all?
-        char *n = XGetAtomName(dpy, mt);
-        DEBUG_PRINT("[DNDX] ClientMessage %s win=0x%lx src=0x%lx\n",
-                    n ? n : "?", xce->window,
-                    (unsigned long)xce->data.l[0]);
-        if (n) XFree(n);
-    }
-#endif
     const Window self = xce->window;
     const Window src  = (Window)xce->data.l[0];
 
@@ -1217,8 +960,6 @@ static void handle_xdnd_from_plugin(XClientMessageEvent *xce)
     }
     if (src && mt == XInternAtom(dpy, "XdndDrop", False))
     {
-        // Should not arrive while we refuse, but answer anyway -- an unanswered
-        // XdndDrop leaves the source waiting on XdndFinished, which is a hang.
         XClientMessageEvent fin; memset(&fin, 0, sizeof(fin));
         fin.type         = ClientMessage;
         fin.display      = dpy;
@@ -1232,26 +973,16 @@ static void handle_xdnd_from_plugin(XClientMessageEvent *xce)
         XFlush(dpy);
         return;
     }
-    // XdndEnter and XdndLeave require no reply.
 }
 
 static void bridge_handle_event(XEvent *ev)
 {
-    // The WM's handle_event() already consumed the XDND catcher's own protocol
-    // traffic (XFixes/ClientMessage/SelectionNotify) for anything addressed to the
-    // catcher window. That consumption doesn't stop on_unhandled_event from firing
-    // regardless -- it fires for every event -- so we still have to actively skip
-    // the catcher's own events here ourselves, or two things end up answering the
-    // same XDND message: the WM's catcher (accept / finished-success) and the
-    // legacy refuse-everything ClientMessage handler further down in this function
-    // (refuse / finished-not-accepted). yabridge got both replies to the same
-    // XdndPosition/XdndDrop, which is what left it unable to start a second drag.
     Window dnd_catcher = g_wm ? g_wm->dnd_catcher_window() : 0;
     if (dnd_catcher &&
         ((ev->type == MapNotify   && ev->xmap.window   == dnd_catcher) ||
          (ev->type == UnmapNotify && ev->xunmap.window == dnd_catcher) ||
          (ev->type == ClientMessage && ev->xclient.window == dnd_catcher)))
-        return;   // our own proxy window: the WM layer already answered this
+        return;
 
     if (g_damage_event_base >= 0 && ev->type == g_damage_event_base + XDamageNotify) {
         handle_damage_notify((XDamageNotifyEvent *)ev);
@@ -1285,16 +1016,6 @@ static void bridge_handle_event(XEvent *ev)
     }
 }
 
-// True if any captured plugin currently has an open popup but NO open modal.
-// Used to scope the Escape-on-click popup-dismiss workaround so it never fires
-// while a modal is up (which would wrongly close the modal).
-// Dismiss any open plugin popup for this capture by clicking outside it on :10.
-//
-// This replaces sending Escape. A Wine menu holds a POINTER grab, and keyboard focus
-// on :10 is not on the menu, so the key event never reached it -- Escape silently did
-// nothing and the grab stayed, which is what locks REAPER's input up entirely. A click
-// outside the menu is what actually dismisses it; the grab owner consumes that click
-// to close itself, so no control underneath gets activated.
 static void dismiss_popups_by_click(Capture *c)
 {
     if (!c || !c->dpy || c->popups.empty()) return;
@@ -1328,17 +1049,11 @@ bool xw_bridge_swell_on_button_event_escape()
     {
         Capture *c = kv.second;
         if (!c) continue;
-        // Raise the modal so an outside click brings it back to the front rather than
-        // leaving it stranded behind the plugin.
         if (!c->modals.empty()){
             xw_raise_modals();
             any = true;
         }
         if (!c->popups.empty()){
-            // Runs when the user clicks anywhere in REAPER, including left of or
-            // above the plugin where the overlay canvas does not reach (it is an
-            // xdg_popup anchored to the FX window, so it only extends right and down
-            // and those clicks never hit canvas_button_press).
             dismiss_popups_by_click(c);
             any = true;
         }
@@ -1346,16 +1061,6 @@ bool xw_bridge_swell_on_button_event_escape()
     return any;
 }
 
-// If any plugin popup is open, dismiss it and return true. Called from SWELL's
-// GDK_DELETE handler when a window is being closed (e.g. Hyprland Super+Q).
-//
-// The overlay canvas is a GTK_WINDOW_POPUP made transient to the plugin's FX
-// window, i.e. an xdg_popup child on Wayland. If that popup is still mapped when
-// its parent (the FX window) closes, the compositor raises an xdg_shell protocol
-// error that kills GTK's Wayland connection and hangs REAPER instantly. So we
-// must fully DESTROY the canvas here (gtk_widget_destroy, not hide) to tear down
-// the xdg_popup and its grab before any close proceeds. We also Escape the :10
-// menu so the plugin drops its own X grab.
 bool xw_bridge_swell_on_gdk_delete_release()
 {
     bool any = false;
@@ -1409,58 +1114,17 @@ bool xw_bridge_swell_on_gdk_delete_release()
             XFlush(c->dpy);
         }
     }
-    // Only touch :10 / send Escape when there was actually a popup or modal to
-    // dismiss. Firing Escape on EVERY window close — including a plain plugin close
-    // with nothing open — is what corrupts the teardown and crashes Wine (the
-    // plugin's GUI window gets destroyed from the outside -> BadWindow).
-    if (any) {
-        // gdk_display_flush(gdk_display_get_default());
-        // Click outside the popup rather than sending Escape: the menu holds a pointer
-        // grab and never receives the key, so Escape left the grab in place and locked
-        // input up. Modals are separate GTK windows with their own key handling and
-        // are unaffected by this.
-        // (popup dismissal now happens above, before the list is cleared)
-    }
     return any;
-}
-
-// Ground-truth dump of every capture's overlay/modal state -- what actually exists
-// right now, regardless of which code path we think created it. Callable from
-// anywhere via xwayland-bridge.h.
-void xw_bridge_debug_dump_overlays()
-{
-    DEBUG_PRINT("[DNDCOORD] --- overlay dump: %zu captures ---\n", g_captures.size());
-    for (auto &kv : g_captures)
-    {
-        Capture *c = kv.second;
-        if (!c) continue;
-        bool canvas_vis = c->popup_canvas && GTK_IS_WIDGET(c->popup_canvas) && gtk_widget_get_visible(c->popup_canvas);
-        int cx = -1, cy = -1;
-        if (canvas_vis)
-        {
-            GdkWindow *gw = gtk_widget_get_window(c->popup_canvas);
-            if (gw) gdk_window_get_origin(gw, &cx, &cy);
-        }
-        DEBUG_PRINT("[DNDCOORD]   capture hwnd=%p popup_canvas=%p visible=%d origin=(%d,%d) size=(%d,%d) popups=%zu modals=%zu\n",
-                    (void*)c->hwnd, (void*)c->popup_canvas, canvas_vis, cx, cy,
-                    c->canvas_w, c->canvas_h, c->popups.size(), c->modals.size());
-    }
 }
 
 void init_private_xwayland()
 {
-    // The WM owns Xwayland spawn, the X connection, error handling.
-    // We just bring it up and register our per-event handler.
     if (!XWaylandWM::init_bridge_wm(":10")) return;
 
     if (g_wm_dpy) {
         int base, err;
         if (XDamageQueryExtension(g_wm_dpy, &base, &err)) {
             g_damage_event_base = base;
-            // Expose the Damage error base so the WM's X error handler can swallow
-            // BadDamage. modal_remove runs on UnmapNotify, but a closing dialog is
-            // usually destroyed right after, and the server auto-frees its damage
-            // on DestroyNotify — so our XDamageDestroy races an already-freed damage.
             g_bridge_damage_error_base = err;
         }
     }
@@ -1474,18 +1138,6 @@ void init_private_xwayland()
 // A true toplevel (h->m_oswidget already set by SWELL itself) is the recursion's
 // base case -- we never touch m_oswidget, only ever read it. Returns the widget to
 // embed into, or nullptr if something in the chain isn't embeddable.
-//
-// This exists because non-toplevel HWNDs (any HWND with a parent) never get a real
-// GTK widget of their own in SWELL's model -- only true toplevels do
-// (swell_oswindow_manage's wantVis is `!hwnd->m_parent && hwnd->m_visible`). So the
-// "embed slot" HWND for a plugin inside an FX-list container was always purely
-// logical, with nothing to embed into directly -- previously worked around by
-// walking up to the nearest real ancestor widget and manually reconstructing an
-// offset to place things correctly within it, which broke for arbitrary nesting
-// depth (each level of Container-in-Container needs its own accounted-for offset).
-// This instead gives every level in the chain its own small, correctly-positioned
-// widget, so embedding at the very end only ever needs hwnd's own single, direct
-// position within its immediate parent -- no reconstruction needed, at any depth.
 static GtkWidget* xw_ensure_embed_widget(HWND h)
 {
     if (!h) return nullptr;
@@ -1508,12 +1160,6 @@ static GtkWidget* xw_ensure_embed_widget(HWND h)
     if (w < 1) w = 1;
     if (hh < 1) hh = 1;
 
-    // Always recurse first, whether h's own widget exists yet or not -- ensures the
-    // whole chain up to the toplevel gets re-verified/repositioned on every call,
-    // not just the widget for h itself. Otherwise, once an ancestor's widget is
-    // cached, nothing ever re-checks whether *its* own parent's position is still
-    // correct on later calls (e.g. the ancestor chain settling into its real,
-    // correct position after the first call created things too early).
     GtkWidget *parent_widget = xw_ensure_embed_widget(h->m_parent);
     if (!parent_widget || !GTK_IS_FIXED(parent_widget)) return nullptr;
 
@@ -1524,11 +1170,17 @@ static GtkWidget* xw_ensure_embed_widget(HWND h)
         return existing;
     }
 
+    GtkWidget *prev_fixed = (GtkWidget*)g_object_get_data(G_OBJECT(parent_widget), "xw-active-embed-fixed");
+    if (prev_fixed && GTK_IS_WIDGET(prev_fixed) && prev_fixed != existing) {
+        gtk_widget_destroy(prev_fixed);
+    }
+
     GtkWidget *fixed = gtk_fixed_new();
     gtk_widget_set_size_request(fixed, w, hh);
     gtk_fixed_put(GTK_FIXED(parent_widget), fixed, h->m_position.left, h->m_position.top);
     gtk_widget_show(fixed);
 
+    g_object_set_data(G_OBJECT(parent_widget), "xw-active-embed-fixed", fixed);
     SetProp(h, "XBridgeEmbedFixed", (HANDLE)fixed);
     return fixed;
 }
@@ -1540,8 +1192,8 @@ static bool try_create_plugin(HWND hwnd)
 
     if (!bs->placed) {
         bs->embed_container = xw_ensure_embed_widget(hwnd->m_parent);
-        xw_size(hwnd);
     }
+    xw_size(hwnd);
 
      // First tick(s): the plugin creates its window as a child of our container.
      if (!bs->cap && bs->disp && bs->parent)
@@ -1602,44 +1254,19 @@ void xw_size(HWND hwnd)
     if (!hwnd || !hwnd->m_private_data || !hwnd->m_oswidget) return;
     bridgeState *bs = (bridgeState*)hwnd->m_private_data;
 
-    // Resolution/realization retry happens exclusively in try_create_plugin (the
-    // 100ms timer's retry phase) -- see xw_ensure_embed_widget there. This function
-    // is purely "update position on an already-resolved widget": it must never walk
-    // or re-verify the ancestor chain itself, since it also fires continuously
-    // during a live resize drag, far more often than the timer -- doing that work on
-    // every single tick is what caused resize-dragging to lag behind the mouse.
     GtkWidget *container = bs->embed_container;
     if (!container || !GTK_IS_FIXED(container)) return;
 
     RECT r = hwnd->m_position;
-    // hwnd's own position, relative to its direct parent (viewpar) -- a single,
-    // direct value SWELL already tracks correctly for hwnd itself. No multi-level
-    // reconstruction needed: xw_ensure_embed_widget already positioned viewpar's own
-    // widget correctly within its own parent, recursively, for any nesting depth, so
-    // embedding here only ever needs this one, direct, already-correct value.
     int pos_x = r.left, pos_y = r.top;
     int w = r.right - r.left, h = r.bottom - r.top;
 
-    // Floating plugin windows never have a menu bar and need no adjustment here --
-    // confirmed already working perfectly. FX-list mode's outer dialog does have one
-    // (the FX/Edit/Options bar), and its height was never being accounted for
-    // anywhere, which is exactly why this offset showed up consistently in FX-list
-    // mode regardless of container nesting depth -- there's only ever one menu bar,
-    // on the outermost real toplevel, not one per nesting level. Use SWELL's own
-    // real, queryable menu bar height (the same value GetSystemMetrics(SM_CYMENU)
-    // returns) rather than a guessed constant.
-    {
-        HWND top = hwnd->m_parent;
-        while (top && !top->m_oswidget) top = top->m_parent;
-        if (top && top->m_menu) {
-            pos_y += GetSystemMetrics(SM_CYMENU);
-        }
+    HWND top = hwnd->m_parent;
+    while (top && !top->m_oswidget) top = top->m_parent;
+    if (top && top->m_menu) {
+        pos_y += GetSystemMetrics(SM_CYMENU);
     }
 
-    // Re-capture the pixmap at the new size — xw_size runs exactly when the window
-    // is being resized, so the backing pixmap must be refreshed here. Guard on
-    // bs->cap: WM_SIZE/SetWindowPos can fire before the plugin is captured (e.g.
-    // during an FX-list swap), and the container resize also needs a live capture.
     if (bs->cap) {
         XResizeWindow(bs->cap->dpy, bs->cap->parent_win, w, h);
         XFlush(bs->cap->dpy);
@@ -1651,12 +1278,6 @@ void xw_size(HWND hwnd)
         gtk_widget_show(hwnd->m_oswidget);
         bs->placed = true;
 
-        // Confirm the embedding actually reached a real toplevel -- gtk_fixed_put
-        // succeeding doesn't guarantee this if `container` itself wasn't yet
-        // anchored to a GtkWindow. If it's not, don't trust bs->placed: reset it
-        // so a later call (the timer retries this every tick too) can try again
-        // once the parent chain is actually ready, instead of permanently
-        // skipping the only code path that ever embeds this widget.
         GtkWidget *tl = gtk_widget_get_toplevel(hwnd->m_oswidget);
         if (!(tl && GTK_IS_WINDOW(tl))) bs->placed = false;
     } else {
@@ -1664,24 +1285,31 @@ void xw_size(HWND hwnd)
         gtk_widget_set_size_request(hwnd->m_oswidget, w, h);
     }
 
-    // Let the real toplevel (the floating FX window, however many embed levels up)
-    // grow to fit the plugin's new size. xw_ensure_embed_widget already sets a
-    // correct size_request on every widget in the chain recursively, so GTK's own
-    // layout already knows the right size -- this just triggers it to actually
-    // apply, rather than manually computing an absolute needed-size by hand.
-    //
-    // Only when the size has actually changed since last time: xw_size fires
-    // continuously during a live resize drag, and gtk_widget_queue_resize on the
-    // toplevel forces GTK to recompute the ENTIRE window's layout -- doing that
-    // unconditionally on every single tick, even when nothing changed, is what
-    // caused resize-dragging to lag noticeably behind the mouse.
     bool size_changed = !bs->has_last_size_pos ||
         r.left != bs->last_size_pos.left || r.top != bs->last_size_pos.top ||
         r.right != bs->last_size_pos.right || r.bottom != bs->last_size_pos.bottom;
+
     if (size_changed) {
-        GtkWidget *tl = gtk_widget_get_toplevel(container);
-        if (tl && GTK_IS_WINDOW(tl))
-            gtk_widget_queue_resize(tl);
+        if (top && top->m_oswidget && GTK_IS_WINDOW(top->m_oswidget)) {
+            GtkWidget *tl_win = (GtkWidget*)top->m_oswidget;
+            SetProp(top, "SWELL_XW_BRIDGE_PLUGIN", (HANDLE)(INT_PTR)0);
+            int target_w = pos_x + w;
+            int target_h = pos_y + h;
+            if (target_w < 1) target_w = 1;
+            if (target_h < 1) target_h = 1;
+            top->m_position.right = top->m_position.left + target_w;
+            top->m_position.bottom = top->m_position.top + target_h;
+            GdkGeometry gh;
+            gh.min_width = target_w;
+            gh.max_width = target_w;
+            gh.min_height = target_h;
+            gh.max_height = target_h;
+            gtk_window_set_geometry_hints(GTK_WINDOW(tl_win), NULL, &gh,
+                (GdkWindowHints)(GDK_HINT_MIN_SIZE | GDK_HINT_MAX_SIZE));
+
+            gtk_widget_set_size_request(container, target_w, target_h);
+            SetProp(top, "SWELL_XW_BRIDGE_PLUGIN", (HANDLE)(INT_PTR)1);
+        }
         bs->last_size_pos = r;
         bs->has_last_size_pos = true;
     }
@@ -1811,34 +1439,18 @@ HWND xw_bridge_create(HWND viewpar, void **wref, const RECT *r, const char *brid
 
     *wref = (void*)container;
 
-    // Embed the widget into REAPER's real widget tree immediately, rather than
-    // waiting for a WM_SIZE message to trigger xw_size naturally -- confirmed via
-    // "assertion 'widget->priv->anchored' failed" that under KWin specifically,
-    // WM_SIZE doesn't reliably fire early enough, leaving draw_area created but
-    // never actually parented (never "anchored" to a toplevel) by the time Xvfb/Wine
-    // starts sending damage events for the plugin's own content. This has nothing to
-    // do with Wine or Xvfb timing at all -- it's a race between two independent
-    // subsystems (Xvfb/Wine painting vs. REAPER/SWELL embedding) with no
-    // synchronization between them. Calling this here makes embedding happen
-    // synchronously at creation time instead of depending on an external trigger
-    // whose timing varies by compositor.
+    {
+        HWND top = viewpar;
+        while (top && !top->m_oswidget) top = top->m_parent;
+        if (top) SetProp(top, "SWELL_XW_BRIDGE_PLUGIN", (HANDLE)(INT_PTR)1);
+    }
+
     xw_size(hwnd);
 
     SetTimer(hwnd, 1, 100, NULL);
     return hwnd;
 }
 
-// Called from SWELL OnKeyEvent
-// See the header. Consumes keys while any plugin modal dialog is open.
-//
-// Backtrace of the hang this prevents:
-//   OnKeyEvent -> SWELLAppMain(WM_KEYDOWN) -> REAPER -> libyabridge-vst2 -> recv()
-// REAPER dispatches the key into the plugin, yabridge waits synchronously for the
-// Wine-side host to answer, and that host is inside its modal dialog's nested message
-// loop and never will. The UI thread blocks in recv() and REAPER has to be killed.
-// Focus, grabs and Escape were all irrelevant -- the key simply must not reach the
-// plugin while a modal is up. Sending it to the dialog instead also lets Escape close
-// the dialog, which releases the nested loop.
 bool xw_bridge_forward_key_to_modal(int keycode, int state, bool is_press)
 {
     for (auto &kv : g_captures)
