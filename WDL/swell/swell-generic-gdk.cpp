@@ -404,6 +404,22 @@ void SWELL_initargs(int *argc, char ***argv)
 #endif
 
 #ifdef SWELL_SUPPORT_GTK
+    // Promote GDK's already-loaded library to global symbol visibility, so
+    // UserPlugins that dlopen() later (e.g. SWS) can resolve GTK/GDK/gdk_pixbuf
+    // symbols they assume the host process already provides globally. REAPER's own
+    // loader loads SWELL.so itself with local scope, so without this, everything
+    // SWELL.so pulls in transitively stays invisible to anything loaded afterward.
+    // This isn't Wayland-specific -- confirmed the identical failure on a custom
+    // X11 (SWELL_SUPPORT_GTK) build too, so it's gated on GTK support itself, not
+    // the Wayland target. Re-dlopen()ing an already-loaded library with RTLD_GLOBAL
+    // doesn't reload it -- it just upgrades its visibility, safely, with no effect
+    // on SWELL's own (already fully resolved, eager) use of these same symbols.
+    // Confirmed libgdk-3.so.0 alone is sufficient: RTLD_GLOBAL promotes its entire
+    // transitive dependency chain (glib, gobject, gdk_pixbuf) along with it.
+    dlopen("libgdk-3.so.0", RTLD_NOW | RTLD_GLOBAL);
+#endif
+
+#ifdef SWELL_SUPPORT_GTK
     SWELL_gdk_active = gtk_init_check(argc,argv) ? 1 : -1;
 #else
     SWELL_gdk_active = gdk_init_check(argc,argv) ? 1 : -1;
