@@ -1527,40 +1527,102 @@ void xw_destroy(HWND hwnd)
     delete bs;
 }
 
+// Recursively ensures h has its own real, positioned GtkFixed widget, creating one
+// (and recursively ensuring its own parent has one first) if it doesn't already.
+// A true toplevel (h->m_oswidget already set by SWELL itself) is the recursion's
+// base case -- we never touch m_oswidget, only ever read it. Returns the widget to
+// embed into, or nullptr if something in the chain isn't embeddable.
+//
+// This exists because non-toplevel HWNDs (any HWND with a parent) never get a real
+// GTK widget of their own in SWELL's model -- only true toplevels do
+// (swell_oswindow_manage's wantVis is `!hwnd->m_parent && hwnd->m_visible`). So the
+// "embed slot" HWND for a plugin inside an FX-list container was always purely
+// logical, with nothing to embed into directly -- previously worked around by
+// walking up to the nearest real ancestor widget and manually reconstructing an
+// offset to place things correctly within it, which broke for arbitrary nesting
+// depth (each level of Container-in-Container needs its own accounted-for offset).
+// This instead gives every level in the chain its own small, correctly-positioned
+// widget, so embedding at the very end only ever needs hwnd's own single, direct
+// position within its immediate parent -- no reconstruction needed, at any depth.
+static GtkWidget* xw_ensure_embed_widget(HWND h)
+{
+    if (!h) return nullptr;
+
+    if (h->m_oswidget) {
+        // Real SWELL toplevel. Get (or create) its inner GtkFixed content area,
+        // same as the existing container-unwrapping logic in xw_size.
+        GtkWidget *top = (GtkWidget*)h->m_oswidget;
+        if (!GTK_IS_WINDOW(top)) return top; // already a plain container, not a toplevel wrapper
+        GtkWidget *child = gtk_bin_get_child(GTK_BIN(top));
+        if (child) return child;
+        GtkWidget *fixed = gtk_fixed_new();
+        gtk_container_add(GTK_CONTAINER(top), fixed);
+        gtk_widget_show(fixed);
+        return fixed;
+    }
+
+    int w = h->m_position.right - h->m_position.left;
+    int hh = h->m_position.bottom - h->m_position.top;
+    if (w < 1) w = 1;
+    if (hh < 1) hh = 1;
+
+    // Always recurse first, whether h's own widget exists yet or not -- ensures the
+    // whole chain up to the toplevel gets re-verified/repositioned on every call,
+    // not just the widget for h itself. Otherwise, once an ancestor's widget is
+    // cached, nothing ever re-checks whether *its* own parent's position is still
+    // correct on later calls (e.g. the ancestor chain settling into its real,
+    // correct position after the first call created things too early).
+    GtkWidget *parent_widget = xw_ensure_embed_widget(h->m_parent);
+    if (!parent_widget || !GTK_IS_FIXED(parent_widget)) return nullptr;
+
+    GtkWidget *existing = (GtkWidget*)GetProp(h, "XBridgeEmbedFixed");
+    if (existing && GTK_IS_WIDGET(existing)) {
+        gtk_fixed_move(GTK_FIXED(parent_widget), existing, h->m_position.left, h->m_position.top);
+        gtk_widget_set_size_request(existing, w, hh);
+        return existing;
+    }
+
+    GtkWidget *fixed = gtk_fixed_new();
+    gtk_widget_set_size_request(fixed, w, hh);
+    gtk_fixed_put(GTK_FIXED(parent_widget), fixed, h->m_position.left, h->m_position.top);
+    gtk_widget_show(fixed);
+
+    SetProp(h, "XBridgeEmbedFixed", (HANDLE)fixed);
+    return fixed;
+}
+
 void xw_size(HWND hwnd)
 {
     if (!hwnd || !hwnd->m_private_data || !hwnd->m_oswidget) return;
     bridgeState *bs = (bridgeState*)hwnd->m_private_data;
 
-    HWND parent = hwnd->m_parent;
-    while (parent && !parent->m_oswidget) parent = parent->m_parent;
-    if (!parent || !parent->m_oswidget) return;
-
-    GtkWidget *container = parent->m_oswidget;
-    if (GTK_IS_WINDOW(container)) {
-        GtkWidget *child = gtk_bin_get_child(GTK_BIN(container));
-        if (child) container = child;
-        else {
-            GtkWidget *fixed = gtk_fixed_new();
-            gtk_container_add(GTK_CONTAINER(container), fixed);
-            gtk_widget_show(fixed);
-            container = fixed;
-        }
-    }
+    GtkWidget *container = xw_ensure_embed_widget(hwnd->m_parent);
+    if (!container || !GTK_IS_FIXED(container)) return;
 
     RECT r = hwnd->m_position;
-    int pos_x = 0, pos_y = 0;
-    HWND fp = hwnd->m_parent;
-    if (fp) {
-        // FLOATING PLUGIN
-        pos_x = fp->m_position.left + r.left;
-        pos_y = fp->m_position.top  + r.top;
-        // PLUGIN IN FX LIST
-        if (fp->m_parent) {
-            pos_y += fp->m_parent->m_position.bottom - fp->m_position.bottom;
+    // hwnd's own position, relative to its direct parent (viewpar) -- a single,
+    // direct value SWELL already tracks correctly for hwnd itself. No multi-level
+    // reconstruction needed: xw_ensure_embed_widget already positioned viewpar's own
+    // widget correctly within its own parent, recursively, for any nesting depth, so
+    // embedding here only ever needs this one, direct, already-correct value.
+    int pos_x = r.left, pos_y = r.top;
+    int w = r.right - r.left, h = r.bottom - r.top;
+
+    // Floating plugin windows never have a menu bar and need no adjustment here --
+    // confirmed already working perfectly. FX-list mode's outer dialog does have one
+    // (the FX/Edit/Options bar), and its height was never being accounted for
+    // anywhere, which is exactly why this offset showed up consistently in FX-list
+    // mode regardless of container nesting depth -- there's only ever one menu bar,
+    // on the outermost real toplevel, not one per nesting level. Use SWELL's own
+    // real, queryable menu bar height (the same value GetSystemMetrics(SM_CYMENU)
+    // returns) rather than a guessed constant.
+    {
+        HWND top = hwnd->m_parent;
+        while (top && !top->m_oswidget) top = top->m_parent;
+        if (top && top->m_menu) {
+            pos_y += GetSystemMetrics(SM_CYMENU);
         }
     }
-    int w = r.right - r.left, h = r.bottom - r.top;
 
     // Re-capture the pixmap at the new size — xw_size runs exactly when the window
     // is being resized, so the backing pixmap must be refreshed here. Guard on
@@ -1571,53 +1633,43 @@ void xw_size(HWND hwnd)
         XFlush(bs->cap->dpy);
     }
 
-    // Refresh the popup offset so popups position correctly in both floating and
-    // FX-list embedded modes. Must use the same computation as everywhere else --
-    // assigning pos_x/pos_y here (the widget's position inside its container) stored a
-    // different quantity and offset every popup after a resize.
-    if (bs->cap) refresh_gtk_offset(bs->cap);
-    if (GTK_IS_FIXED(container)) {
-        if (!bs->placed) {
-            gtk_fixed_put(GTK_FIXED(container), hwnd->m_oswidget, pos_x, pos_y);
-            gtk_widget_set_size_request(hwnd->m_oswidget, w, h);
-            gtk_widget_show(hwnd->m_oswidget);
-            bs->placed = true;
-
-            // Confirm the embedding actually reached a real toplevel -- gtk_fixed_put
-            // succeeding doesn't guarantee this if `container` itself wasn't yet
-            // anchored to a GtkWindow. If it's not, don't trust bs->placed: reset it
-            // so a later call (the timer retries this every tick too) can try again
-            // once the parent chain is actually ready, instead of permanently
-            // skipping the only code path that ever embeds this widget.
-            GtkWidget *tl = gtk_widget_get_toplevel(hwnd->m_oswidget);
-            if (!(tl && GTK_IS_WINDOW(tl))) bs->placed = false;
-        } else {
-            gtk_fixed_move(GTK_FIXED(container), hwnd->m_oswidget, pos_x, pos_y);
-            gtk_widget_set_size_request(hwnd->m_oswidget, w, h);
-        }
-
-        // **Request parent window resize to fit new plugin size**
-        if (GTK_IS_WINDOW(parent->m_oswidget)) {
-            int needed_width = pos_x + (r.right - r.left);
-            int needed_height = pos_y + (r.bottom - r.top);
-
-            // Set minimum size requirement
-            gtk_widget_set_size_request(GTK_WIDGET(parent->m_oswidget), 
-                                        needed_width, 
-                                        needed_height);
-
-            // Trigger relayout
-            gtk_widget_queue_resize(GTK_WIDGET(parent->m_oswidget));
-
-        }
-    } else if (GTK_IS_CONTAINER(container) && !bs->placed) {
-        gtk_container_add(GTK_CONTAINER(container), hwnd->m_oswidget);
+    if (!bs->placed) {
+        gtk_fixed_put(GTK_FIXED(container), hwnd->m_oswidget, pos_x, pos_y);
+        gtk_widget_set_size_request(hwnd->m_oswidget, w, h);
         gtk_widget_show(hwnd->m_oswidget);
         bs->placed = true;
 
+        // Confirm the embedding actually reached a real toplevel -- gtk_fixed_put
+        // succeeding doesn't guarantee this if `container` itself wasn't yet
+        // anchored to a GtkWindow. If it's not, don't trust bs->placed: reset it
+        // so a later call (the timer retries this every tick too) can try again
+        // once the parent chain is actually ready, instead of permanently
+        // skipping the only code path that ever embeds this widget.
         GtkWidget *tl = gtk_widget_get_toplevel(hwnd->m_oswidget);
         if (!(tl && GTK_IS_WINDOW(tl))) bs->placed = false;
+    } else {
+        gtk_fixed_move(GTK_FIXED(container), hwnd->m_oswidget, pos_x, pos_y);
+        gtk_widget_set_size_request(hwnd->m_oswidget, w, h);
     }
+
+    // Let the real toplevel (the floating FX window, however many embed levels up)
+    // grow to fit the plugin's new size. xw_ensure_embed_widget already sets a
+    // correct size_request on every widget in the chain recursively, so GTK's own
+    // layout already knows the right size -- this just triggers it to actually
+    // apply, rather than manually computing an absolute needed-size by hand.
+    {
+        GtkWidget *tl = gtk_widget_get_toplevel(container);
+        if (tl && GTK_IS_WINDOW(tl))
+            gtk_widget_queue_resize(tl);
+    }
+
+    // Refresh the popup offset so popups position correctly in both floating and
+    // FX-list embedded modes. Must run after the widget's own repositioning above
+    // (gtk_fixed_move/put), not before -- it reads the widget's actual on-screen
+    // position, so computing it before the move used stale, pre-resize data. This
+    // is what broke popup positioning specifically during a resize (e.g. Virtual Mix
+    // Rack expanding the rack to make room for a dragged-in module).
+    if (bs->cap) refresh_gtk_offset(bs->cap);
 }
 
 static LRESULT xw_bridgeProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam)
