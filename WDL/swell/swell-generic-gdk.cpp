@@ -361,7 +361,10 @@ void swell_oswindow_focus(HWND hwnd)
 void swell_recalcMinMaxInfo(HWND hwnd)
 {
   if (!hwnd || !hwnd->m_oswindow || !(hwnd->m_style & WS_CAPTION)) return;
-
+#ifdef SWELL_TARGET_WAYLAND
+  // ALLOWS PLUGIN AUTO RESIZING!!!!!
+  if (GetProp(hwnd, "SWELL_XW_BRIDGE_PLUGIN") == (HANDLE)(INT_PTR)1) return;
+#endif
   MINMAXINFO mmi;
   memset(&mmi,0,sizeof(mmi));
   if (hwnd->m_style & WS_THICKFRAME)
@@ -1361,6 +1364,7 @@ static void OnConfigureEvent(GdkEventConfigure *cfg)
   if (flag&1) SendMessage(hwnd,WM_MOVE,0,0);
   if (flag&2) SendMessage(hwnd,WM_SIZE,hwnd->m_is_maximized ? SIZE_MAXIMIZED : SIZE_RESTORED,0);
 #ifdef SWELL_TARGET_WAYLAND
+  //NOTE: NOT SURE IF NEEDED WORKS FINE WITHOUT IT!!!
   // Release the creation-time size pin now that the window has been mapped at its
   // restored size. Do it on the first configure only. After this the window is
   // freely resizable (recalcMinMaxInfo below re-applies the real min/max limits).
