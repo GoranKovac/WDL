@@ -288,6 +288,15 @@ static void connect_widget(Capture *c)
                           GDK_BUTTON_RELEASE_MASK |
                           GDK_SCROLL_MASK);
 
+    // disable GTK's animation system entirely, globally -- the narrower
+    // CSS-transition-property attempt didn't stop the repeated on_draw calls, so
+    // testing whether animations are the cause at all, via a broader, more
+    // definitive switch, before looking for a different mechanism entirely.
+    {
+        GtkSettings *settings = gtk_widget_get_settings(c->widget);
+        if (settings) g_object_set(settings, "gtk-enable-animations", FALSE, NULL);
+    }
+
     g_signal_connect(c->widget, "enter-notify-event",   G_CALLBACK(on_enter), c);
     g_signal_connect(c->widget, "draw",                 G_CALLBACK(on_draw),           c);
     g_signal_connect(c->widget, "button-press-event",   G_CALLBACK(on_button_press),   c);
