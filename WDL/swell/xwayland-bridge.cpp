@@ -1192,8 +1192,8 @@ static bool try_create_plugin(HWND hwnd)
 
     if (!bs->placed) {
         bs->embed_container = xw_ensure_embed_widget(hwnd->m_parent);
+        xw_size(hwnd);
     }
-    xw_size(hwnd);
 
      // First tick(s): the plugin creates its window as a child of our container.
      if (!bs->cap && bs->disp && bs->parent)
@@ -1228,6 +1228,10 @@ static bool try_create_plugin(HWND hwnd)
          }
          else if (list) XFree(list);
      }
+
+    if (bs->placed && bs->cap) {
+        KillTimer(hwnd, 1);
+    }
 
     return true;
 }
@@ -1267,7 +1271,11 @@ void xw_size(HWND hwnd)
         pos_y += GetSystemMetrics(SM_CYMENU);
     }
 
-    if (bs->cap) {
+    bool size_changed = !bs->has_last_size_pos ||
+        r.left != bs->last_size_pos.left || r.top != bs->last_size_pos.top ||
+        r.right != bs->last_size_pos.right || r.bottom != bs->last_size_pos.bottom;
+
+    if (bs->cap && size_changed) {
         XResizeWindow(bs->cap->dpy, bs->cap->parent_win, w, h);
         XFlush(bs->cap->dpy);
     }
@@ -1284,10 +1292,6 @@ void xw_size(HWND hwnd)
         gtk_fixed_move(GTK_FIXED(container), hwnd->m_oswidget, pos_x, pos_y);
         gtk_widget_set_size_request(hwnd->m_oswidget, w, h);
     }
-
-    bool size_changed = !bs->has_last_size_pos ||
-        r.left != bs->last_size_pos.left || r.top != bs->last_size_pos.top ||
-        r.right != bs->last_size_pos.right || r.bottom != bs->last_size_pos.bottom;
 
     if (size_changed) {
         if (top && top->m_oswidget && GTK_IS_WINDOW(top->m_oswidget)) {
