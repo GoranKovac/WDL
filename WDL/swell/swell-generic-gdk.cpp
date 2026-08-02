@@ -144,6 +144,13 @@ static int g_swell_wayland_title_h; // 0 = compositor has real SSD, use it norma
 #define SWELL_WAYLAND_TITLEBAR_CLOSEBTN_W 36
 #define SWELL_WAYLAND_BORDER_WIDTH 2
 
+// Defined in xwayland-bridge-wle.cpp -- sets up the private, embedded
+// compositor + xwayland-satellite used for hosting X11 (Wine/yabridge)
+// plugin GUIs as real, natively-composited Wayland surfaces, rather than
+// screen-scraped pixmaps.
+bool swell_wayland_bridge_init();
+HWND xw_bridge_create(HWND viewpar, void **wref, const RECT *r, const char *bridge_class_name);
+
 static void swell_wayland_init_titlebar_height()
 {
   GdkDisplay *disp = gdk_display_get_default();
@@ -610,6 +617,7 @@ static void init_options()
 #ifdef SWELL_TARGET_WAYLAND
     swell_wayland_init_titlebar_height();
     swell_wayland_suppress_csd_shadow_once();
+    swell_wayland_bridge_init();
 #endif
 
     if (swell_gdk_option("gdk_owned_windows_keep_above", "auto (default is 1)",1))
@@ -4236,11 +4244,7 @@ HWND SWELL_CreateXBridgeWindow(HWND viewpar, void **wref, const RECT *r)
   HWND hwnd = NULL;
   *wref = NULL;
 #ifdef SWELL_TARGET_WAYLAND
-  // do nothing on Wayland for now, will add bridge later
-  hwnd = new HWND__(viewpar,0,r,NULL,true,NULL);
-  hwnd->m_classname = bridge_class_name;
-  hwnd->m_private_data = 0;
-  return hwnd;
+  return xw_bridge_create(viewpar, wref, r, bridge_class_name);
 #endif
   GdkWindow *ospar = NULL;
   HWND hpar = viewpar;

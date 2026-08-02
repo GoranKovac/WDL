@@ -108,7 +108,14 @@ LICE_OBJS = lice.o  lice_arc.o lice_colorspace.o lice_line.o lice_text.o \
 
 OBJS = $(SWELL_OBJS)
 
-#Wayland (SWELL_TARGET_WAYLAND) depends on GTK3 so load it automatically
+ifdef WAYLAND
+  WLEMBED_PKG ?= libwlembed-0
+  WLEMBED_GTK3_PKG ?= libwlembed-gtk3-0
+  OBJS += xwayland-bridge-wle.o
+  CFLAGS += $(shell $(PKG_CONFIG) --cflags $(WLEMBED_PKG) $(WLEMBED_GTK3_PKG))
+  LINKEXTRA += $(shell $(PKG_CONFIG) --libs $(WLEMBED_PKG) $(WLEMBED_GTK3_PKG))
+endif
+
 ifdef WAYLAND
   ifndef SWELL_SUPPORT_GTK
     SWELL_SUPPORT_GTK = 1
