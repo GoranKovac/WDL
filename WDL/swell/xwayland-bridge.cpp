@@ -1274,6 +1274,14 @@ void xw_size(HWND hwnd)
     int pos_x = r.left, pos_y = r.top;
     int w = r.right - r.left, h = r.bottom - r.top;
 
+    // title is bigger if compositor needs CSD
+    if (g_swell_wayland_title_h > 0){
+        pos_y += g_swell_wayland_title_h + (SWELL_WAYLAND_BORDER_WIDTH * 2);
+        pos_x += SWELL_WAYLAND_BORDER_WIDTH * 2;
+        w += SWELL_WAYLAND_BORDER_WIDTH * 2;
+        h += SWELL_WAYLAND_BORDER_WIDTH * 2;
+    }
+
     HWND top = hwnd->m_parent;
     while (top && !top->m_oswidget) top = top->m_parent;
     if (top && top->m_menu) {
