@@ -141,9 +141,9 @@ static int gdk_options;
 #define OPTION_FULLSCREEN_DYNAMIC 64
 
 #ifdef SWELL_TARGET_WAYLAND
-static int g_swell_wayland_title_h; // 0 = compositor has real SSD, use it normally
+int g_swell_wayland_title_h; // 0 = compositor has real SSD, use it normally
 #define SWELL_WAYLAND_TITLEBAR_CLOSEBTN_W 36
-#define SWELL_WAYLAND_BORDER_WIDTH 2
+int SWELL_WAYLAND_BORDER_WIDTH = 2;
 
 static void swell_wayland_init_titlebar_height()
 {

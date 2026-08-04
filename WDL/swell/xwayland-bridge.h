@@ -24,6 +24,9 @@
 #include "swell.h"
 #include "swell-internal.h"
 
+extern int g_swell_wayland_title_h;
+extern int SWELL_WAYLAND_BORDER_WIDTH;
+
 void init_private_xwayland();
 HWND xw_bridge_create(
     HWND viewpar,
