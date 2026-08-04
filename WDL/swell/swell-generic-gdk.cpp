@@ -541,6 +541,10 @@ void SWELL_initargs(int *argc, char ***argv)
 
     if (!SWELL_gdk_active)
       SWELL_gdk_active = gdk_init_check(argc,argv) ? 1 : -1;
+#ifdef SWELL_TARGET_WAYLAND
+    if (SWELL_gdk_active > 0 && !SWELL_load_gtk())
+      SWELL_gdk_active = -1;
+#endif
     if (SWELL_gdk_active > 0)
     {
 #ifdef SWELL_TARGET_WAYLAND
