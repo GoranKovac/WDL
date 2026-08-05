@@ -12,10 +12,6 @@ void xw_size(HWND hwnd);
 XWaylandWM     *g_wm           = nullptr;
 Display *g_wm_dpy       = nullptr;
 
-static int  xw_alloc_slot(int *sx, int *sy);
-static void xw_free_slot(int slot);
-static bool point_in_slot(int slot, int x, int y);
-static void slot_rect(int slot, int *sx, int *sy, int *sw, int *sh);
 
 struct Capture {
     Display   *dpy         = nullptr;
@@ -42,7 +38,6 @@ struct Capture {
     int        gtk_x           = 0;
     int        gtk_y           = 0;
     Window     root_popup      = 0;
-    int        slot            = -1;
 
 
     struct PopupWin { Window x11_win; Pixmap pixmap; int x,y,w,h; bool visible; Damage damage; Visual *visual; };
@@ -80,7 +75,6 @@ struct bridgeState {
     Window   parent = 0;         // container window on :10
     Capture *cap    = nullptr;
     bool     placed = false;     // has the SWELL widget been put in its container
-    int      slot   = -1;        // layout slot on :10, released on teardown
     RECT     last_size_pos = {0,0,0,0}; // last hwnd->m_position xw_size actually acted on, see xw_size
     bool     has_last_size_pos = false;
     GtkWidget *embed_container = nullptr; // resolved once via xw_ensure_embed_widget, see xw_bridge_create/xw_size
@@ -549,8 +543,13 @@ static void canvas_add_popup(Capture *c, Window x11_win, XWindowAttributes *attr
                 (unsigned long)x11_win, attr->x, attr->y, attr->width, attr->height,
                 c->popup_canvas ? gtk_widget_get_visible(c->popup_canvas) : -1);
 
-    int slot_px = 0, slot_py = 0;
-    refresh_gtk_offset(c, &slot_px, &slot_py);
+    // Refresh the cached gtk offset before using it below. Without this,
+    // c->gtk_x/y is only whatever xw_size last stored, which can be stale
+    // when the plugin toplevel has moved (e.g. user drags a floating FX
+    // window) between size events. Removing this call while removing the
+    // slot code was a real bug -- side effect matters more than the out
+    // params ever did.
+    refresh_gtk_offset(c);
 
     if (!c->popup_canvas) create_popup_canvas(c);
 
@@ -575,8 +574,8 @@ static void canvas_add_popup(Capture *c, Window x11_win, XWindowAttributes *attr
     }
     pp->x = attr->x + c->gtk_x;
     pp->y = attr->y + c->gtk_y;
-    DEBUG_PRINT("[POPOFF] win=0x%lx attr=(%d,%d) slot_origin=(%d,%d) gtk=(%d,%d) -> pp=(%d,%d)\n",
-                (unsigned long)x11_win, attr->x, attr->y, slot_px, slot_py,
+    DEBUG_PRINT("[POPOFF] win=0x%lx attr=(%d,%d) gtk=(%d,%d) -> pp=(%d,%d)\n",
+                (unsigned long)x11_win, attr->x, attr->y,
                 c->gtk_x, c->gtk_y, pp->x, pp->y);
     pp->w = attr->width;
     pp->h = attr->height;
@@ -825,26 +824,11 @@ static void on_popup_mapped(Window w)
     if (!XGetWindowAttributes(g_wm_dpy, w, &attr) || attr.map_state != IsViewable)
         return;
 
-    DEBUG_PRINT("[SLOTATTR] win=0x%lx attr=(%d,%d)\n", (unsigned long)w, attr.x, attr.y);
-    for (auto &kv : g_captures) {
-        Capture *cand = kv.second;
-        if (!cand) continue;
-        int sx, sy, sw, sh;
-        slot_rect(cand->slot, &sx, &sy, &sw, &sh);
-        DEBUG_PRINT("[SLOTATTR]   candidate slot=%d rect=(%d,%d,%d,%d) contains=%d\n",
-                    cand->slot, sx, sy, sw, sh, point_in_slot(cand->slot, attr.x, attr.y));
-    }
-
-    for (auto &kv : g_captures) {
-        Capture *cand = kv.second;
-        if (cand && point_in_slot(cand->slot, attr.x, attr.y) &&
-            is_window_from_owned_plugin(cand->dpy, w, cand->gui_win)) {
-            DEBUG_PRINT("[SLOTATTR]   -> matched by slot, cand->slot=%d\n", cand->slot);
-            handle_new_window(w, cand, &attr);
-            return;
-        }
-    }
-    DEBUG_PRINT("[SLOTATTR]   -> no slot matched, falling back to PID-only\n");
+    // Match the newly-mapped window to its owning capture by PID. Override-redirect
+    // popups are not reparented under the plugin's own container, so there is no
+    // X11 hierarchy to walk back -- PID is the discriminator we have left. If two
+    // instances of the same plugin share one Wine host process they cannot be
+    // distinguished here; that's a known trade-off.
     for (auto &kv : g_captures) {
         Capture *cand = kv.second;
         if (cand && is_window_from_owned_plugin(cand->dpy, w, cand->gui_win)) {
@@ -1256,7 +1240,6 @@ static bool try_create_plugin(HWND hwnd)
 
              Capture *c = setup_capture(bs->disp, bs->parent, plugin_win, hwnd);
              c->widget = hwnd->m_oswidget;
-             c->slot = bs->slot;
 
              // Wine plugins nest a child GUI window; native plugins draw directly.
              Window gr, gp, *gk = nullptr; unsigned int gn = 0;
@@ -1293,7 +1276,6 @@ void xw_destroy(HWND hwnd)
         if (parent) gtk_container_remove(GTK_CONTAINER(parent), hwnd->m_oswidget);
     }
     if (bs->cap) cleanup_capture(bs->cap);
-    xw_free_slot(bs->slot);
     hwnd->m_private_data = 0;
     delete bs;
 }
@@ -1400,68 +1382,6 @@ static LRESULT xw_bridgeProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam)
     return 0;
 }
 
-// Every plugin container used to be created at (0,0), so on :10 they all stacked on
-// top of each other. Input is delivered with XTest, which goes to whatever window is
-// under the pointer -- so with the containers overlapping, every click landed on the
-// topmost one and only the last-opened plugin responded. That is the input "dead
-// zone". On a real display there is nowhere else to put them; on Xvfb's large virtual
-// framebuffer each plugin simply gets its own slot, and then the pointer genuinely is
-// over the intended window. Nothing on this display is ever visible, so the layout
-// only has to avoid overlap -- which also matters because overlapping windows lose
-// the occluded pixels when captured.
-#define XW_SLOT_W      2048
-#define XW_SLOT_H      1536
-#define XW_SLOT_COLS   3
-// No slot touches the screen edges. A knob near a plugin's top-left needs the pointer
-// to keep travelling up/left while dragging, and at origin (0,0) it just clamps at the
-// edge and stops producing motion, so the knob freezes. The margin gives every plugin
-// room on all sides -- free on a framebuffer this size.
-#define XW_SLOT_MARGIN 2048
-static unsigned int g_slot_used;   // bitmask of occupied slots
-
-static int xw_alloc_slot(int *sx, int *sy)
-{
-    for (int i = 0; i < 32; i++)
-    {
-        if (g_slot_used & (1u << i)) continue;
-        g_slot_used |= (1u << i);
-        *sx = XW_SLOT_MARGIN + (i % XW_SLOT_COLS) * XW_SLOT_W;
-        *sy = XW_SLOT_MARGIN + (i / XW_SLOT_COLS) * XW_SLOT_H;
-        return i;
-    }
-    *sx = *sy = XW_SLOT_MARGIN;   // out of slots: at least stay off the edges
-    return -1;
-}
-
-static void xw_free_slot(int slot)
-{
-    if (slot >= 0 && slot < 32) g_slot_used &= ~(1u << slot);
-}
-
-// Does a raw :10 position fall inside the rectangle a given slot owns? Used to tell
-// which instance a newly-mapped popup actually belongs to, since PID alone can't
-// distinguish multiple instances of the same plugin sharing one Wine host process
-// (see is_window_from_owned_plugin's caller in on_popup_mapped) and override-redirect
-// popups aren't reparented under the plugin's own container, so there's no X11
-// hierarchy to walk back either. The slot system already guarantees every instance a
-// unique, non-overlapping rectangle, so this is a reliable discriminator using
-// information we already have.
-static void slot_rect(int slot, int *sx, int *sy, int *sw, int *sh)
-{
-    *sx = (slot >= 0) ? (XW_SLOT_MARGIN + (slot % XW_SLOT_COLS) * XW_SLOT_W) : -1;
-    *sy = (slot >= 0) ? (XW_SLOT_MARGIN + (slot / XW_SLOT_COLS) * XW_SLOT_H) : -1;
-    *sw = XW_SLOT_W;
-    *sh = XW_SLOT_H;
-}
-
-static bool point_in_slot(int slot, int x, int y)
-{
-    if (slot < 0) return false;
-    int sx, sy, sw, sh;
-    slot_rect(slot, &sx, &sy, &sw, &sh);
-    return x >= sx && x < sx + sw && y >= sy && y < sy + sh;
-}
-
 HWND xw_bridge_create(HWND viewpar, void **wref, const RECT *r, const char *bridge_class_name)
 {
     HWND hwnd = nullptr;
@@ -1478,9 +1398,6 @@ HWND xw_bridge_create(HWND viewpar, void **wref, const RECT *r, const char *brid
     Window root = RootWindow(disp, screen);
     int w = wdl_max(r->right - r->left, 1);
     int h = wdl_max(r->bottom - r->top, 1);
-
-    int slot_x = 0, slot_y = 0;
-    const int slot = xw_alloc_slot(&slot_x, &slot_y);
 
     Window container = XCreateSimpleWindow(disp, root, 0, 0, w, h, 0,
                                            BlackPixel(disp, screen),
@@ -1500,7 +1417,6 @@ HWND xw_bridge_create(HWND viewpar, void **wref, const RECT *r, const char *brid
     bridgeState *bs = new bridgeState();
     bs->disp   = disp;
     bs->parent = container;
-    bs->slot   = slot;
     hwnd->m_private_data = (INT_PTR)bs;
 
     *wref = (void*)container;
