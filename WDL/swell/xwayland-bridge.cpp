@@ -4,10 +4,9 @@
 #define DEBUG_PRINT(...) ((void)0)
 #endif
 #include "xwayland-bridge.h"
-#include <X11/extensions/XShm.h>
-#include <sys/ipc.h>
-#include <sys/shm.h>
-
+#include <X11/extensions/Xcomposite.h>
+#include <X11/extensions/Xdamage.h>
+#include <cairo/cairo-xlib.h>
 void xw_size(HWND hwnd);
 
 XWaylandWM     *g_wm           = nullptr;
@@ -23,12 +22,11 @@ struct Capture {
     Window     parent_win  = 0;
     Window     plugin_win  = 0;
     Window     gui_win     = 0;
-    Pixmap     pixmap      = 0;
-    XImage         *shm_img      = nullptr;
-    XShmSegmentInfo shm_info     = {};
-    bool            shm_attached = false;
-    int             shm_w        = 0;
-    int             shm_h        = 0;
+    Pixmap     pixmap      = 0;      // XComposite-named window pixmap; refreshed on resize
+    int        pixmap_w    = 0;
+    int        pixmap_h    = 0;
+    Visual    *visual      = nullptr; // plugin_win's visual, cached for cairo_xlib_surface_create
+    int        depth       = 0;
     GtkWidget *widget      = nullptr;
     HWND       hwnd        = nullptr;
     //
@@ -88,70 +86,83 @@ struct bridgeState {
     GtkWidget *embed_container = nullptr; // resolved once via xw_ensure_embed_widget, see xw_bridge_create/xw_size
 };
 
-static void destroy_shm(Capture *c)
+// Refresh the composite-named window pixmap after the plugin window has been
+// (re)configured. Automatic redirection means the X server keeps drawing the
+// window off-screen; we sample it via XCompositeNameWindowPixmap and render
+// with cairo's xlib backend. The pixmap handle becomes invalid on every
+// resize, so we re-name it whenever the size we saw changes.
+static bool ensure_pixmap(Capture *c, int w, int h)
 {
-    if (c->shm_img) {
-        if (c->shm_attached && c->dpy) XShmDetach(c->dpy, &c->shm_info);
-        if (c->shm_info.shmaddr) shmdt(c->shm_info.shmaddr);
-        c->shm_img->data = nullptr;     // shm memory, not malloc'd -- don't let Xlib free it
-        XDestroyImage(c->shm_img);
-        c->shm_img = nullptr;
+    if (c->pixmap && c->pixmap_w == w && c->pixmap_h == h) return true;
+
+    if (!c->visual) {
+        XWindowAttributes wa;
+        if (!XGetWindowAttributes(c->dpy, c->plugin_win, &wa)) return false;
+        c->visual = wa.visual;
+        c->depth  = wa.depth;
     }
-    c->shm_info.shmaddr = nullptr;
-    c->shm_info.shmid   = -1;
-    c->shm_attached = false;
-    c->shm_w = c->shm_h = 0;
+
+    // Order matters: flush any pending server-side resize first, then rename.
+    // Otherwise the newly-named pixmap gets invalidated by the resize we just
+    // missed and the next free hits BadPixmap.
+    XFlush(c->dpy);
+
+    Pixmap old = c->pixmap;
+    c->pixmap  = XCompositeNameWindowPixmap(c->dpy, c->plugin_win);
+    if (old) XFreePixmap(c->dpy, old);
+
+    c->pixmap_w = w;
+    c->pixmap_h = h;
+    return c->pixmap != 0;
 }
 
-// (Re)allocate the shared-memory image when the plugin's size changes.
-static bool ensure_shm(Capture *c, int w, int h)
+static void destroy_pixmap(Capture *c)
 {
-    if (c->shm_img && c->shm_w == w && c->shm_h == h) return true;
-    destroy_shm(c);
-    if (w <= 0 || h <= 0) return false;
+    if (!c) return;
+    if (c->pixmap && c->dpy) { XFreePixmap(c->dpy, c->pixmap); c->pixmap = 0; }
+    c->pixmap_w = c->pixmap_h = 0;
+}
 
-    const int screen = DefaultScreen(c->dpy);
-    Visual *vis      = DefaultVisual(c->dpy, screen);
-    const int depth  = DefaultDepth(c->dpy, screen);
+// Unconditional composite-pixmap rename. Called whenever we know the pixmap
+// handle is about to become invalid (resize) or already has. Does not skip on
+// unchanged size -- ensure_pixmap does that when size is the guarantee we
+// have; refresh_pixmap is the one to use when the caller knows a resize is in
+// flight.
+static void refresh_pixmap(Capture *c)
+{
+    if (!c || !c->dpy || !c->plugin_win) return;
 
-    c->shm_img = XShmCreateImage(c->dpy, vis, depth, ZPixmap, nullptr, &c->shm_info, w, h);
-    if (!c->shm_img) return false;
+    // Flush any pending server-side resize before naming, otherwise the
+    // freshly-named pixmap gets invalidated by the resize we just missed and
+    // the next XFreePixmap hits BadPixmap.
+    XFlush(c->dpy);
 
-    c->shm_info.shmid = shmget(IPC_PRIVATE,
-                               (size_t)c->shm_img->bytes_per_line * c->shm_img->height,
-                               IPC_CREAT | 0600);
-    if (c->shm_info.shmid < 0) { XDestroyImage(c->shm_img); c->shm_img = nullptr; return false; }
+    Pixmap old = c->pixmap;
+    c->pixmap  = XCompositeNameWindowPixmap(c->dpy, c->plugin_win);
+    if (old) XFreePixmap(c->dpy, old);
 
-    c->shm_info.shmaddr  = c->shm_img->data = (char*)shmat(c->shm_info.shmid, nullptr, 0);
-    c->shm_info.readOnly = False;
-    if (c->shm_info.shmaddr == (char*)-1) {
-        shmctl(c->shm_info.shmid, IPC_RMID, nullptr);
-        c->shm_info.shmaddr = nullptr;
-        c->shm_img->data = nullptr;
-        XDestroyImage(c->shm_img); c->shm_img = nullptr;
-        return false;
+    // Track size for ensure_pixmap's fast path.
+    XWindowAttributes wa;
+    if (XGetWindowAttributes(c->dpy, c->plugin_win, &wa)) {
+        c->pixmap_w = wa.width;
+        c->pixmap_h = wa.height;
+        if (!c->visual) { c->visual = wa.visual; c->depth = wa.depth; }
     }
-    if (!XShmAttach(c->dpy, &c->shm_info)) { destroy_shm(c); return false; }
-    XSync(c->dpy, False);
-    shmctl(c->shm_info.shmid, IPC_RMID, nullptr);
-    c->shm_info.shmid = -1;
 
-    c->shm_attached = true;
-    c->shm_w = w;
-    c->shm_h = h;
-    return true;
+    if (c->widget && GTK_IS_WIDGET(c->widget)) gtk_widget_queue_draw(c->widget);
 }
 
 static bool on_draw(GtkWidget *, cairo_t *cr, gpointer data)
 {
     Capture *c = (Capture*)data;
-    if (!c || !c->shm_img || !c->shm_img->data) return FALSE;
+    if (!c || !c->pixmap || !c->visual) return FALSE;
 
-    cairo_surface_t *surf =
-        cairo_image_surface_create_for_data((unsigned char*)c->shm_img->data,
-                                            CAIRO_FORMAT_RGB24,
-                                            c->shm_img->width, c->shm_img->height,
-                                            c->shm_img->bytes_per_line);
+    // Wrap the composite-named pixmap directly as a cairo xlib surface --
+    // no capture/copy step. The X server keeps this pixmap in sync with the
+    // off-screen plugin window because we requested Automatic redirection.
+    cairo_surface_t *surf = cairo_xlib_surface_create(c->dpy, c->pixmap,
+                                                      c->visual,
+                                                      c->pixmap_w, c->pixmap_h);
     if (surf) {
         if (cairo_surface_status(surf) == CAIRO_STATUS_SUCCESS) {
             cairo_set_source_surface(cr, surf, 0, 0);
@@ -159,7 +170,6 @@ static bool on_draw(GtkWidget *, cairo_t *cr, gpointer data)
         }
         cairo_surface_destroy(surf);
     }
-
     return TRUE;
 }
 
@@ -314,9 +324,22 @@ static Capture* setup_capture(Display *dpy, Window parent_win, Window plugin_win
     c->plugin_win = plugin_win;
     c->hwnd       = hwnd;
 
-    XSetWindowAttributes swa;
-    swa.backing_store = Always;
-    XChangeWindowAttributes(dpy, plugin_win, CWBackingStore, &swa);
+    // Automatic composite redirection: the X server keeps drawing the plugin
+    // window off-screen (it never has to be visible in root), and we sample
+    // the resulting pixmap via XCompositeNameWindowPixmap. This is what the
+    // pre-Xvfb bridge used, and it sidesteps the Wine input regression that
+    // occurs when two Wine top-levels share the same X coordinates -- with
+    // Automatic redirect the plugin windows never contest hit-testing at all.
+    XCompositeRedirectWindow(dpy, plugin_win, CompositeRedirectAutomatic);
+
+    // Cache the visual/depth once so on_draw does not have to XGetWindowAttributes
+    // every frame.
+    XWindowAttributes wa;
+    if (XGetWindowAttributes(dpy, plugin_win, &wa)) {
+        c->visual = wa.visual;
+        c->depth  = wa.depth;
+        ensure_pixmap(c, wa.width, wa.height);
+    }
 
     int base, err;
     if (g_wm_dpy && XDamageQueryExtension(g_wm_dpy, &base, &err)) {
@@ -327,8 +350,8 @@ static Capture* setup_capture(Display *dpy, Window parent_win, Window plugin_win
     XFlush(dpy);
 
     register_capture(c);
-    DEBUG_PRINT("[XW] setup parent=0x%lx plugin=0x%lx (xshm)\n",
-                parent_win, plugin_win);
+    DEBUG_PRINT("[XW] setup parent=0x%lx plugin=0x%lx (auto-composite, pixmap=0x%lx)\n",
+                parent_win, plugin_win, (unsigned long)c->pixmap);
     return c;
 }
 
@@ -336,8 +359,7 @@ static void cleanup_capture(Capture *c)
 {
     if (!c) return;
     unregister_capture(c);
-    destroy_shm(c);
-    if (c->pixmap) XFreePixmap(c->dpy, c->pixmap);
+    destroy_pixmap(c);
     Display *d = c->dpy;
     c->dpy = nullptr;
     if (d) XCloseDisplay(d);
@@ -532,7 +554,7 @@ static void canvas_add_popup(Capture *c, Window x11_win, XWindowAttributes *attr
 
     if (!c->popup_canvas) create_popup_canvas(c);
 
-    XCompositeRedirectWindow(c->dpy, x11_win, CompositeRedirectManual);
+    XCompositeRedirectWindow(c->dpy, x11_win, CompositeRedirectAutomatic);
     XFlush(c->dpy);
     Pixmap pixmap = XCompositeNameWindowPixmap(c->dpy, x11_win);
 
@@ -683,7 +705,7 @@ static void create_modal(Capture *state, Window win, XWindowAttributes *attr)
     for (auto &m : state->modals) if (m.x11_win == win) return;
 
     Display *dpy = state->dpy;
-    XCompositeRedirectWindow(dpy, win, CompositeRedirectManual);
+    XCompositeRedirectWindow(dpy, win, CompositeRedirectAutomatic);
     XFlush(dpy);
     Pixmap pm = XCompositeNameWindowPixmap(dpy, win);
 
@@ -892,21 +914,21 @@ static void handle_damage_notify(XDamageNotifyEvent *de)
 
     XDamageSubtract(g_wm_dpy, de->damage, None, None);
 
-    auto update_capture_buffer = [](Capture *c) -> bool {
+    // With Automatic redirection there is no capture step: the X server keeps
+    // the composite pixmap in sync. All we need to do on damage is (a) refresh
+    // the pixmap handle if the window has been resized (the handle becomes
+    // invalid on every resize), and (b) tell GTK to redraw the affected area.
+    auto refresh_pixmap_if_resized = [](Capture *c) -> bool {
         if (!c || !c->dpy || !c->plugin_win) return false;
-
         XWindowAttributes wa;
         if (!XGetWindowAttributes(c->dpy, c->plugin_win, &wa)) return false;
         if (wa.width <= 0 || wa.height <= 0) return false;
-        if (!ensure_shm(c, wa.width, wa.height)) return false;
-
-        return XShmGetImage(c->dpy, c->plugin_win, c->shm_img, 0, 0, AllPlanes);
+        return ensure_pixmap(c, wa.width, wa.height);
     };
 
     Capture *c = find_capture(de->drawable);
     if (c && c->widget && GTK_IS_WIDGET(c->widget)) {
-        // Update the buffer from the X Server immediately before scheduling the GTK draw
-        if (update_capture_buffer(c)) {
+        if (refresh_pixmap_if_resized(c)) {
             gtk_widget_queue_draw_area(c->widget, de->area.x, de->area.y,
                                        de->area.width, de->area.height);
         }
@@ -932,10 +954,24 @@ static void handle_damage_notify(XDamageNotifyEvent *de)
         for (auto &md : cc->modals) {
             if (md.x11_win == de->drawable) {
                 if (md.draw && GTK_IS_WIDGET(md.draw)) {
-                    if (update_capture_buffer(cc)) {
-                        gtk_widget_queue_draw_area(md.draw, de->area.x, de->area.y,
-                                                   de->area.width, de->area.height);
+                    // Refresh the modal's OWN pixmap if the modal window was
+                    // resized (composite pixmap becomes invalid on every
+                    // resize). Then just tell GTK to redraw the damaged area
+                    // -- with Automatic redirection the pixmap stays live on
+                    // its own; no explicit capture step needed.
+                    XWindowAttributes wa;
+                    if (XGetWindowAttributes(cc->dpy, md.x11_win, &wa)
+                        && wa.width > 0 && wa.height > 0) {
+                        if (md.w != wa.width || md.h != wa.height || md.pixmap == 0) {
+                            if (md.pixmap) XFreePixmap(cc->dpy, md.pixmap);
+                            XFlush(cc->dpy);
+                            md.pixmap = XCompositeNameWindowPixmap(cc->dpy, md.x11_win);
+                            md.w = wa.width;
+                            md.h = wa.height;
+                        }
                     }
+                    gtk_widget_queue_draw_area(md.draw, de->area.x, de->area.y,
+                                               de->area.width, de->area.height);
                 }
                 return;
             }
@@ -1292,7 +1328,16 @@ void xw_size(HWND hwnd)
         r.left != bs->last_size_pos.left || r.top != bs->last_size_pos.top ||
         r.right != bs->last_size_pos.right || r.bottom != bs->last_size_pos.bottom;
 
+    // Re-capture the pixmap at the new size -- xw_size runs exactly when the
+    // window is being resized, so the backing pixmap must be refreshed here.
+    // Refresh BEFORE XResizeWindow, matching pre_xvfb's ordering: refresh_pixmap
+    // flushes and re-names, so we snapshot the current server-side state, then
+    // the resize proceeds; the next Damage event will bring the next refresh.
+    // Guard on bs->cap: WM_SIZE/SetWindowPos can fire before the plugin is
+    // captured (e.g. during an FX-list swap), and the container resize also
+    // needs a live capture.
     if (bs->cap && size_changed) {
+        refresh_pixmap(bs->cap);
         XResizeWindow(bs->cap->dpy, bs->cap->parent_win, w, h);
         XFlush(bs->cap->dpy);
     }
@@ -1437,7 +1482,7 @@ HWND xw_bridge_create(HWND viewpar, void **wref, const RECT *r, const char *brid
     int slot_x = 0, slot_y = 0;
     const int slot = xw_alloc_slot(&slot_x, &slot_y);
 
-    Window container = XCreateSimpleWindow(disp, root, slot_x, slot_y, w, h, 0,
+    Window container = XCreateSimpleWindow(disp, root, 0, 0, w, h, 0,
                                            BlackPixel(disp, screen),
                                            WhitePixel(disp, screen));
     XMapWindow(disp, container);
