@@ -267,26 +267,78 @@ static bool on_scroll(GtkWidget *, GdkEventScroll *e, gpointer data)
     return true;
 }
 
-bool on_enter(GtkWidget *widget, GdkEventCrossing *event, gpointer data)
+// The currently-active capture, i.e. the plugin the user is actually
+// interacting with. Driven by the compositor's own focus signal on our top-
+// level (GTK's notify::is-active), not by X11 EnterNotify on :10 -- pointer
+// crossings on :10 are noise that fire even when the compositor hasn't given
+// us focus at all.
+Capture *g_active_capture = nullptr;
+
+// Compositor told GTK that our top-level's is-active state changed. Under
+// normal Wayland behaviour is-active only becomes true when the user has
+// actually clicked/focused the window, so this is the right signal for
+// "user wants to interact with this plugin".
+//
+// In floating mode there's one capture per top-level, so this is exact. In
+// embedded mode (FX chain) all captures share one top-level, so is-active
+// tells us "someone in this group is active"; we set g_active_capture to
+// whichever capture the signal fired for and last-wins. That's fine because
+// only one plugin is genuinely being interacted with at a time.
+// Does this capture have an open modal? Modals are heavyweight -- a real
+// dialog window the user is filling in -- so focus changes must NOT flip
+// g_active_capture while one is up. Popups deliberately do NOT lock: clicking
+// on another plugin while a menu is up is a legitimate "dismiss and switch"
+// gesture, matching menu behaviour everywhere else. Menus close on focus loss
+// on their own.
+static bool has_live_ui(Capture *c)
+{
+    return c && !c->modals.empty();
+}
+
+static void on_toplevel_active(GObject *obj, GParamSpec *, gpointer data)
 {
     Capture *c = (Capture*)data;
-    GdkWindow *gw = gtk_widget_get_window(widget);
-    if (gw) {
-        GdkCursor *cur = gdk_cursor_new_from_name(gdk_window_get_display(gw), "default");
-        gdk_window_set_cursor(gw, cur);
-        if (cur) g_object_unref(cur);
+    if (!c) return;
+
+    gboolean active = FALSE;
+    g_object_get(obj, "is-active", &active, NULL);
+
+    if (active) {
+        // Don't steal active from a capture that is mid-interaction with the
+        // user (menu up / modal open). Its own is-active is temporarily false
+        // because the popup canvas or modal toplevel took focus; that's not a
+        // genuine "user moved to a different plugin" event.
+        if (g_active_capture && g_active_capture != c && has_live_ui(g_active_capture))
+            return;
+
+        g_active_capture = c;
+        // Update cursor + raise on real activation only, not on hover noise.
+        if (c->widget) {
+            GdkWindow *gw = gtk_widget_get_window(c->widget);
+            if (gw) {
+                GdkCursor *cur = gdk_cursor_new_from_name(gdk_window_get_display(gw), "default");
+                gdk_window_set_cursor(gw, cur);
+                if (cur) g_object_unref(cur);
+            }
+        }
+        if (c->dpy && c->parent_win) {
+            XRaiseWindow(c->dpy, c->parent_win);
+            XFlush(c->dpy);
+        }
+        xw_raise_modals();
+    } else if (g_active_capture == c) {
+        // Don't drop active while our own popup/modal is up -- the compositor
+        // is just handing focus to the popup canvas / modal we spawned, not
+        // telling us the user is done with this plugin.
+        if (has_live_ui(c)) return;
+        g_active_capture = nullptr;
     }
-    XRaiseWindow(c->dpy, c->parent_win);
-    XFlush(c->dpy);
-    xw_raise_modals();
-    return false;
 }
 
 static void connect_widget(Capture *c)
 {
     if (!c->widget) return;
     gtk_widget_add_events(c->widget,
-                          GDK_ENTER_NOTIFY_MASK |
                           GDK_POINTER_MOTION_MASK |
                           GDK_BUTTON_PRESS_MASK |
                           GDK_BUTTON_RELEASE_MASK |
@@ -301,7 +353,13 @@ static void connect_widget(Capture *c)
         if (settings) g_object_set(settings, "gtk-enable-animations", FALSE, NULL);
     }
 
-    g_signal_connect(c->widget, "enter-notify-event",   G_CALLBACK(on_enter), c);
+    // Track compositor focus on the top-level -- this is the real "user is
+    // interacting with this plugin" signal, not X11 EnterNotify.
+    GtkWidget *toplevel = gtk_widget_get_toplevel(c->widget);
+    if (toplevel && GTK_IS_WINDOW(toplevel))
+        g_signal_connect(toplevel, "notify::is-active",
+                         G_CALLBACK(on_toplevel_active), c);
+
     g_signal_connect(c->widget, "draw",                 G_CALLBACK(on_draw),           c);
     g_signal_connect(c->widget, "button-press-event",   G_CALLBACK(on_button_press),   c);
     g_signal_connect(c->widget, "button-release-event", G_CALLBACK(on_button_release), c);
@@ -344,6 +402,11 @@ static Capture* setup_capture(Display *dpy, Window parent_win, Window plugin_win
     XFlush(dpy);
 
     register_capture(c);
+    // A newly-created plugin is always the last one the user acted on -- opening
+    // it is itself the "activate" action -- so treat it as the active capture
+    // immediately. notify::is-active keeps this in sync afterwards; this just
+    // avoids a race between plugin map and the compositor's focus decision.
+    g_active_capture = c;
     DEBUG_PRINT("[XW] setup parent=0x%lx plugin=0x%lx (auto-composite, pixmap=0x%lx)\n",
                 parent_win, plugin_win, (unsigned long)c->pixmap);
     return c;
@@ -352,6 +415,7 @@ static Capture* setup_capture(Display *dpy, Window parent_win, Window plugin_win
 static void cleanup_capture(Capture *c)
 {
     if (!c) return;
+    if (g_active_capture == c) g_active_capture = nullptr;
     unregister_capture(c);
     destroy_pixmap(c);
     Display *d = c->dpy;
@@ -824,11 +888,26 @@ static void on_popup_mapped(Window w)
     if (!XGetWindowAttributes(g_wm_dpy, w, &attr) || attr.map_state != IsViewable)
         return;
 
-    // Match the newly-mapped window to its owning capture by PID. Override-redirect
-    // popups are not reparented under the plugin's own container, so there is no
-    // X11 hierarchy to walk back -- PID is the discriminator we have left. If two
-    // instances of the same plugin share one Wine host process they cannot be
-    // distinguished here; that's a known trade-off.
+    // Match the newly-mapped window to its owning capture.
+    //
+    // Only the ACTIVE plugin can spawn popups. The user has to interact with a
+    // plugin for it to open a menu / dialog, and "interact" implies the
+    // compositor gave that plugin focus, which is what g_active_capture tracks.
+    // Preferring it over PID first solves the multi-instance case: two copies
+    // of the same plugin under one Wine host share a PID, so PID-only matching
+    // would misattribute the popup to whichever capture the map iterates over
+    // first.
+    //
+    // Still verify the PID relationship: if the active capture's PID doesn't
+    // own this window, this popup is unrelated to it and we fall through to
+    // the PID loop as a safety net (e.g. popups that appear without a prior
+    // focus event).
+    if (g_active_capture &&
+        is_window_from_owned_plugin(g_active_capture->dpy, w, g_active_capture->gui_win)) {
+        handle_new_window(w, g_active_capture, &attr);
+        return;
+    }
+
     for (auto &kv : g_captures) {
         Capture *cand = kv.second;
         if (cand && is_window_from_owned_plugin(cand->dpy, w, cand->gui_win)) {
