@@ -24,6 +24,7 @@ struct Capture {
     Visual    *visual      = nullptr; // plugin_win's visual, cached for cairo_xlib_surface_create
     int        depth       = 0;
     GtkWidget *widget      = nullptr;
+    GtkWidget *active_toplevel = nullptr; // toplevel we hooked notify::is-active on; disconnected in cleanup
     HWND       hwnd        = nullptr;
     //
     Damage     damage      = 0;
@@ -69,6 +70,14 @@ static Capture* find_capture(Window w)
     auto it = g_captures.find(w);
     return it != g_captures.end() ? it->second : nullptr;
 }
+
+// The currently-active capture, i.e. the plugin the user is actually
+// interacting with. Set eagerly on button-press (before we forward the click
+// to X, so a synchronously-mapped popup doesn't race us) and by the
+// compositor's own focus signal on our top-level (GTK's notify::is-active)
+// for the general case.
+Capture *g_active_capture = nullptr;
+
 
 struct bridgeState {
     Display *disp   = nullptr;   // this plugin's connection to :10
@@ -207,6 +216,13 @@ static bool on_button_press(GtkWidget *widget, GdkEventButton *e, gpointer data)
         xw_raise_modals();
         return true;
     }
+    // Update active BEFORE forwarding the click. The plugin may synchronously
+    // spawn a popup in response, and if we relied on notify::is-active to
+    // update g_active_capture that signal wouldn't have fired yet -- the popup
+    // would map first and be misattributed to the previously-active capture.
+    // Button-press is the earliest reliable "user just started interacting
+    // with THIS plugin" signal we have.
+    g_active_capture = c;
     if (c->hwnd) SetFocus(c->hwnd);
     forward_motion(c, (int)e->x, (int)e->y);
     XTestFakeButtonEvent(c->dpy, e->button, True, CurrentTime);
@@ -267,12 +283,6 @@ static bool on_scroll(GtkWidget *, GdkEventScroll *e, gpointer data)
     return true;
 }
 
-// The currently-active capture, i.e. the plugin the user is actually
-// interacting with. Driven by the compositor's own focus signal on our top-
-// level (GTK's notify::is-active), not by X11 EnterNotify on :10 -- pointer
-// crossings on :10 are noise that fire even when the compositor hasn't given
-// us focus at all.
-Capture *g_active_capture = nullptr;
 
 // Compositor told GTK that our top-level's is-active state changed. Under
 // normal Wayland behaviour is-active only becomes true when the user has
@@ -356,9 +366,13 @@ static void connect_widget(Capture *c)
     // Track compositor focus on the top-level -- this is the real "user is
     // interacting with this plugin" signal, not X11 EnterNotify.
     GtkWidget *toplevel = gtk_widget_get_toplevel(c->widget);
-    if (toplevel && GTK_IS_WINDOW(toplevel))
+    if (toplevel && GTK_IS_WINDOW(toplevel)) {
         g_signal_connect(toplevel, "notify::is-active",
                          G_CALLBACK(on_toplevel_active), c);
+        c->active_toplevel = toplevel;
+        g_object_add_weak_pointer(G_OBJECT(toplevel),
+                                  (gpointer*)&c->active_toplevel);
+    }
 
     g_signal_connect(c->widget, "draw",                 G_CALLBACK(on_draw),           c);
     g_signal_connect(c->widget, "button-press-event",   G_CALLBACK(on_button_press),   c);
@@ -416,6 +430,17 @@ static void cleanup_capture(Capture *c)
 {
     if (!c) return;
     if (g_active_capture == c) g_active_capture = nullptr;
+    // Disconnect notify::is-active BEFORE freeing the capture -- the toplevel
+    // (REAPER's main window in embedded/FX-list mode) outlives us, and the
+    // compositor routinely changes focus during an FX swap. Without this, the
+    // signal fires with a dangling Capture* and gtk_widget_get_window(c->widget)
+    // asserts.
+    if (c->active_toplevel && GTK_IS_WIDGET(c->active_toplevel)) {
+        g_signal_handlers_disconnect_by_data(c->active_toplevel, c);
+        g_object_remove_weak_pointer(G_OBJECT(c->active_toplevel),
+                                     (gpointer*)&c->active_toplevel);
+        c->active_toplevel = nullptr;
+    }
     unregister_capture(c);
     destroy_pixmap(c);
     Display *d = c->dpy;
