@@ -212,8 +212,8 @@ void XWaylandWM::announce_wm(Window support_win) {
     if (XGetWindowProperty(dpy_, root, atoms_._NET_SUPPORTING_WM_CHECK,
                            0, 1, False, XA_WINDOW,
                            &actual, &fmt, &n, &left, &data) == Success && data) {
-        Window set_win = *(Window*)data;
-        DEBUG_PRINT("[WM] _NET_SUPPORTING_WM_CHECK verified: 0x%lx\n", set_win);
+        DEBUG_PRINT("[WM] _NET_SUPPORTING_WM_CHECK verified: 0x%lx\n",
+                    (unsigned long)*(Window*)data);
         XFree(data);
     } else {
         DEBUG_PRINT("[WM] _NET_SUPPORTING_WM_CHECK NOT SET - announce failed\n");
