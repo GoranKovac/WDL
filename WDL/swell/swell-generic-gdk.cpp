@@ -1577,6 +1577,10 @@ int title_h = 0, bw = 0;
     LICE_IBitmap *bm = hwnd->m_backingstore;
     cairo_surface_t *temp_surface = (cairo_surface_t*)bm->Extended(0xca140,NULL);
     if (temp_surface) cairo_set_source_surface(crc, temp_surface, bw, title_h + bw);
+#ifdef SWELL_TARGET_WAYLAND
+    // Do NEAREST filtering to fix blur on OS scaling
+    cairo_pattern_set_filter(cairo_get_source(crc), CAIRO_FILTER_NEAREST);
+#endif
     cairo_paint(crc);
     cairo_destroy(crc);
     if (temp_surface) bm->Extended(0xca140,temp_surface); // release
