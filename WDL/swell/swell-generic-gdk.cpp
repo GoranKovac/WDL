@@ -250,7 +250,7 @@ static HWND s_wayland_active_tooltip;
 // Last real toplevel the pointer was over, recorded in OnMotionEvent. Tooltips have
 // no parent/owner, so this is what tells us which window a tooltip belongs to.
 // Stored as the OS window (re-resolved on use) so a destroyed window can't dangle.
-static SWELL_OSWINDOW s_last_hover_oswindow;
+SWELL_OSWINDOW s_last_hover_oswindow;
 bool PopupMenuIsActive();
 
 static SWELL_OSWINDOW s_armed_drag_oswindow;
