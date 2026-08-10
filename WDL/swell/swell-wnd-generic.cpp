@@ -7034,6 +7034,14 @@ static HWND recurseOwnedWindowHitTest(HWND h, POINT p, int maxdepth)
 HWND WindowFromPoint(POINT p)
 {
 #ifdef SWELL_TARGET_WAYLAND
+  // imgui fix
+  extern HWND g_wayland_hovered_hwnd;
+  if (g_wayland_hovered_hwnd)
+  {
+    HWND child = ChildWindowFromPoint(g_wayland_hovered_hwnd, p);
+    return child ? child : g_wayland_hovered_hwnd;
+  }
+
   SWELL_OSWINDOW hov = s_last_hover_oswindow;
   if (hov)
   {
@@ -7059,6 +7067,9 @@ HWND WindowFromPoint(POINT p)
   return NULL;
 #endif
 }
+
+
+
 
 #ifdef _DEBUG
 int g_swell_in_paint;

@@ -89,6 +89,24 @@ static guint32 _gdk_x11_window_get_desktop(GdkWindow *window)
   return (guint32) nitems;
 }
 
+HWND g_wayland_hovered_hwnd = NULL;
+
+gboolean swell_wayland_handle_hover_enter(GtkWidget *widget, GdkEventCrossing *event, gpointer user_data)
+{
+  HWND hwnd = (HWND)user_data;
+  if (!hwnd) return FALSE;
+
+  if (event->type == GDK_ENTER_NOTIFY) 
+  {
+    g_wayland_hovered_hwnd = hwnd;
+  } 
+  else if (event->type == GDK_LEAVE_NOTIFY) 
+  {
+    if (g_wayland_hovered_hwnd == hwnd) 
+      g_wayland_hovered_hwnd = NULL;
+  }
+  return FALSE;
+}
 static void _gdk_x11_window_move_to_desktop(GdkWindow *window, guint32 desktop)
 {
   XClientMessageEvent xclient;
@@ -364,6 +382,7 @@ void swell_oswindow_destroy(HWND hwnd)
     if (s_wayland_active_tooltip == hwnd) s_wayland_active_tooltip = NULL;
     if (s_last_hover_oswindow && s_last_hover_oswindow == hwnd->m_oswindow)
       s_last_hover_oswindow = NULL;
+    if (g_wayland_hovered_hwnd == hwnd) g_wayland_hovered_hwnd = NULL;
 #endif
     if (g_swell_touchptr && g_swell_touchptr_wnd == hwnd->m_oswindow)
       g_swell_touchptr = NULL;
@@ -799,14 +818,10 @@ void swell_oswindow_manage(HWND hwnd, bool wantfocus)
         bool is_popup_menu = (hwnd->m_classname && strcmp(hwnd->m_classname, "__SWELL_MENU") == 0);
         bool is_tooltip = (!hwnd->m_parent && !hwnd->m_owner && (hwnd->m_style & WS_CHILD) && (!hwnd->m_title.Get() || !hwnd->m_title.Get()[0]));
 
-        // REAPER's dock drag preview is indistinguishable from a tooltip at creation
-        // time (same class, empty title, WS_CHILD), but unlike a tooltip it has to
-        // move: gdk_window_move_to_rect() below makes a real xdg_popup, whose position
-        // is fixed by its positioner when it maps and cannot be changed afterwards
-        // (GTK3 has no xdg_popup.reposition), so the preview froze wherever it first
-        // appeared while REAPER kept issuing moves. Keeping it off that path leaves it
-        // a subsurface, which gdk_window_move can still reposition. A drag always
-        // holds the mouse capture; a hover tooltip never does.
+        // Imgui fix
+        bool is_interactive_popup = (hwnd->m_style & WS_CHILD) && hwnd->m_owner;
+        if (is_interactive_popup) is_popup_menu = true;
+
         const bool is_drag_preview = is_tooltip && GetCapture() != NULL;
 
         bool is_splash = (!hwnd->m_parent && !hwnd->m_owner &&
@@ -938,6 +953,8 @@ void swell_oswindow_manage(HWND hwnd, bool wantfocus)
           popup_parent_hwnd = parent_hwnd;
         }
 
+        g_signal_connect(G_OBJECT(gtk_win), "enter-notify-event", G_CALLBACK(swell_wayland_handle_hover_enter), hwnd);
+        g_signal_connect(G_OBJECT(gtk_win), "leave-notify-event", G_CALLBACK(swell_wayland_handle_hover_enter), hwnd);
         gtk_widget_realize(gtk_win);
 
         // gtk_window_move is not constrained to the screen,
