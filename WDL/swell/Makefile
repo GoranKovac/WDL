@@ -111,6 +111,9 @@ OBJS = $(SWELL_OBJS)
 #Wayland (SWELL_TARGET_WAYLAND) depends on GTK3 so load it automatically
 ifdef WAYLAND
   override SWELL_GDK_ONLY =
+  # spare-window for modal dialogs doesn't resize on an already 
+	# mapped Wayland so disable it
+  CFLAGS += -DSWELL_NO_SPARE_MODALDLG
 endif
 
 ifndef NOGDK
