@@ -441,7 +441,11 @@ void swell_recalcMinMaxInfo(HWND hwnd)
   if (!hwnd || !hwnd->m_oswindow || !(hwnd->m_style & WS_CAPTION)) return;
 #ifdef SWELL_TARGET_WAYLAND
   // ALLOWS PLUGIN AUTO RESIZING!!!!!
-  if (GetProp(hwnd, "SWELL_XW_BRIDGE_PLUGIN") == (HANDLE)(INT_PTR)1) return;
+  if (GetProp(hwnd, "SWELL_XW_BRIDGE_PLUGIN") == (HANDLE)(INT_PTR)1)
+  {
+    SetProp(hwnd, "SWELL_XW_BRIDGE_PLUGIN", (HANDLE)(INT_PTR)0);
+    return;
+  }
 #endif
   MINMAXINFO mmi;
   memset(&mmi,0,sizeof(mmi));
