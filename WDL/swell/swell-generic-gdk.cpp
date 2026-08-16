@@ -881,7 +881,6 @@ void swell_oswindow_manage(HWND hwnd, bool wantfocus)
           gh.min_height = gh.max_height = rh;
           gtk_window_set_geometry_hints(GTK_WINDOW(gtk_win), NULL, &gh,
             (GdkWindowHints)(GDK_HINT_MIN_SIZE | GDK_HINT_MAX_SIZE));
-          SetProp(hwnd, "SWELL_SizePinned", (HANDLE)(INT_PTR)1);
         }
 
         // Tooltip and a menu can't both be showed at same time,
@@ -1648,17 +1647,6 @@ static void OnConfigureEvent(GdkEventConfigure *cfg)
   hwnd->m_position.bottom = cfg_y + cfg_height;
   if (flag&1) SendMessage(hwnd,WM_MOVE,0,0);
   if (flag&2) SendMessage(hwnd,WM_SIZE,hwnd->m_is_maximized ? SIZE_MAXIMIZED : SIZE_RESTORED,0);
-#ifdef SWELL_TARGET_WAYLAND
-  //NOTE: NOT SURE IF NEEDED WORKS FINE WITHOUT IT!!!
-  // Release the creation-time size pin now that the window has been mapped at its
-  // restored size. Do it on the first configure only. After this the window is
-  // freely resizable (recalcMinMaxInfo below re-applies the real min/max limits).
-  if (GetProp(hwnd, "SWELL_SizePinned") && hwnd->m_oswidget && GTK_IS_WINDOW(hwnd->m_oswidget))
-  {
-    RemoveProp(hwnd, "SWELL_SizePinned");
-    gtk_window_set_geometry_hints(GTK_WINDOW(hwnd->m_oswidget), NULL, NULL, (GdkWindowHints)0);
-  }
-#endif
 #ifdef SWELL_TARGET_WAYLAND
   // Prevent modal windows to be resized manually (broken when fixed windows to remember previous size)
   if (!hwnd->m_hashaddestroy && hwnd->m_oswindow)
