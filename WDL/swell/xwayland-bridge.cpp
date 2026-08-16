@@ -1442,26 +1442,6 @@ void xw_size(HWND hwnd)
     }
 
     if (size_changed) {
-        if (top && top->m_oswidget && GTK_IS_WINDOW(top->m_oswidget)) {
-            GtkWidget *tl_win = (GtkWidget*)top->m_oswidget;
-            SetProp(top, "SWELL_XW_BRIDGE_PLUGIN", (HANDLE)(INT_PTR)0);
-            int target_w = pos_x + w;
-            int target_h = pos_y + h;
-            if (target_w < 1) target_w = 1;
-            if (target_h < 1) target_h = 1;
-            top->m_position.right = top->m_position.left + target_w;
-            top->m_position.bottom = top->m_position.top + target_h;
-            GdkGeometry gh;
-            gh.min_width = target_w;
-            gh.max_width = target_w;
-            gh.min_height = target_h;
-            gh.max_height = target_h;
-            gtk_window_set_geometry_hints(GTK_WINDOW(tl_win), NULL, &gh,
-                (GdkWindowHints)(GDK_HINT_MIN_SIZE | GDK_HINT_MAX_SIZE));
-
-            gtk_widget_set_size_request(container, target_w, target_h);
-            SetProp(top, "SWELL_XW_BRIDGE_PLUGIN", (HANDLE)(INT_PTR)1);
-        }
         bs->last_size_pos = r;
         bs->has_last_size_pos = true;
     }
