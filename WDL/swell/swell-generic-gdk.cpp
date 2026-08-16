@@ -1639,14 +1639,8 @@ static void OnConfigureEvent(GdkEventConfigure *cfg)
   hwnd->m_position.bottom = cfg_y + cfg_height;
   if (flag&1) SendMessage(hwnd,WM_MOVE,0,0);
   if (flag&2) SendMessage(hwnd,WM_SIZE,hwnd->m_is_maximized ? SIZE_MAXIMIZED : SIZE_RESTORED,0);
-#ifdef SWELL_TARGET_WAYLAND
-  // Prevent modal windows to be resized manually (broken when fixed windows to remember previous size)
-  if (!hwnd->m_hashaddestroy && hwnd->m_oswindow)
-    swell_recalcMinMaxInfo(hwnd);
-#else
   if (!hwnd->m_hashaddestroy && hwnd->m_oswindow && (hwnd->m_style & WS_THICKFRAME))
     swell_recalcMinMaxInfo(hwnd);
-#endif
 }
 
 static void OnWindowStateEvent(GdkEventWindowState *evt)
