@@ -743,8 +743,19 @@ void SetWindowPos(HWND hwnd, HWND zorder, int x, int y, int cx, int cy, int flag
 
     if (hwnd->m_oswindow && !hwnd->m_oswindow_fullscreen)
     {
+#ifdef SWELL_TARGET_WAYLAND
+      // gdk_window_resize()/move_resize() don't reliably apply to an
+      // already-mapped Wayland surface (e.g. resizing a top-level window
+      // for a live content swap within an already-open view). Destroy and
+      // recreate the native window instead, matching what closing/
+      // reopening the view already does correctly.
+      swell_oswindow_destroy(hwnd);
+      swell_oswindow_manage(hwnd, false);
+      if (reposflag&2) SendMessage(hwnd,WM_SIZE,SIZE_RESTORED,0);
+#else
       swell_oswindow_resize(hwnd->m_oswindow,reposflag,f);
       if (reposflag&2) SendMessage(hwnd,WM_SIZE,SIZE_RESTORED,0);
+#endif
     }
     else
     {
