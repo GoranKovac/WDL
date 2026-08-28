@@ -7047,7 +7047,17 @@ HWND WindowFromPoint(POINT p)
 #ifdef SWELL_TARGET_WAYLAND
   // imgui fix
   extern HWND g_wayland_hovered_hwnd;
+  bool hover_hwnd_still_valid = false;
   if (g_wayland_hovered_hwnd)
+  {
+    HWND t = SWELL_topwindows;
+    while (t && t != g_wayland_hovered_hwnd) t = t->m_next;
+    if (t)
+      hover_hwnd_still_valid = true;
+    else
+      g_wayland_hovered_hwnd = NULL;
+  }
+  if (hover_hwnd_still_valid)
   {
     HWND child = ChildWindowFromPoint(g_wayland_hovered_hwnd, p);
     return child ? child : g_wayland_hovered_hwnd;
