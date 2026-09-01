@@ -1425,16 +1425,18 @@ void xw_size(HWND hwnd)
     // which is exactly where the X11 bridge does it. Attempting the same from
     // a damage callback ran mid-teardown and segfaulted.
     {
+        // Re-resolve the embed container every time and re-place if it moved.
+        // Fixed float/unfloat in fx list view
+        GtkWidget *fresh = xw_ensure_embed_widget(hwnd->m_parent);
+        if (fresh && fresh != bs->embed_container) {
+            DEBUG_PRINT("[REPARENT] embed container %p -> %p, re-placing\n",
+                        (void*)bs->embed_container, (void*)fresh);
+            bs->embed_container = fresh;
+            bs->placed = false;   // the put/show path below re-places it
+        }
         HWND top = hwnd->m_parent;
         while (top && !top->m_oswidget) top = top->m_parent;
-        GtkWidget *host = top ? (GtkWidget*)top->m_oswidget : nullptr;
-        if (host && host != bs->cur_parent_toplevel) {
-            DEBUG_PRINT("[REPARENT] host toplevel %p -> %p, re-placing embed\n",
-                        (void*)bs->cur_parent_toplevel, (void*)host);
-            bs->embed_container = xw_ensure_embed_widget(hwnd->m_parent);
-            bs->placed = false;   // the put/show path below re-places it
-            bs->cur_parent_toplevel = host;
-        }
+        if (top && top->m_oswidget) bs->cur_parent_toplevel = (GtkWidget*)top->m_oswidget;
     }
 
     GtkWidget *container = bs->embed_container;
