@@ -86,7 +86,15 @@ struct bridgeState {
     bool     placed = false;     // has the SWELL widget been put in its container
     RECT     last_size_pos = {0,0,0,0}; // last hwnd->m_position xw_size actually acted on, see xw_size
     bool     has_last_size_pos = false;
-    GtkWidget *embed_container = nullptr; // resolved once via xw_ensure_embed_widget, see xw_bridge_create/xw_size
+    GtkWidget *embed_container = nullptr; // resolved via xw_ensure_embed_widget, see xw_bridge_create/xw_size
+    // Host toplevel our widget is currently placed in. Mirrors bs->cur_parent
+    // in SWELL's X11 bridge (swell-generic-gdk.cpp, xbridgeProc WM_SIZE):
+    // REAPER destroys and recreates the FX window when a plugin resizes
+    // itself, and the X11 bridge detects that by comparing this against the
+    // host's current m_oswindow and reparenting into the new one. Without the
+    // equivalent here, our widget is left in the discarded toplevel -- alive
+    // at the GTK level, but with its GdkWindow destroyed, so it never draws.
+    GtkWidget *cur_parent_toplevel = nullptr;
 };
 
 // Refresh the composite-named window pixmap after the plugin window has been
@@ -1297,6 +1305,11 @@ static GtkWidget* xw_ensure_embed_widget(HWND h)
     if (!parent_widget || !GTK_IS_FIXED(parent_widget)) return nullptr;
 
     GtkWidget *existing = (GtkWidget*)GetProp(h, "XBridgeEmbedFixed");
+
+    if (existing && GTK_IS_WIDGET(existing) && gtk_widget_get_parent(existing) != parent_widget) {
+        existing = nullptr;
+    }
+
     if (existing && GTK_IS_WIDGET(existing)) {
         gtk_fixed_move(GTK_FIXED(parent_widget), existing, h->m_position.left, h->m_position.top);
         gtk_widget_set_size_request(existing, w, hh);
@@ -1388,6 +1401,41 @@ void xw_size(HWND hwnd)
 {
     if (!hwnd || !hwnd->m_private_data || !hwnd->m_oswidget) return;
     bridgeState *bs = (bridgeState*)hwnd->m_private_data;
+ 
+    // Has REAPER replaced the host toplevel underneath us?
+    //
+    // Same check SWELL's X11 bridge does in xbridgeProc's WM_SIZE/WM_MOVE
+    // (swell-generic-gdk.cpp):
+    //
+    //     if (h && h->m_oswindow != bs->cur_parent) bs->need_reparent = true;
+    //     ... gdk_window_reparent(bs->w, h->m_oswindow, ...);
+    //         bs->cur_parent = h->m_oswindow;
+    //
+    // REAPER destroys and recreates the FX window when a plugin resizes itself
+    // (Kontakt loading a library). swell_oswindow_destroy() destroys the
+    // GdkWindow and nulls m_oswidget, then swell_oswindow_manage() builds a
+    // fresh GtkWindow. Our drawing area stays in the discarded one: GTK still
+    // reports it parented with a GtkWindow toplevel, but at the GDK level its
+    // parent is NULL and the old toplevel's window reads back freed memory, so
+    // it is never drawn again -- a live pixmap full of plugin content with
+    // nothing painting it, recoverable only by reopening the plugin.
+    //
+    // Doing this here rather than from the damage callback matters: xw_size
+    // runs on WM_SIZE/WM_MOVE, after SWELL has finished rebuilding the window,
+    // which is exactly where the X11 bridge does it. Attempting the same from
+    // a damage callback ran mid-teardown and segfaulted.
+    {
+        HWND top = hwnd->m_parent;
+        while (top && !top->m_oswidget) top = top->m_parent;
+        GtkWidget *host = top ? (GtkWidget*)top->m_oswidget : nullptr;
+        if (host && host != bs->cur_parent_toplevel) {
+            DEBUG_PRINT("[REPARENT] host toplevel %p -> %p, re-placing embed\n",
+                        (void*)bs->cur_parent_toplevel, (void*)host);
+            bs->embed_container = xw_ensure_embed_widget(hwnd->m_parent);
+            bs->placed = false;   // the put/show path below re-places it
+            bs->cur_parent_toplevel = host;
+        }
+    }
 
     GtkWidget *container = bs->embed_container;
     if (!container || !GTK_IS_FIXED(container)) return;
@@ -1429,6 +1477,27 @@ void xw_size(HWND hwnd)
     }
 
     if (!bs->placed) {
+        // If we are re-placing after the host toplevel was replaced, the widget
+        // may still be parented to the old (now dead) container. gtk_fixed_put()
+        // refuses an already-parented widget, so detach it first, holding a
+        // reference across the move so it is not finalized in between.
+        {
+            GtkWidget *oldp = gtk_widget_get_parent((GtkWidget*)hwnd->m_oswidget);
+            if (oldp && oldp != container && GTK_IS_CONTAINER(oldp)) {
+                g_object_ref(hwnd->m_oswidget);
+                gtk_container_remove(GTK_CONTAINER(oldp), (GtkWidget*)hwnd->m_oswidget);
+                gtk_fixed_put(GTK_FIXED(container), (GtkWidget*)hwnd->m_oswidget, pos_x, pos_y);
+                g_object_unref(hwnd->m_oswidget);
+                gtk_widget_set_size_request((GtkWidget*)hwnd->m_oswidget, w, h);
+                gtk_widget_show((GtkWidget*)hwnd->m_oswidget);
+                bs->placed = true;
+                GtkWidget *tl2 = gtk_widget_get_toplevel((GtkWidget*)hwnd->m_oswidget);
+                if (!(tl2 && GTK_IS_WINDOW(tl2))) bs->placed = false;
+                if (size_changed) { bs->last_size_pos = r; bs->has_last_size_pos = true; }
+                if (bs->cap) refresh_gtk_offset(bs->cap);
+                return;
+            }
+        }
         gtk_fixed_put(GTK_FIXED(container), hwnd->m_oswidget, pos_x, pos_y);
         gtk_widget_set_size_request(hwnd->m_oswidget, w, h);
         gtk_widget_show(hwnd->m_oswidget);

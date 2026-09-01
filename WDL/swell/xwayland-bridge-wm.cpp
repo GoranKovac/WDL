@@ -205,6 +205,29 @@ void XWaylandWM::announce_wm(Window support_win) {
                  PropertyChangeMask);
     XFlush(dpy_);
     DEBUG_PRINT("[WM] SubstructureRedirect on root selected\n");
+
+    // Manually redirect every current and future child of root, the way every
+    // real Xwayland window manager does (Mutter, KWin and wlroots all do this;
+    // Mutter's teardown code calls it "the most important part of cleanup").
+    // In rootless mode the Wayland compositor IS the X11 window manager, and
+    // this is part of that job. We previously did only per-window
+    // CompositeRedirectAutomatic on the plugin window and never this.
+    //
+    // Without it, our container toplevels stay unredirected, which makes them
+    // valid Present flip targets. The upstream fix for the exact line we were
+    // crashing on is titled "Handle clearing damage after flip in
+    // xwl_present_execute": a flip tears the window's damage down, and a later
+    // present then uses it. That matched the coredump exactly -- a valid
+    // xwl_window whose ->damage was NULL, so RegionEmpty() ran on
+    // DamageRegion(NULL) == 0x10. With toplevels manually redirected there is
+    // nothing to flip to, Present takes the copy path, and the damage stays
+    // alive. This is why vanilla REAPER under KWin's own XWM never hit it.
+    //
+    // Only one client may hold CompositeRedirectManual, but we are the sole WM
+    // on our own private display, so there is nothing to contend with.
+    XCompositeRedirectSubwindows(dpy_, root, CompositeRedirectManual);
+    XFlush(dpy_);
+    DEBUG_PRINT("[WM] CompositeRedirectManual on root subwindows\n");
     
     // Verify it actually got set
     Atom actual; int fmt; unsigned long n, left;
