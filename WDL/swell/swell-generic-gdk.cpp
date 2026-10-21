@@ -370,8 +370,14 @@ static void on_deactivate()
 
 void swell_oswindow_destroy(HWND hwnd)
 {
-  if (hwnd && hwnd->m_oswidget)
-    // gtk_window_set_modal(GTK_WINDOW(hwnd->m_oswidget), FALSE);
+#ifdef SWELL_TARGET_WAYLAND
+  // Release the GTK grab a modal window took when shown. gdk_window_destroy()
+  // below never hides the GtkWindow, so the grab would leak and GTK would keep
+  // routing button events to the dead dialog (e.g. the XWayland plugin bridge
+  // stops getting clicks after the project-open dialog).
+  if (hwnd && hwnd->m_oswidget && GTK_IS_WINDOW(hwnd->m_oswidget))
+    gtk_window_set_modal(GTK_WINDOW(hwnd->m_oswidget), FALSE);
+#endif
   if (hwnd && hwnd->m_oswindow)
   {
     if (SWELL_focused_oswindow == hwnd->m_oswindow) SWELL_focused_oswindow = NULL;
