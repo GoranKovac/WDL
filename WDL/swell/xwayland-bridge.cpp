@@ -1392,7 +1392,10 @@ void xw_destroy(HWND hwnd)
         GtkWidget *parent = gtk_widget_get_parent(hwnd->m_oswidget);
         if (parent) gtk_container_remove(GTK_CONTAINER(parent), hwnd->m_oswidget);
     }
+    // The capture owns bs->disp once it exists; if the plugin never got captured,
+    // close it or the connection and its mapped container stay on :10.
     if (bs->cap) cleanup_capture(bs->cap);
+    else if (bs->disp) XCloseDisplay(bs->disp);
     hwnd->m_private_data = 0;
     delete bs;
 }
