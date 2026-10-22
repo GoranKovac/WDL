@@ -1334,6 +1334,19 @@ static GtkWidget* xw_ensure_embed_widget(HWND h)
     return fixed;
 }
 
+// Size the container and centre it on :10's screen. Rootless Xwayland's screen is
+// exactly the monitor area and its pointer is clamped to it, so a container at 0,0
+// leaves no room left/up of the plugin: knob drags stop dead there. Centring splits
+// the spare room evenly; a plugin bigger than the screen clamps back to 0, so this
+// never pushes a window further off-screen than 0,0 did.
+static void place_container(Display *dpy, Window container, int w, int h)
+{
+    const int scr = DefaultScreen(dpy);
+    const int x = wdl_max((DisplayWidth(dpy, scr)  - w) / 2, 0);
+    const int y = wdl_max((DisplayHeight(dpy, scr) - h) / 2, 0);
+    XMoveResizeWindow(dpy, container, x, y, w, h);
+}
+
 static bool try_create_plugin(HWND hwnd)
 {
     if (!hwnd || !hwnd->m_private_data) return true;
@@ -1355,7 +1368,7 @@ static bool try_create_plugin(HWND hwnd)
 
              XWindowAttributes attr;
              if (XGetWindowAttributes(bs->disp, plugin_win, &attr))
-                 XResizeWindow(bs->disp, bs->parent, attr.width, attr.height);
+                 place_container(bs->disp, bs->parent, attr.width, attr.height);
              XFlush(bs->disp);
 
              Capture *c = setup_capture(bs->disp, bs->parent, plugin_win, hwnd);
@@ -1477,7 +1490,7 @@ void xw_size(HWND hwnd)
     // needs a live capture.
     if (bs->cap && size_changed) {
         refresh_pixmap(bs->cap);
-        XResizeWindow(bs->cap->dpy, bs->cap->parent_win, w, h);
+        place_container(bs->cap->dpy, bs->cap->parent_win, w, h);
         XFlush(bs->cap->dpy);
     }
 
@@ -1560,6 +1573,7 @@ HWND xw_bridge_create(HWND viewpar, void **wref, const RECT *r, const char *brid
     Window container = XCreateSimpleWindow(disp, root, 0, 0, w, h, 0,
                                            BlackPixel(disp, screen),
                                            WhitePixel(disp, screen));
+    place_container(disp, container, w, h);
     XMapWindow(disp, container);
     XFlush(disp);
 
