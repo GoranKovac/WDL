@@ -100,14 +100,7 @@ XWaylandWM* XWaylandWM::init_bridge_wm(const char *display_name)
     if (s_xwayland_pid < 0) return nullptr;
 
     setenv("DISPLAY", display_name, 1);
-    // Nothing on the Wayland side ever shows our rootless :10 surfaces, so they
-    // never get wl_surface frame callbacks. Xwayland's Present then falls back to
-    // its 1s timer (TIMER_LEN_FLIP) for any vsynced swap, and an in-process GLX
-    // plugin UI (robtk/pugl, e.g. AVL Drumkits) blocks REAPER's UI thread inside
-    // glXSwapBuffers for ~1s per frame. We read the result back via composite
-    // pixmaps anyway, so vsync buys nothing -- turn it off unless the user set it.
-    // setenv("vblank_mode", "0", 0);          // Mesa
-    // setenv("__GL_SYNC_TO_VBLANK", "0", 0);  // NVIDIA
+    // Vsynced GLX swaps used to block ~1s here; see disallow_commits().
     XInitThreads();
     XSetErrorHandler(wm_x11_error_handler);
 
@@ -124,6 +117,8 @@ XWaylandWM* XWaylandWM::init_bridge_wm(const char *display_name)
                                          -2, -2, 1, 1, 0, 0, 0);
     XMapWindow(g_wm_dpy, support);
     g_wm->announce_wm(support);
+    // Created before we held SubstructureRedirect, so no CreateNotify for it.
+    g_wm->disallow_commits(support);
 
     GIOChannel *ch = g_io_channel_unix_new(ConnectionNumber(g_wm_dpy));
     g_io_add_watch(ch, G_IO_IN, wm_gio_event_cb, nullptr);
@@ -162,6 +157,22 @@ void XWaylandWM::init_atoms() {
     atoms_._NET_WM_NAME               = XInternAtom(dpy_, "_NET_WM_NAME",               False);
     atoms_._NET_SUPPORTED             = XInternAtom(dpy_, "_NET_SUPPORTED",             False);
     atoms_._NET_WM_BYPASS_COMPOSITOR  = XInternAtom(dpy_, "_NET_WM_BYPASS_COMPOSITOR",  False);
+    atoms_._XWAYLAND_ALLOW_COMMITS    = XInternAtom(dpy_, "_XWAYLAND_ALLOW_COMMITS",    False);
+}
+
+// Our manual redirect gives every toplevel a wl_surface on the host compositor,
+// but nothing ever gives it a role, so it never gets frame callbacks. Xwayland
+// commits to it anyway, and with a frame callback outstanding Present uses its
+// 1s TIMER_LEN_FLIP fallback -- a vsynced glXSwapBuffers then blocks for ~1s.
+// _XWAYLAND_ALLOW_COMMITS=0 stops the commits: no frame callback is requested,
+// flips are refused, and Present paces copies on its 17ms TIMER_LEN_COPY. We
+// read content back from the composite pixmap, so nothing is lost. Only the WM
+// client (the one holding SubstructureRedirect on root) may set this property,
+// and it must be CARDINAL/32 with one item or Xwayland ignores it.
+void XWaylandWM::disallow_commits(Window w) {
+    long zero = 0;
+    XChangeProperty(dpy_, w, atoms_._XWAYLAND_ALLOW_COMMITS, XA_CARDINAL, 32,
+                    PropModeReplace, (unsigned char*)&zero, 1);
 }
 
 // ─── WM announcement (needed by native plugins that check for a WM) ───────────
@@ -320,7 +331,8 @@ bool XWaylandWM::handle_event(XEvent *ev) {
     // DEBUG_PRINT("[WM] handle_event type=%d win=0x%lx\n", ev->type, ev->xany.window);
     if (dnd_handle_event(ev)) return true;
     switch (ev->type) {
-    case MapRequest:       DEBUG_PRINT("[WM] -> MapRequest\n");       return on_map_request(&ev->xmaprequest);
+    case CreateNotify:     return on_create_notify(&ev->xcreatewindow);
+    case MapRequest:      DEBUG_PRINT("[WM] -> MapRequest\n");       return on_map_request(&ev->xmaprequest);
     case ConfigureRequest: DEBUG_PRINT("[WM] -> ConfigureRequest\n"); return on_configure_request(&ev->xconfigurerequest);
     case ReparentNotify:   DEBUG_PRINT("[WM] -> ReparentNotify\n");   return on_reparent_notify(&ev->xreparent);
     case UnmapNotify:      DEBUG_PRINT("[WM] -> UnmapNotify\n");      return on_unmap_notify(&ev->xunmap);
@@ -329,6 +341,17 @@ bool XWaylandWM::handle_event(XEvent *ev) {
     DEBUG_PRINT("[WM] -> unhandled (type=%d)\n", ev->type);
         return false;
     }
+}
+
+// ─── CreateNotify ─────────────────────────────────────────────────────────────
+// Every new child of root is a toplevel that Xwayland gives a wl_surface (see
+// disallow_commits). Non-override-redirect windows reach us here before their
+// MapRequest, so the property is in place before the first commit; for
+// override-redirect ones Xwayland picks the change up live.
+bool XWaylandWM::on_create_notify(XCreateWindowEvent *ev) {
+    if (ev->parent == DefaultRootWindow(dpy_))
+        disallow_commits(ev->window);
+    return false;
 }
 
 // ─── MapRequest ───────────────────────────────────────────────────────────────
@@ -450,6 +473,13 @@ XFlush(dpy_);
 // Sent when a window is reparented into our container. Track it and send a
 // synthetic ConfigureNotify so native plugins learn their geometry and render.
 bool XWaylandWM::on_reparent_notify(XReparentEvent *ev) {
+    // A window moved under root became a toplevel without a CreateNotify there,
+    // so it needs the commit block too (see disallow_commits).
+    if (ev->parent == DefaultRootWindow(dpy_)) {
+        disallow_commits(ev->window);
+        return false;
+    }
+
     if (!containers_.count(ev->parent))
         return false;
 

@@ -42,6 +42,8 @@ struct WMAtoms {
     Atom _NET_SUPPORTED;
     // Composite
     Atom _NET_WM_BYPASS_COMPOSITOR;
+    // Xwayland
+    Atom _XWAYLAND_ALLOW_COMMITS;
 };
 
 // WM_STATE values (ICCCM §4.1.3.1)
@@ -183,6 +185,7 @@ private:
     void set_wm_state(Window w, int state);
     void read_wm_protocols(Window w, WMWindowState &st);
     void read_wm_hints(Window w, WMWindowState &st);
+    void disallow_commits(Window w);
 
     bool on_map_request(XMapRequestEvent *ev);
     bool on_map_notify(XMapEvent *ev);
