@@ -1010,21 +1010,24 @@ static void handle_damage_notify(XDamageNotifyEvent *de)
 
     XDamageSubtract(g_wm_dpy, de->damage, None, None);
 
-    // With Automatic redirection there is no capture step: the X server keeps
-    // the composite pixmap in sync. All we need to do on damage is (a) refresh
-    // the pixmap handle if the window has been resized (the handle becomes
-    // invalid on every resize), and (b) tell GTK to redraw the affected area.
-    auto refresh_pixmap_if_resized = [](Capture *c) -> bool {
+    // With Automatic redirection there is no capture step, but the named pixmap
+    // is only a reference to whatever backs the window at naming time. Besides
+    // resizes, Xwayland's Present flips (GLX plugin UIs, e.g. robtk/AVL Drumkits)
+    // swap the window pixmap for the client's buffer on every swap, leaving our
+    // handle on a stale buffer -- so re-name on every damage, then tell GTK to
+    // redraw the affected area.
+    auto rename_pixmap = [](Capture *c) -> bool {
         if (!c || !c->dpy || !c->plugin_win) return false;
         XWindowAttributes wa;
         if (!XGetWindowAttributes(c->dpy, c->plugin_win, &wa)) return false;
         if (wa.width <= 0 || wa.height <= 0) return false;
+        c->pixmap_w = c->pixmap_h = 0; // defeat ensure_pixmap's same-size fast path
         return ensure_pixmap(c, wa.width, wa.height);
     };
 
     Capture *c = find_capture(de->drawable);
     if (c && c->widget && GTK_IS_WIDGET(c->widget)) {
-        if (refresh_pixmap_if_resized(c)) {
+        if (rename_pixmap(c)) {
             gtk_widget_queue_draw_area(c->widget, de->area.x, de->area.y,
                                        de->area.width, de->area.height);
         }
@@ -1392,10 +1395,7 @@ void xw_destroy(HWND hwnd)
         GtkWidget *parent = gtk_widget_get_parent(hwnd->m_oswidget);
         if (parent) gtk_container_remove(GTK_CONTAINER(parent), hwnd->m_oswidget);
     }
-    // The capture owns bs->disp once it exists; if the plugin never got captured,
-    // close it or the connection and its mapped container stay on :10.
     if (bs->cap) cleanup_capture(bs->cap);
-    else if (bs->disp) XCloseDisplay(bs->disp);
     hwnd->m_private_data = 0;
     delete bs;
 }

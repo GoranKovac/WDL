@@ -100,6 +100,14 @@ XWaylandWM* XWaylandWM::init_bridge_wm(const char *display_name)
     if (s_xwayland_pid < 0) return nullptr;
 
     setenv("DISPLAY", display_name, 1);
+    // Nothing on the Wayland side ever shows our rootless :10 surfaces, so they
+    // never get wl_surface frame callbacks. Xwayland's Present then falls back to
+    // its 1s timer (TIMER_LEN_FLIP) for any vsynced swap, and an in-process GLX
+    // plugin UI (robtk/pugl, e.g. AVL Drumkits) blocks REAPER's UI thread inside
+    // glXSwapBuffers for ~1s per frame. We read the result back via composite
+    // pixmaps anyway, so vsync buys nothing -- turn it off unless the user set it.
+    // setenv("vblank_mode", "0", 0);          // Mesa
+    // setenv("__GL_SYNC_TO_VBLANK", "0", 0);  // NVIDIA
     XInitThreads();
     XSetErrorHandler(wm_x11_error_handler);
 
