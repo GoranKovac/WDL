@@ -429,6 +429,12 @@ static Capture* setup_capture(Display *dpy, Window parent_win, Window plugin_win
     // immediately. notify::is-active keeps this in sync afterwards; this just
     // avoids a race between plugin map and the compositor's focus decision.
     g_active_capture = c;
+    // Raise it too: containers overlap on :10 and XTest input goes to whichever
+    // is on top. notify::is-active is hooked only after the new toplevel already
+    // has focus, so on_toplevel_active never raises it and input keeps landing on
+    // the previous plugin.
+    XRaiseWindow(dpy, parent_win);
+    XFlush(dpy);
     DEBUG_PRINT("[XW] setup parent=0x%lx plugin=0x%lx (auto-composite, pixmap=0x%lx)\n",
                 parent_win, plugin_win, (unsigned long)c->pixmap);
     return c;
