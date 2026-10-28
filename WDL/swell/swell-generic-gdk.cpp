@@ -2976,6 +2976,9 @@ void SWELL_RunEvents()
 #endif
 
     GMainContext *ctx=g_main_context_default();
+#ifdef SWELL_TARGET_WAYLAND
+    const gint64 deadline = g_get_monotonic_time() + 4000;
+#endif
     while (g_main_context_iteration(ctx,FALSE))
     {
       GdkEvent *evt;
@@ -2983,7 +2986,13 @@ void SWELL_RunEvents()
       {
         swell_gdkEventHandler(evt,(gpointer)1);
         gdk_event_free(evt);
+#ifdef SWELL_TARGET_WAYLAND
+        if (g_get_monotonic_time() >= deadline) break;
+#endif
       }
+#ifdef SWELL_TARGET_WAYLAND
+      if (g_get_monotonic_time() >= deadline) break;
+#endif
     }
 
     DWORD dt;
