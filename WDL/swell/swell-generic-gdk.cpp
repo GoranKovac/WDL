@@ -881,6 +881,7 @@ void swell_oswindow_manage(HWND hwnd, bool wantfocus)
 
         GtkWidget *gtk_win = gtk_window_new((is_popup_menu || is_tooltip) ? GTK_WINDOW_POPUP : GTK_WINDOW_TOPLEVEL);
 
+        gtk_window_set_decorated(GTK_WINDOW(gtk_win), (hwnd->m_style & WS_CAPTION) != 0);
         const int scale = swell_gdk_window_scale(transient_for);
 
         gtk_widget_set_app_paintable(gtk_win, TRUE);
@@ -1046,6 +1047,8 @@ void swell_oswindow_manage(HWND hwnd, bool wantfocus)
           }
         }
         hwnd->m_oswindow = gtk_widget_get_window(gtk_win);
+        if (GDK_IS_WAYLAND_WINDOW(hwnd->m_oswindow) && !(hwnd->m_style & WS_CAPTION))
+          gdk_wayland_window_announce_csd(hwnd->m_oswindow);
 #else
         GdkWindowAttr attr={0,};
         attr.title = (char *)hwnd->m_title.Get();
@@ -2875,6 +2878,17 @@ void swell_oswindow_update_style(HWND hwnd, LONG oldstyle)
     swell_hide_owned_windows_transient(hwnd);
 
     gdk_window_hide(hwnd->m_oswindow);
+#ifdef SWELL_TARGET_WAYLAND
+    if (hwnd->m_oswidget)
+      gtk_window_set_decorated(GTK_WINDOW(hwnd->m_oswidget), (val & WS_CAPTION) != 0);
+    if (GDK_IS_WAYLAND_WINDOW(hwnd->m_oswindow))
+    {
+      if (!(val & WS_CAPTION) || g_swell_wayland_title_h)
+        gdk_wayland_window_announce_csd(hwnd->m_oswindow);
+      else
+        gdk_wayland_window_announce_ssd(hwnd->m_oswindow);
+    }
+#endif
     if (val & WS_CAPTION)
     {
       if (val & WS_THICKFRAME)
