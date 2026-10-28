@@ -177,6 +177,7 @@ default: libSwell$(DLL_EXT)
 .PHONY: clean 
 
 SWELL_HEADERS=swell-dlggen.h swell-gdi-internalpool.h swell-menugen.h swell-types.h swell-functions.h swell-internal.h
+SWELL_HEADERS+=swell-gdk-scale.h
 
 swell.o: $(SWELL_HEADERS)
 swell-ini.o: $(SWELL_HEADERS)
@@ -190,6 +191,7 @@ swell-kb-generic.o: $(SWELL_HEADERS)
 swell-miscdlg-generic.o: $(SWELL_HEADERS)
 swell-modstub-generic.o: $(SWELL_HEADERS)
 swell-appstub-generic.o: $(SWELL_HEADERS)
+swell-generic-gdk.o xwayland-bridge.o: $(SWELL_HEADERS)
 
 libSwell$(DLL_EXT): $(OBJS)
 	$(CXX) -shared -o $@ $(CFLAGS) $(LFLAGS) $^ $(LINKEXTRA)
