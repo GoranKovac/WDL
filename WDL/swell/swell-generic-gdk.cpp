@@ -95,6 +95,7 @@ static guint32 _gdk_x11_window_get_desktop(GdkWindow *window)
   return (guint32) nitems;
 }
 
+#ifdef SWELL_TARGET_WAYLAND
 HWND g_wayland_hovered_hwnd = NULL;
 
 gboolean swell_wayland_handle_hover_enter(GtkWidget *widget, GdkEventCrossing *event, gpointer user_data)
@@ -113,6 +114,7 @@ gboolean swell_wayland_handle_hover_enter(GtkWidget *widget, GdkEventCrossing *e
   }
   return FALSE;
 }
+#endif
 static void _gdk_x11_window_move_to_desktop(GdkWindow *window, guint32 desktop)
 {
   XClientMessageEvent xclient;
@@ -415,7 +417,9 @@ void swell_oswindow_destroy(HWND hwnd)
       g_swell_touchptr = NULL;
     gdk_window_destroy(hwnd->m_oswindow);
     hwnd->m_oswindow=NULL;
+#ifdef SWELL_TARGET_WAYLAND
     hwnd->m_oswidget=NULL;
+#endif
 #ifdef SWELL_LICE_GDI
     delete hwnd->m_backingstore;
     hwnd->m_backingstore=0;
@@ -874,6 +878,7 @@ static void swell_set_owned_windows_transient(HWND hwnd, bool do_create)
   }
 }
 
+#ifdef SWELL_TARGET_WAYLAND
 static void on_drag_data_received(GtkWidget *widget, GdkDragContext *context, gint x, gint y, GtkSelectionData *data, guint info, guint time, gpointer user_data)
 {
   HWND target_hwnd = (HWND)user_data;
@@ -904,6 +909,7 @@ static void on_drag_data_received(GtkWidget *widget, GdkDragContext *context, gi
     gtk_drag_finish(context, FALSE, FALSE, time);
   }
 }
+#endif
 
 bool IsModalDialogBox(HWND);
 
@@ -2221,15 +2227,6 @@ static void OnMotionEvent(GdkEventMotion *m)
     }
   }
 #endif
-  // Remember which real toplevel the pointer is over. m->window is the OS window the
-  // motion happened on, so this is authoritative even on Wayland (no global coords
-  // needed). Skip popups: tooltips and menus are both WS_CHILD, and letting the
-  // pointer entering a tooltip overwrite this would re-anchor the next tooltip to it.
-  {
-    HWND top = swell_oswindow_to_hwnd(m->window);
-    if (top && top->m_oswidget && !(top->m_style & WS_CHILD))
-      s_last_hover_oswindow = m->window;
-  }
 
   POINT p={(int)m->x, (int)m->y};
   HWND hwnd = getMouseTarget(m->window,p,NULL);
