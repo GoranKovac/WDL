@@ -8,6 +8,7 @@
 #include "swell-gdk-scale.h"
 #include <X11/extensions/Xcomposite.h>
 #include <X11/extensions/Xdamage.h>
+#include <X11/extensions/Xfixes.h>
 #include <cairo/cairo-xlib.h>
 void xw_size(HWND hwnd);
 
@@ -330,6 +331,7 @@ static void on_toplevel_active(GObject *obj, GParamSpec *, gpointer data)
 static void connect_widget(Capture *c)
 {
     if (!c->widget) return;
+    g_object_add_weak_pointer(G_OBJECT(c->widget), (gpointer*)&c->widget);
     gtk_widget_add_events(c->widget,
                           GDK_POINTER_MOTION_MASK |
                           GDK_BUTTON_PRESS_MASK |
@@ -372,6 +374,8 @@ static Capture* setup_capture(Display *dpy, Window parent_win, Window plugin_win
     c->plugin_win = plugin_win;
     c->hwnd       = hwnd;
 
+    XFixesChangeSaveSet(dpy, plugin_win, SetModeInsert, SaveSetRoot, SaveSetUnmap);
+
     // Automatic composite redirection: the X server keeps drawing the plugin
     // window off-screen (it never has to be visible in root), and we sample
     // the resulting pixmap via XCompositeNameWindowPixmap. This is what the
@@ -407,6 +411,9 @@ static Capture* setup_capture(Display *dpy, Window parent_win, Window plugin_win
     return c;
 }
 
+static void canvas_remove_popup(Capture *c, Window x11_win);
+static void modal_remove(Capture *c, Window win);
+
 static void cleanup_capture(Capture *c)
 {
     if (!c) return;
@@ -423,6 +430,14 @@ static void cleanup_capture(Capture *c)
         c->active_toplevel = nullptr;
     }
     unregister_capture(c);
+    if (c->widget) {
+        g_signal_handlers_disconnect_by_data(c->widget, c);
+        g_object_remove_weak_pointer(G_OBJECT(c->widget), (gpointer*)&c->widget);
+    }
+    while (!c->popups.empty()) canvas_remove_popup(c, c->popups.back().x11_win);
+    while (!c->modals.empty()) modal_remove(c, c->modals.back().x11_win);
+    if (c->damage && g_wm_dpy) XDamageDestroy(g_wm_dpy, c->damage);
+    if (g_wm_dpy) XFlush(g_wm_dpy);
     destroy_pixmap(c);
     Display *d = c->dpy;
     c->dpy = nullptr;
@@ -1383,16 +1398,25 @@ void xw_destroy(HWND hwnd)
 {
     if (!hwnd || !hwnd->m_private_data) return;
     bridgeState *bs = (bridgeState*)hwnd->m_private_data;
-    // m_oswidget is non-NULL here only if the widget is still alive (the weak
-    // pointer nulls it on destroy), so this is safe.
+    hwnd->m_private_data = 0;
+    KillTimer(hwnd, 1);
+    if (bs->cap) cleanup_capture(bs->cap);
+    else if (bs->disp) {
+        Window root, parent, *children = nullptr;
+        unsigned int count = 0;
+        if (XQueryTree(bs->disp, bs->parent, &root, &parent, &children, &count)) {
+            for (unsigned int i = 0; i < count; ++i)
+                XFixesChangeSaveSet(bs->disp, children[i], SetModeInsert, SaveSetRoot, SaveSetUnmap);
+        }
+        if (children) XFree(children);
+        XCloseDisplay(bs->disp);
+    }
     if (hwnd->m_oswidget && GTK_IS_WIDGET(hwnd->m_oswidget)) {
         g_signal_handlers_disconnect_by_data(hwnd->m_oswidget, hwnd);
         g_object_remove_weak_pointer(G_OBJECT(hwnd->m_oswidget), (gpointer*)&hwnd->m_oswidget);
-        GtkWidget *parent = gtk_widget_get_parent(hwnd->m_oswidget);
-        if (parent) gtk_container_remove(GTK_CONTAINER(parent), hwnd->m_oswidget);
+        gtk_widget_destroy(hwnd->m_oswidget);
+        hwnd->m_oswidget = nullptr;
     }
-    if (bs->cap) cleanup_capture(bs->cap);
-    hwnd->m_private_data = 0;
     delete bs;
 }
 
