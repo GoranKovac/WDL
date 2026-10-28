@@ -3,7 +3,9 @@
 #else
 #define DEBUG_PRINT(...) ((void)0)
 #endif
+#include <gdk/gdkwayland.h>
 #include "xwayland-bridge.h"
+#include "swell-gdk-scale.h"
 #include <X11/extensions/Xcomposite.h>
 #include <X11/extensions/Xdamage.h>
 #include <cairo/cairo-xlib.h>
@@ -119,7 +121,7 @@ static void destroy_pixmap(Capture *c)
     c->pixmap_w = c->pixmap_h = 0;
 }
 
-static bool on_draw(GtkWidget *, cairo_t *cr, gpointer data)
+static bool on_draw(GtkWidget *widget, cairo_t *cr, gpointer data)
 {
     Capture *c = (Capture*)data;
     if (!c || !c->pixmap || !c->visual) return FALSE;
@@ -132,19 +134,24 @@ static bool on_draw(GtkWidget *, cairo_t *cr, gpointer data)
                                                       c->pixmap_w, c->pixmap_h);
     if (surf) {
         if (cairo_surface_status(surf) == CAIRO_STATUS_SUCCESS) {
+            const int scale = swell_gdk_widget_scale(widget);
+            cairo_save(cr);
+            cairo_scale(cr, 1.0 / scale, 1.0 / scale);
             cairo_set_source_surface(cr, surf, 0, 0);
             cairo_paint(cr);
+            cairo_restore(cr);
         }
         cairo_surface_destroy(surf);
     }
     return TRUE;
 }
 
-static void forward_motion(Capture *c, int wx, int wy)
+static void forward_motion(Capture *c, double wx, double wy)
 {
+    const int scale = swell_gdk_widget_scale(c->widget);
     Window child; int rx, ry;
     XTranslateCoordinates(c->dpy, c->plugin_win, DefaultRootWindow(c->dpy),
-                          wx, wy, &rx, &ry, &child);
+                          (int)(wx * scale), (int)(wy * scale), &rx, &ry, &child);
     XTestFakeMotionEvent(c->dpy, DefaultScreen(c->dpy), rx, ry, CurrentTime);
 }
 
@@ -188,7 +195,7 @@ static bool on_button_press(GtkWidget *widget, GdkEventButton *e, gpointer data)
     // with THIS plugin" signal we have.
     g_active_capture = c;
     if (c->hwnd) SetFocus(c->hwnd);
-    forward_motion(c, (int)e->x, (int)e->y);
+    forward_motion(c, e->x, e->y);
     XTestFakeButtonEvent(c->dpy, e->button, True, CurrentTime);
     XFlush(c->dpy);
     return true;
@@ -199,7 +206,7 @@ static bool on_button_release(GtkWidget *, GdkEventButton *e, gpointer data)
     DEBUG_PRINT("[DNDX] widget button RELEASE btn=%d\n", e->button);
     Capture *c = (Capture*)data;
     if (!c || !c->dpy) return false;
-    forward_motion(c, (int)e->x, (int)e->y);
+    forward_motion(c, e->x, e->y);
     XTestFakeButtonEvent(c->dpy, e->button, False, CurrentTime);
     XFlush(c->dpy);
     return true;
@@ -223,7 +230,7 @@ static bool on_motion(GtkWidget *, GdkEventMotion *e, gpointer data)
 
     Capture *c = (Capture*)data;
     if (!c || !c->dpy) return false;
-    forward_motion(c, (int)e->x, (int)e->y);
+    forward_motion(c, e->x, e->y);
     XFlush(c->dpy);
     return true;
 }
@@ -240,7 +247,7 @@ static bool on_scroll(GtkWidget *, GdkEventScroll *e, gpointer data)
         case GDK_SCROLL_RIGHT: btn = 7; break;
         default: return false;
     }
-    forward_motion(c, (int)e->x, (int)e->y);
+    forward_motion(c, e->x, e->y);
     XTestFakeButtonEvent(c->dpy, btn, True,  CurrentTime);
     XTestFakeButtonEvent(c->dpy, btn, False, CurrentTime);
     XFlush(c->dpy);
@@ -412,11 +419,14 @@ static void cleanup_capture(Capture *c)
     delete c;
 }
 
-static bool canvas_draw_cb(GtkWidget *, cairo_t *cr, gpointer data)
+static bool canvas_draw_cb(GtkWidget *widget, cairo_t *cr, gpointer data)
 {
     Capture *c = (Capture*)data;
     if (!c || !c->dpy) return false;
 
+    const int scale = swell_gdk_widget_scale(widget);
+    cairo_save(cr);
+    cairo_scale(cr, 1.0 / scale, 1.0 / scale);
     cairo_set_source_rgba(cr, 0, 0, 0, 0);
     cairo_set_operator(cr, CAIRO_OPERATOR_SOURCE);
     cairo_paint(cr);
@@ -443,16 +453,18 @@ static bool canvas_draw_cb(GtkWidget *, cairo_t *cr, gpointer data)
             cairo_surface_destroy(surf);
         }
     }
+    cairo_restore(cr);
     return true;
 }
 
-static bool canvas_button_press(GtkWidget *, GdkEventButton *e, gpointer data)
+static bool canvas_button_press(GtkWidget *widget, GdkEventButton *e, gpointer data)
 {
     Capture *c = (Capture*)data;
     if (!c || !c->dpy) return false;
 
-    int screen_x = (int)e->x;
-    int screen_y = (int)e->y;
+    const int scale = swell_gdk_widget_scale(widget);
+    int screen_x = (int)(e->x * scale);
+    int screen_y = (int)(e->y * scale);
     int x11_x = screen_x - c->gtk_x;
     int x11_y = screen_y - c->gtk_y;
 
@@ -492,7 +504,7 @@ static bool canvas_button_release(GtkWidget *, GdkEventButton *e, gpointer data)
     return true;
 }
 
-static bool canvas_motion(GtkWidget *, GdkEventMotion *e, gpointer data)
+static bool canvas_motion(GtkWidget *widget, GdkEventMotion *e, gpointer data)
 {
     Capture *c = (Capture*)data;
     if (!c || !c->dpy) return false;
@@ -502,8 +514,9 @@ static bool canvas_motion(GtkWidget *, GdkEventMotion *e, gpointer data)
     if (now - last_time < 16) return true;
     last_time = now;
 
-    int screen_x = (int)e->x;
-    int screen_y = (int)e->y;
+    const int scale = swell_gdk_widget_scale(widget);
+    int screen_x = (int)(e->x * scale);
+    int screen_y = (int)(e->y * scale);
     int x11_x = screen_x - c->gtk_x;
     int x11_y = screen_y - c->gtk_y;
 
@@ -566,8 +579,9 @@ static void refresh_gtk_offset(Capture *c, int *out_px = nullptr, int *out_py = 
 
     int wox = 0, woy = 0;
     gdk_window_get_origin(ww, &wox, &woy);
-    c->gtk_x = wox - px;
-    c->gtk_y = woy - py;
+    const int scale = swell_gdk_window_scale(ww);
+    c->gtk_x = wox * scale - px;
+    c->gtk_y = woy * scale - py;
 }
 
 static void canvas_add_popup(Capture *c, Window x11_win, XWindowAttributes *attr)
@@ -663,7 +677,7 @@ static void canvas_remove_popup(Capture *c, Window x11_win)
 
 struct ModalRender { Capture *cap; Window x11_win; };
 
-static bool modal_draw_cb(GtkWidget *, cairo_t *cr, gpointer data)
+static bool modal_draw_cb(GtkWidget *widget, cairo_t *cr, gpointer data)
 {
     ModalRender *m = (ModalRender*)data;
     if (!m || !m->cap || !m->cap->dpy) return false;
@@ -679,46 +693,51 @@ static bool modal_draw_cb(GtkWidget *, cairo_t *cr, gpointer data)
 
     cairo_surface_t *surf = cairo_xlib_surface_create(dpy, pm, visual, gw, gh);
     if (surf) {
+        const int scale = swell_gdk_widget_scale(widget);
+        cairo_save(cr);
+        cairo_scale(cr, 1.0 / scale, 1.0 / scale);
         cairo_set_source_surface(cr, surf, 0, 0);
         cairo_paint(cr);
+        cairo_restore(cr);
         cairo_surface_destroy(surf);
     }
     return true;
 }
 
-static void modal_forward_motion(ModalRender *m, int wx, int wy)
+static void modal_forward_motion(ModalRender *m, GtkWidget *widget, double wx, double wy)
 {
+    const int scale = swell_gdk_widget_scale(widget);
     Window child; int rx, ry;
     XTranslateCoordinates(m->cap->dpy, m->x11_win, DefaultRootWindow(m->cap->dpy),
-                          wx, wy, &rx, &ry, &child);
+                          (int)(wx * scale), (int)(wy * scale), &rx, &ry, &child);
     XTestFakeMotionEvent(m->cap->dpy, DefaultScreen(m->cap->dpy), rx, ry, CurrentTime);
 }
 
-static bool modal_button_press(GtkWidget *, GdkEventButton *e, gpointer data)
+static bool modal_button_press(GtkWidget *widget, GdkEventButton *e, gpointer data)
 {
     ModalRender *m = (ModalRender*)data;
     if (!m || !m->cap->dpy) return false;
-    modal_forward_motion(m, (int)e->x, (int)e->y);
+    modal_forward_motion(m, widget, e->x, e->y);
     XTestFakeButtonEvent(m->cap->dpy, e->button, True, CurrentTime);
     XFlush(m->cap->dpy);
     return true;
 }
 
-static bool modal_button_release(GtkWidget *, GdkEventButton *e, gpointer data)
+static bool modal_button_release(GtkWidget *widget, GdkEventButton *e, gpointer data)
 {
     ModalRender *m = (ModalRender*)data;
     if (!m || !m->cap->dpy) return false;
-    modal_forward_motion(m, (int)e->x, (int)e->y);
+    modal_forward_motion(m, widget, e->x, e->y);
     XTestFakeButtonEvent(m->cap->dpy, e->button, False, CurrentTime);
     XFlush(m->cap->dpy);
     return true;
 }
 
-static bool modal_motion(GtkWidget *, GdkEventMotion *e, gpointer data)
+static bool modal_motion(GtkWidget *widget, GdkEventMotion *e, gpointer data)
 {
     ModalRender *m = (ModalRender*)data;
     if (!m || !m->cap->dpy) return false;
-    modal_forward_motion(m, (int)e->x, (int)e->y);
+    modal_forward_motion(m, widget, e->x, e->y);
     XFlush(m->cap->dpy);
     return true;
 }
@@ -765,10 +784,11 @@ static void create_modal(Capture *state, Window win, XWindowAttributes *attr)
 
     gtk_window_set_type_hint(GTK_WINDOW(gtk_win), GDK_WINDOW_TYPE_HINT_DIALOG);
 
-    gtk_window_resize(GTK_WINDOW(gtk_win), attr->width, attr->height);
+    const int scale = swell_gdk_widget_scale(state->widget);
+    gtk_window_resize(GTK_WINDOW(gtk_win), swell_gdk_ceil(attr->width, scale), swell_gdk_ceil(attr->height, scale));
 
     GtkWidget *draw = gtk_drawing_area_new();
-    gtk_widget_set_size_request(draw, attr->width, attr->height);
+    gtk_widget_set_size_request(draw, swell_gdk_ceil(attr->width, scale), swell_gdk_ceil(attr->height, scale));
     gtk_container_add(GTK_CONTAINER(gtk_win), draw);
 
     ModalRender *mr = new ModalRender();
@@ -942,6 +962,9 @@ static bool on_popup_configured(Window w, int cx, int cy, int cw, int ch)
                 if (cwin) {
                     GdkRectangle old_r = { old_x, old_y, old_w, old_h };
                     GdkRectangle new_r = { p.x,   p.y,   p.w,   p.h   };
+                    const int scale = swell_gdk_window_scale(cwin);
+                    old_r = swell_gdk_logical_rect(old_r, scale);
+                    new_r = swell_gdk_logical_rect(new_r, scale);
                     gdk_window_invalidate_rect(cwin, &old_r, FALSE);
                     gdk_window_invalidate_rect(cwin, &new_r, FALSE);
                 } else {
@@ -966,7 +989,7 @@ static void handle_damage_notify(XDamageNotifyEvent *de)
     Capture *c = find_capture(de->drawable);
     if (c && c->widget && GTK_IS_WIDGET(c->widget)) {
         if (refresh_pixmap(c)) {
-            gtk_widget_queue_draw_area(c->widget, de->area.x, de->area.y,
+            swell_gdk_queue_draw_pixels(c->widget, de->area.x, de->area.y,
                                        de->area.width, de->area.height);
         }
         return;
@@ -981,7 +1004,7 @@ static void handle_damage_notify(XDamageNotifyEvent *de)
                 if (cc->canvas_draw && GTK_IS_WIDGET(cc->canvas_draw)) {
                     int inv_x = pp.x + de->area.x;
                     int inv_y = pp.y + de->area.y;
-                    gtk_widget_queue_draw_area(cc->canvas_draw, inv_x, inv_y,
+                    swell_gdk_queue_draw_pixels(cc->canvas_draw, inv_x, inv_y,
                                                de->area.width, de->area.height);
                 }
                 return;
@@ -1007,7 +1030,7 @@ static void handle_damage_notify(XDamageNotifyEvent *de)
                             md.h = wa.height;
                         }
                     }
-                    gtk_widget_queue_draw_area(md.draw, de->area.x, de->area.y,
+                    swell_gdk_queue_draw_pixels(md.draw, de->area.x, de->area.y,
                                                de->area.width, de->area.height);
                 }
                 return;
@@ -1232,6 +1255,12 @@ static GtkWidget* xw_ensure_embed_widget(HWND h)
         GtkWidget *child = gtk_bin_get_child(GTK_BIN(top));
         if (child) return child;
         GtkWidget *fixed = gtk_fixed_new();
+        if (g_swell_wayland_title_h && (h->m_style & WS_CAPTION)) {
+            gtk_widget_set_margin_start(fixed, SWELL_WAYLAND_BORDER_WIDTH);
+            gtk_widget_set_margin_end(fixed, SWELL_WAYLAND_BORDER_WIDTH);
+            gtk_widget_set_margin_top(fixed, g_swell_wayland_title_h + SWELL_WAYLAND_BORDER_WIDTH);
+            gtk_widget_set_margin_bottom(fixed, SWELL_WAYLAND_BORDER_WIDTH);
+        }
         gtk_container_add(GTK_CONTAINER(top), fixed);
         gtk_widget_show(fixed);
         return fixed;
@@ -1243,6 +1272,9 @@ static GtkWidget* xw_ensure_embed_widget(HWND h)
     // never get smaller than its previous plugin. Sized by their children instead.
     GtkWidget *parent_widget = xw_ensure_embed_widget(h->m_parent);
     if (!parent_widget || !GTK_IS_FIXED(parent_widget)) return nullptr;
+    const int scale = swell_gdk_widget_scale(parent_widget);
+    const int x = swell_gdk_floor(h->m_position.left, scale);
+    const int y = swell_gdk_floor(h->m_position.top, scale);
 
     GtkWidget *existing = (GtkWidget*)GetProp(h, "XBridgeEmbedFixed");
 
@@ -1251,7 +1283,7 @@ static GtkWidget* xw_ensure_embed_widget(HWND h)
     }
 
     if (existing && GTK_IS_WIDGET(existing)) {
-        gtk_fixed_move(GTK_FIXED(parent_widget), existing, h->m_position.left, h->m_position.top);
+        gtk_fixed_move(GTK_FIXED(parent_widget), existing, x, y);
         return existing;
     }
 
@@ -1261,7 +1293,7 @@ static GtkWidget* xw_ensure_embed_widget(HWND h)
     }
 
     GtkWidget *fixed = gtk_fixed_new();
-    gtk_fixed_put(GTK_FIXED(parent_widget), fixed, h->m_position.left, h->m_position.top);
+    gtk_fixed_put(GTK_FIXED(parent_widget), fixed, x, y);
     gtk_widget_show(fixed);
 
     g_object_set_data(G_OBJECT(parent_widget), "xw-active-embed-fixed", fixed);
@@ -1339,6 +1371,7 @@ void xw_destroy(HWND hwnd)
     // m_oswidget is non-NULL here only if the widget is still alive (the weak
     // pointer nulls it on destroy), so this is safe.
     if (hwnd->m_oswidget && GTK_IS_WIDGET(hwnd->m_oswidget)) {
+        g_signal_handlers_disconnect_by_data(hwnd->m_oswidget, hwnd);
         g_object_remove_weak_pointer(G_OBJECT(hwnd->m_oswidget), (gpointer*)&hwnd->m_oswidget);
         GtkWidget *parent = gtk_widget_get_parent(hwnd->m_oswidget);
         if (parent) gtk_container_remove(GTK_CONTAINER(parent), hwnd->m_oswidget);
@@ -1389,18 +1422,11 @@ void xw_size(HWND hwnd)
 
     GtkWidget *container = bs->embed_container;
     if (!container || !GTK_IS_FIXED(container)) return;
+    const int scale = swell_gdk_widget_scale(container);
 
     RECT r = hwnd->m_position;
     int pos_x = r.left, pos_y = r.top;
     int w = r.right - r.left, h = r.bottom - r.top;
-
-    // title is bigger if compositor needs CSD
-    if (g_swell_wayland_title_h > 0){
-        pos_y += g_swell_wayland_title_h + (SWELL_WAYLAND_BORDER_WIDTH * 2);
-        pos_x += SWELL_WAYLAND_BORDER_WIDTH * 2;
-        w += SWELL_WAYLAND_BORDER_WIDTH * 2;
-        h += SWELL_WAYLAND_BORDER_WIDTH * 2;
-    }
 
     HWND top = hwnd->m_parent;
     while (top && !top->m_oswidget) top = top->m_parent;
@@ -1426,6 +1452,11 @@ void xw_size(HWND hwnd)
         place_container(bs->cap->dpy, bs->cap->parent_win, w, h);
         XFlush(bs->cap->dpy);
     }
+
+    pos_x = swell_gdk_floor(pos_x, scale);
+    pos_y = swell_gdk_floor(pos_y, scale);
+    w = swell_gdk_ceil(w, scale);
+    h = swell_gdk_ceil(h, scale);
 
     if (!bs->placed) {
         // If we are re-placing after the host toplevel was replaced, the widget
@@ -1486,6 +1517,11 @@ static LRESULT xw_bridgeProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam)
     return 0;
 }
 
+static void xw_scale_changed(GtkWidget *, GParamSpec *, gpointer data)
+{
+    xw_size((HWND)data);
+}
+
 HWND xw_bridge_create(HWND viewpar, void **wref, const RECT *r, const char *bridge_class_name)
 {
     HWND hwnd = nullptr;
@@ -1511,7 +1547,10 @@ HWND xw_bridge_create(HWND viewpar, void **wref, const RECT *r, const char *brid
     XFlush(disp);
 
     GtkWidget *draw_area = gtk_drawing_area_new();
-    gtk_widget_set_size_request(draw_area, w, h);
+    HWND parent = viewpar;
+    while (parent && !parent->m_oswidget) parent = parent->m_parent;
+    const int scale = swell_gdk_widget_scale(parent ? parent->m_oswidget : NULL);
+    gtk_widget_set_size_request(draw_area, swell_gdk_ceil(w, scale), swell_gdk_ceil(h, scale));
 
     hwnd = new HWND__(viewpar, 0, r, NULL, true, xw_bridgeProc);
     hwnd->m_classname = bridge_class_name;
@@ -1523,6 +1562,7 @@ HWND xw_bridge_create(HWND viewpar, void **wref, const RECT *r, const char *brid
     bs->disp   = disp;
     bs->parent = container;
     hwnd->m_private_data = (INT_PTR)bs;
+    g_signal_connect(draw_area, "notify::scale-factor", G_CALLBACK(xw_scale_changed), hwnd);
 
     *wref = (void*)container;
 
