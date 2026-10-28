@@ -9,6 +9,7 @@
 #include <X11/extensions/Xcomposite.h>
 #include <X11/extensions/Xdamage.h>
 #include <X11/extensions/Xfixes.h>
+#include <X11/extensions/shape.h>
 #include <cairo/cairo-xlib.h>
 void xw_size(HWND hwnd);
 
@@ -507,6 +508,14 @@ static bool canvas_draw_cb(GtkWidget *widget, cairo_t *cr, gpointer data)
     return true;
 }
 
+static bool popup_accepts_input(Display *dpy, Window window)
+{
+    int count = 0, ordering;
+    XRectangle *rects = XShapeGetRectangles(dpy, window, ShapeInput, &count, &ordering);
+    if (rects) XFree(rects);
+    return count > 0;
+}
+
 static bool canvas_button_press(GtkWidget *widget, GdkEventButton *e, gpointer data)
 {
     Capture *c = (Capture*)data;
@@ -522,7 +531,8 @@ static bool canvas_button_press(GtkWidget *widget, GdkEventButton *e, gpointer d
     for (auto it = c->popups.rbegin(); it != c->popups.rend(); ++it) {
         if (!it->visible) continue;
         if (screen_x >= it->x && screen_x < it->x + it->w &&
-            screen_y >= it->y && screen_y < it->y + it->h) {
+            screen_y >= it->y && screen_y < it->y + it->h &&
+            popup_accepts_input(c->dpy, it->x11_win)) {
             hit = true;
             XTestFakeMotionEvent(c->dpy, DefaultScreen(c->dpy), x11_x, x11_y, CurrentTime);
             XFlush(c->dpy);
@@ -699,7 +709,8 @@ static void canvas_add_popup(Capture *c, Window x11_win, XWindowAttributes *attr
     pp->h = attr->height;
     pp->visible = true;
 
-    if (c->root_popup == None) c->root_popup = x11_win;
+    if (c->root_popup == None && popup_accepts_input(c->dpy, x11_win))
+        c->root_popup = x11_win;
 
     if (!gtk_widget_get_visible(c->popup_canvas))
         gtk_widget_show_all(c->popup_canvas);
@@ -928,14 +939,6 @@ static void handle_new_window(Window win, Capture *state, XWindowAttributes *att
 
     bool is_popup = classify_popup(state->dpy, win, attr);
     if (is_popup) {
-        if (attr->width <= 1 || attr->height <= 1) {
-            DEBUG_PRINT("skipping 1x1 window: 0x%lx (%dx%d)\n", (unsigned long)win, attr->width, attr->height);
-            return;
-        }
-        if (attr->width == 12 || attr->height == 12) {
-            DEBUG_PRINT("skipping unnamed shadow juce window: 0x%lx (%dx%d)\n", (unsigned long)win, attr->width, attr->height);
-            return;
-        }
         canvas_add_popup(state, win, attr);
     } else {
         create_modal(state, win, attr);

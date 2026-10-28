@@ -112,7 +112,7 @@ OBJS = $(SWELL_OBJS)
 ifdef WAYLAND
   SWELL_OBJS += xwayland-bridge.o xwayland-bridge-wm.o xwayland-bridge-display.o
   CFLAGS += $(shell $(PKG_CONFIG) --cflags wayland-client)
-  LINKEXTRA += -lXcomposite -lXtst -lXfixes $(shell $(PKG_CONFIG) --libs wayland-client)
+  LINKEXTRA += -lXcomposite -lXtst -lXfixes -lXext $(shell $(PKG_CONFIG) --libs wayland-client)
   override SWELL_GDK_ONLY =
   # spare-window for modal dialogs doesn't resize on an already 
 	# mapped Wayland so disable it
