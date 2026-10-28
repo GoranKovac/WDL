@@ -65,18 +65,37 @@ static int wm_x11_error_handler(Display *dpy, XErrorEvent *err)
     return 0;
 }
 
-// GLib main-loop watch: pump all pending events. The WM handles each first, then
-// the bridge gets a look via on_unhandled_event for its own per-event work.
-static gboolean wm_gio_event_cb(GIOChannel *, GIOCondition, gpointer)
+struct WMEventSource {
+    GSource source;
+    GPollFD poll;
+};
+
+static gboolean wm_event_prepare(GSource *, gint *timeout)
 {
-    while (g_wm_dpy && XPending(g_wm_dpy)) {
+    *timeout = -1;
+    return g_wm_dpy && XEventsQueued(g_wm_dpy, QueuedAlready);
+}
+
+static gboolean wm_event_check(GSource *source)
+{
+    WMEventSource *wm_source = (WMEventSource*)source;
+    return (wm_source->poll.revents & G_IO_IN) ||
+        (g_wm_dpy && XEventsQueued(g_wm_dpy, QueuedAlready));
+}
+
+static gboolean wm_event_dispatch(GSource *, GSourceFunc, gpointer)
+{
+    const gint64 deadline = g_get_monotonic_time() + 2000;
+    for (int n = 0; n < 64 && g_wm_dpy && XPending(g_wm_dpy); ++n) {
         XEvent ev;
         XNextEvent(g_wm_dpy, &ev);
         if (g_wm) {
             g_wm->handle_event(&ev);
             if (g_wm->on_unhandled_event) g_wm->on_unhandled_event(&ev);
         }
+        if (g_get_monotonic_time() >= deadline) break;
     }
+    if (g_wm_dpy) XFlush(g_wm_dpy);
     return TRUE;
 }
 
@@ -108,9 +127,15 @@ XWaylandWM* XWaylandWM::init_bridge_wm(const char *display_name)
     // Created before we held SubstructureRedirect, so no CreateNotify for it.
     g_wm->disallow_commits(support);
 
-    GIOChannel *ch = g_io_channel_unix_new(ConnectionNumber(g_wm_dpy));
-    g_io_add_watch(ch, G_IO_IN, wm_gio_event_cb, nullptr);
-    g_io_channel_unref(ch);
+    static GSourceFuncs funcs = { wm_event_prepare, wm_event_check, wm_event_dispatch, nullptr, nullptr, nullptr };
+    GSource *source = g_source_new(&funcs, sizeof(WMEventSource));
+    WMEventSource *wm_source = (WMEventSource*)source;
+    wm_source->poll.fd = ConnectionNumber(g_wm_dpy);
+    wm_source->poll.events = G_IO_IN;
+    g_source_add_poll(source, &wm_source->poll);
+    g_source_set_priority(source, GDK_PRIORITY_REDRAW + 1);
+    g_source_attach(source, nullptr);
+    g_source_unref(source);
 
     DEBUG_PRINT("[WM] initialised\n");
     return g_wm;
