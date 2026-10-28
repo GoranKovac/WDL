@@ -100,7 +100,6 @@ XWaylandWM* XWaylandWM::init_bridge_wm(const char *display_name)
     if (s_xwayland_pid < 0) return nullptr;
 
     setenv("DISPLAY", display_name, 1);
-    // Vsynced GLX swaps used to block ~1s here; see disallow_commits().
     XInitThreads();
     XSetErrorHandler(wm_x11_error_handler);
 
