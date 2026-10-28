@@ -1237,11 +1237,10 @@ static GtkWidget* xw_ensure_embed_widget(HWND h)
         return fixed;
     }
 
-    int w = h->m_position.right - h->m_position.left;
-    int hh = h->m_position.bottom - h->m_position.top;
-    if (w < 1) w = 1;
-    if (hh < 1) hh = 1;
-
+    // No size request on these intermediate fixeds: it was only refreshed when a
+    // bridge xw_size ran, so after REAPER resized h it went stale -- and GTK won't
+    // let a toplevel shrink below its content's request, so a host window could
+    // never get smaller than its previous plugin. Sized by their children instead.
     GtkWidget *parent_widget = xw_ensure_embed_widget(h->m_parent);
     if (!parent_widget || !GTK_IS_FIXED(parent_widget)) return nullptr;
 
@@ -1253,7 +1252,6 @@ static GtkWidget* xw_ensure_embed_widget(HWND h)
 
     if (existing && GTK_IS_WIDGET(existing)) {
         gtk_fixed_move(GTK_FIXED(parent_widget), existing, h->m_position.left, h->m_position.top);
-        gtk_widget_set_size_request(existing, w, hh);
         return existing;
     }
 
@@ -1263,7 +1261,6 @@ static GtkWidget* xw_ensure_embed_widget(HWND h)
     }
 
     GtkWidget *fixed = gtk_fixed_new();
-    gtk_widget_set_size_request(fixed, w, hh);
     gtk_fixed_put(GTK_FIXED(parent_widget), fixed, h->m_position.left, h->m_position.top);
     gtk_widget_show(fixed);
 
@@ -1365,8 +1362,8 @@ void xw_size(HWND hwnd)
     //     ... gdk_window_reparent(bs->w, h->m_oswindow, ...);
     //         bs->cur_parent = h->m_oswindow;
     //
-    // REAPER destroys and recreates the FX window when a plugin resizes itself
-    // (Kontakt loading a library). swell_oswindow_destroy() destroys the
+    // SWELL replaces the host toplevel when the FX window is floated/unfloated
+    // from the FX list. swell_oswindow_destroy() destroys the
     // GdkWindow and nulls m_oswidget, then swell_oswindow_manage() builds a
     // fresh GtkWindow. Our drawing area stays in the discarded one: GTK still
     // reports it parented with a GtkWindow toplevel, but at the GDK level its

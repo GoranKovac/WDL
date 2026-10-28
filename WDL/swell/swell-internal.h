@@ -1037,6 +1037,9 @@ void swell_oswindow_postresize(HWND hwnd, RECT f);
 void swell_oswindow_invalidate(HWND hwnd, const RECT *r);
 void swell_oswindow_destroy(HWND hwnd);
 void swell_oswindow_manage(HWND hwnd, bool wantfocus);
+#ifdef SWELL_TARGET_WAYLAND
+void swell_oswindow_resize_mapped(HWND hwnd, int reposflag, RECT f);
+#endif
 void swell_oswindow_maximize(HWND, bool wantmax); // false=restore
 void swell_oswindow_updatetoscreen(HWND hwnd, RECT *rect);
 HWND swell_window_wants_all_input(); // window with an active drag of menubar will have this set, to route all mouse events to nonclient area of window

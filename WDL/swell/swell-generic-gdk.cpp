@@ -136,6 +136,11 @@ static void _gdk_x11_window_move_to_desktop(GdkWindow *window, guint32 desktop)
 
 // for m_oswindow_private
 #define PRIVATE_NEEDSHOW 1 
+#define PRIVATE_SIZEPIN 2 // Wayland: min==max size pin pending, see swell_oswindow_resize_mapped
+
+#ifdef SWELL_TARGET_WAYLAND
+static void swell_wl_sizepin_release(GdkFrameClock *clock, gpointer data);
+#endif
 
 #ifndef SWELL_WINDOWSKEY_GDK_MASK
 #define  SWELL_WINDOWSKEY_GDK_MASK GDK_MOD4_MASK
@@ -377,6 +382,14 @@ void swell_oswindow_destroy(HWND hwnd)
   // stops getting clicks after the project-open dialog).
   if (hwnd && hwnd->m_oswidget && GTK_IS_WINDOW(hwnd->m_oswidget))
     gtk_window_set_modal(GTK_WINDOW(hwnd->m_oswidget), FALSE);
+
+  if (hwnd && (hwnd->m_oswindow_private & PRIVATE_SIZEPIN))
+  {
+    hwnd->m_oswindow_private &= ~PRIVATE_SIZEPIN;
+    if (hwnd->m_oswindow)
+      g_signal_handlers_disconnect_by_func(gdk_window_get_frame_clock(hwnd->m_oswindow),
+                                           (gpointer)swell_wl_sizepin_release, hwnd);
+  }
 #endif
   if (hwnd && hwnd->m_oswindow)
   {
@@ -492,6 +505,9 @@ void swell_oswindow_focus(HWND hwnd)
 void swell_recalcMinMaxInfo(HWND hwnd)
 {
   if (!hwnd || !hwnd->m_oswindow || !(hwnd->m_style & WS_CAPTION)) return;
+#ifdef SWELL_TARGET_WAYLAND
+  if (hwnd->m_oswindow_private & PRIVATE_SIZEPIN) return; // don't overwrite a pending pin
+#endif
   MINMAXINFO mmi;
   memset(&mmi,0,sizeof(mmi));
   if (hwnd->m_style & WS_THICKFRAME)
@@ -980,9 +996,9 @@ void swell_oswindow_manage(HWND hwnd, bool wantfocus)
           // GTK ignores set_default_size when content natural size differs, and a
           // max-only hint just caps (doesn't force). To make the restored size
           // actually apply on Wayland, pin min=max=restored size — GTK cannot
-          // override an exact min==max constraint. This is released on the FIRST
-          // configure event (see OnConfigureEvent), i.e. once the window has been
-          // mapped at this exact size, after which it is freely resizable.
+          // override an exact min==max constraint. The compositor's limits are
+          // relaxed on the first configure (swell_recalcMinMaxInfo), but GTK keeps
+          // this pin and clamps later resizes to it -- see swell_oswindow_resize_mapped.
           int rw = r.right - r.left, rh = r.bottom - r.top;
           if (rw < 1) rw = 1;
           if (rh < 1) rh = 1;
@@ -3093,6 +3109,58 @@ void swell_oswindow_resize(SWELL_OSWINDOW wnd, int reposflag, RECT f)
   else if (reposflag&2) gdk_window_resize(wnd,f.right-f.left,f.bottom-f.top);
   else if (reposflag&1) gdk_window_move(wnd,f.left,f.top);
 }
+
+#ifdef SWELL_TARGET_WAYLAND
+// Runs after GDK's own after-paint handler (connected at realize), i.e. after
+// the commit that carried the pin -- back to the window's real limits.
+static void swell_wl_sizepin_release(GdkFrameClock *clock, gpointer data)
+{
+  HWND hwnd = (HWND)data;
+  g_signal_handlers_disconnect_by_func(clock, (gpointer)swell_wl_sizepin_release, data);
+  hwnd->m_oswindow_private &= ~PRIVATE_SIZEPIN;
+  swell_recalcMinMaxInfo(hwnd);
+}
+
+// SetWindowPos on an already-mapped toplevel (e.g. the FX window resizing to a
+// newly selected plugin). gdk_window_resize() alone doesn't stick: the
+// GtkWindow still holds the min==max hints from creation (see
+// swell_oswindow_manage) and clamps every request back to that size. Moving
+// that pin to the new size makes GTK resize the window itself. Some compositors
+// (Hyprland) only resize a floating window to min==max, so keep the pin on the
+// GdkWindow until the frame carrying it has been committed.
+void swell_oswindow_resize_mapped(HWND hwnd, int reposflag, RECT f)
+{
+  if (!(reposflag&2) || !hwnd->m_oswidget || !GTK_IS_WINDOW(hwnd->m_oswidget))
+  {
+    swell_oswindow_resize(hwnd->m_oswindow,reposflag,f);
+    return;
+  }
+
+  int w = wdl_max(f.right - f.left, 1), h = wdl_max(f.bottom - f.top, 1);
+  if (swell_wayland_needs_manual_titlebar(hwnd))
+  {
+    w += SWELL_WAYLAND_BORDER_WIDTH*2;
+    h += g_swell_wayland_title_h + SWELL_WAYLAND_BORDER_WIDTH*2;
+  }
+
+  GdkGeometry gh;
+  memset(&gh,0,sizeof(gh));
+  gh.min_width = gh.max_width = w;
+  gh.min_height = gh.max_height = h;
+  gtk_window_set_geometry_hints(GTK_WINDOW(hwnd->m_oswidget), NULL, &gh,
+    (GdkWindowHints)(GDK_HINT_MIN_SIZE | GDK_HINT_MAX_SIZE));
+  // GTK only sends hints that differ from the last ones it sent, which may not
+  // be what the compositor has now -- send them on the GdkWindow too.
+  gdk_window_set_geometry_hints(hwnd->m_oswindow, &gh,
+    (GdkWindowHints)(GDK_HINT_MIN_SIZE | GDK_HINT_MAX_SIZE));
+  if (!(hwnd->m_oswindow_private & PRIVATE_SIZEPIN))
+  {
+    hwnd->m_oswindow_private |= PRIVATE_SIZEPIN;
+    g_signal_connect(gdk_window_get_frame_clock(hwnd->m_oswindow), "after-paint",
+                     G_CALLBACK(swell_wl_sizepin_release), hwnd);
+  }
+}
+#endif
 
 void swell_oswindow_postresize(HWND hwnd, RECT f) 
 { 
