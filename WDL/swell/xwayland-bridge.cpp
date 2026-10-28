@@ -638,11 +638,25 @@ static void canvas_add_popup(Capture *c, Window x11_win, XWindowAttributes *attr
 {
     if (!c) return;
 
+    // Refresh the cached gtk offset before using it below. Without this,
+    // c->gtk_x/y is only whatever xw_size last stored, which can be stale
+    // when the plugin toplevel has moved (e.g. user drags a floating FX
+    // window) between size events. Removing this call while removing the
+    // slot code was a real bug -- side effect matters more than the out
+    // params ever did.
+    refresh_gtk_offset(c);
+    Window child;
+    int x, y;
+    if (!XTranslateCoordinates(c->dpy, x11_win, DefaultRootWindow(c->dpy),
+                               0, 0, &x, &y, &child)) return;
+    x += c->gtk_x;
+    y += c->gtk_y;
+
     Capture::PopupWin *pp = nullptr;
     for (auto &e : c->popups) if (e.x11_win == x11_win) { pp = &e; break; }
 
     if (pp && pp->pixmap != None &&
-        pp->x == attr->x + c->gtk_x && pp->y == attr->y + c->gtk_y &&
+        pp->x == x && pp->y == y &&
         pp->w == attr->width && pp->h == attr->height)
     {
         pp->visible = true;
@@ -654,14 +668,6 @@ static void canvas_add_popup(Capture *c, Window x11_win, XWindowAttributes *attr
     DEBUG_PRINT("[DNDCOORD] canvas_add_popup win=0x%lx attr=(%d,%d,%d,%d) canvas_was_visible=%d\n",
                 (unsigned long)x11_win, attr->x, attr->y, attr->width, attr->height,
                 c->popup_canvas ? gtk_widget_get_visible(c->popup_canvas) : -1);
-
-    // Refresh the cached gtk offset before using it below. Without this,
-    // c->gtk_x/y is only whatever xw_size last stored, which can be stale
-    // when the plugin toplevel has moved (e.g. user drags a floating FX
-    // window) between size events. Removing this call while removing the
-    // slot code was a real bug -- side effect matters more than the out
-    // params ever did.
-    refresh_gtk_offset(c);
 
     if (!c->popup_canvas) create_popup_canvas(c);
 
@@ -684,8 +690,8 @@ static void canvas_add_popup(Capture *c, Window x11_win, XWindowAttributes *attr
         pp->visual = XGetWindowAttributes(c->dpy, x11_win, &wa_local)
                    ? wa_local.visual : DefaultVisual(c->dpy, DefaultScreen(c->dpy));
     }
-    pp->x = attr->x + c->gtk_x;
-    pp->y = attr->y + c->gtk_y;
+    pp->x = x;
+    pp->y = y;
     DEBUG_PRINT("[POPOFF] win=0x%lx attr=(%d,%d) gtk=(%d,%d) -> pp=(%d,%d)\n",
                 (unsigned long)x11_win, attr->x, attr->y,
                 c->gtk_x, c->gtk_y, pp->x, pp->y);
@@ -987,23 +993,21 @@ static void on_popup_unmapped(Window w)
     }
 }
 
-static bool on_popup_configured(Window w, int cx, int cy, int cw, int ch)
+static bool on_popup_configured(Window w, int cw, int ch)
 {
     for (auto &kv : g_captures) {
         Capture *c = kv.second;
         if (!c || kv.first != c->parent_win) continue;
         for (auto &p : c->popups) {
             if (p.x11_win != w) continue;
-            int ox = 0, oy = 0;
-            refresh_gtk_offset(c, &ox, &oy);
+            Window child;
+            int x, y;
+            if (!XTranslateCoordinates(c->dpy, w, DefaultRootWindow(c->dpy),
+                                       0, 0, &x, &y, &child)) return true;
+            refresh_gtk_offset(c);
             int old_x = p.x, old_y = p.y, old_w = p.w, old_h = p.h;
-            {
-                int fx = cx, fy = cy;
-                if (fx < ox) fx += ox;
-                if (fy < oy) fy += oy;
-                p.x = fx + c->gtk_x;
-                p.y = fy + c->gtk_y;
-            }
+            p.x = x + c->gtk_x;
+            p.y = y + c->gtk_y;
             bool size_changed = (p.w != cw || p.h != ch);
             p.w = cw; p.h = ch;
             if (size_changed) {
@@ -1168,7 +1172,6 @@ static void bridge_handle_event(XEvent *ev)
             break;
         case ConfigureNotify:
             on_popup_configured(ev->xconfigure.window,
-                                ev->xconfigure.x, ev->xconfigure.y,
                                 ev->xconfigure.width, ev->xconfigure.height);
             break;
         default:
