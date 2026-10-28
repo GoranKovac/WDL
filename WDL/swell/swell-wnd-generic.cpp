@@ -140,7 +140,9 @@ HWND__::HWND__(HWND par, int wID, const RECT *wndr, const char *label, bool visi
      m_menu=NULL;
      m_font=NULL;
      m_oswindow = NULL;
+#ifdef SWELL_TARGET_WAYLAND
      m_oswidget = NULL;
+#endif
 
 #ifdef SWELL_LICE_GDI
      m_paintctx=0;
