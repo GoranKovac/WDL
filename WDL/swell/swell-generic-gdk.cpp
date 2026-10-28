@@ -24,6 +24,7 @@
 #ifndef SWELL_PROVIDED_BY_APP
 #ifdef SWELL_TARGET_WAYLAND
 #include <gdk/gdkwayland.h>
+#include <gio/gdesktopappinfo.h>
 #include <wayland-client.h>
 #include "xwayland-bridge.h"
 #endif
@@ -172,6 +173,28 @@ static int gdk_options;
 int g_swell_wayland_title_h; // 0 = compositor has real SSD, use it normally
 #define SWELL_WAYLAND_TITLEBAR_CLOSEBTN_W 36
 int SWELL_WAYLAND_BORDER_WIDTH = 2;
+
+static void swell_wayland_init_application_id()
+{
+  if (!g_swell_appname || !GDK_IS_WAYLAND_DISPLAY(gdk_display_get_default())) return;
+
+  GList *apps = g_app_info_get_all();
+  for (GList *p = apps; p; p = p->next)
+  {
+    if (!G_IS_DESKTOP_APP_INFO(p->data)) continue;
+    const char *wmclass = g_desktop_app_info_get_startup_wm_class(G_DESKTOP_APP_INFO(p->data));
+    const char *id = g_app_info_get_id(G_APP_INFO(p->data));
+    if (wmclass && !strcmp(wmclass, g_swell_appname) && id && g_str_has_suffix(id, ".desktop"))
+    {
+      char *app_id = g_strndup(id, strlen(id) - strlen(".desktop"));
+      g_set_prgname(app_id);
+      g_free(app_id);
+      break;
+    }
+  }
+  for (GList *p = apps; p; p = p->next) g_object_unref(p->data);
+  g_list_free(apps);
+}
 
 static void swell_wayland_init_titlebar_height()
 {
@@ -702,6 +725,7 @@ static void init_options()
     gdk_options = 0x40000000;
 
 #ifdef SWELL_TARGET_WAYLAND
+    swell_wayland_init_application_id();
     swell_wayland_init_titlebar_height();
     swell_wayland_suppress_csd_shadow_once();
 #endif
