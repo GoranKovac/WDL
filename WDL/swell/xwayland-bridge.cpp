@@ -1293,6 +1293,27 @@ void init_private_xwayland()
     g_wm->dnd_init();
 }
 
+struct XwFixed { GtkFixed parent; };
+struct XwFixedClass { GtkFixedClass parent; };
+G_DEFINE_TYPE(XwFixed, xw_fixed, GTK_TYPE_FIXED)
+
+static void xw_fixed_get_preferred_size(GtkWidget *, gint *minimum, gint *natural)
+{
+    if (minimum) *minimum = 1;
+    if (natural) *natural = 1;
+}
+
+static void xw_fixed_class_init(XwFixedClass *klass)
+{
+    GtkWidgetClass *widget_class = GTK_WIDGET_CLASS(klass);
+    widget_class->get_preferred_width = xw_fixed_get_preferred_size;
+    widget_class->get_preferred_height = xw_fixed_get_preferred_size;
+}
+
+static void xw_fixed_init(XwFixed *)
+{
+}
+
 // Recursively ensures h has its own real, positioned GtkFixed widget, creating one
 // (and recursively ensuring its own parent has one first) if it doesn't already.
 // A true toplevel (h->m_oswidget already set by SWELL itself) is the recursion's
@@ -1309,7 +1330,7 @@ static GtkWidget* xw_ensure_embed_widget(HWND h)
         if (!GTK_IS_WINDOW(top)) return top; // already a plain container, not a toplevel wrapper
         GtkWidget *child = gtk_bin_get_child(GTK_BIN(top));
         if (child) return child;
-        GtkWidget *fixed = gtk_fixed_new();
+        GtkWidget *fixed = GTK_WIDGET(g_object_new(xw_fixed_get_type(), NULL));
         if (g_swell_wayland_title_h && (h->m_style & WS_CAPTION)) {
             gtk_widget_set_margin_start(fixed, SWELL_WAYLAND_BORDER_WIDTH);
             gtk_widget_set_margin_end(fixed, SWELL_WAYLAND_BORDER_WIDTH);
