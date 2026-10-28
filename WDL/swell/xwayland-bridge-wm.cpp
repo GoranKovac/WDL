@@ -193,6 +193,7 @@ void XWaylandWM::disallow_commits(Window w) {
 void XWaylandWM::announce_wm(Window support_win) {
     support_win_ = support_win;
     Window root = DefaultRootWindow(dpy_);
+    set_active_window(None);
 
     // _NET_SUPPORTING_WM_CHECK on root → support_win
     XChangeProperty(dpy_, root,
@@ -280,6 +281,14 @@ void XWaylandWM::register_container(Window container, bool is_native) {
     containers_.insert(container);
     xwm_redirect_container(dpy_, container);
     (void)is_native;
+}
+
+void XWaylandWM::set_active_window(Window window) {
+    if (active_window_ == window) return;
+    active_window_ = window;
+    XChangeProperty(dpy_, DefaultRootWindow(dpy_), atoms_._NET_ACTIVE_WINDOW,
+                    XA_WINDOW, 32, PropModeReplace, (unsigned char*)&window, 1);
+    XFlush(dpy_);
 }
 
 void XWaylandWM::unregister_container(Window container) {

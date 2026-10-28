@@ -117,6 +117,7 @@ public:
     void on_gtk_focus(GtkWidget *widget, Window x11_win);
     // Call when a GTK widget loses focus.
     void on_gtk_unfocus(GtkWidget *widget);
+    void set_active_window(Window window);
     Time get_server_time();
     // Send WM_TAKE_FOCUS to a window (ICCCM §4.1.7).
     void send_take_focus(Window w, Time t = CurrentTime);
@@ -211,6 +212,7 @@ private:
     std::set<Window> containers_;
     GrabState   grab_;
     Window      support_win_ = None;
+    Window      active_window_ = ~0UL;
 
     // ── DND catcher state ───────────────────────────────────────────────────
     Window   dnd_catcher_        = 0;
