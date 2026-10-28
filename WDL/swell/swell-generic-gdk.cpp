@@ -682,7 +682,7 @@ void SWELL_initargs(int *argc, char ***argv)
     *(void **)&_gdk_set_allowed_backends = dlsym(RTLD_DEFAULT,"gdk_set_allowed_backends");
 
 #ifdef SWELL_TARGET_WAYLAND
-      _gdk_set_allowed_backends("wayland, x11");
+      _gdk_set_allowed_backends("wayland,x11");
 #else
       _gdk_set_allowed_backends("x11");
 #endif
@@ -841,7 +841,8 @@ static void init_options()
   if (!gdk_options)
   {
     gdk_options = OPTIONS_READ;
-    if (getenv("WAYLAND_DISPLAY")) gdk_options |= OPTION_IS_WAYLAND;
+    const char *wayland_display = getenv("WAYLAND_DISPLAY");
+    if (wayland_display && *wayland_display) gdk_options |= OPTION_IS_WAYLAND;
 
 #ifdef SWELL_TARGET_WAYLAND
     swell_wayland_init_application_id();
