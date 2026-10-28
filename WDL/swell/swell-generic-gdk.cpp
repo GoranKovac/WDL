@@ -3090,6 +3090,12 @@ bool GetWindowRect(HWND hwnd, RECT *r)
 void swell_oswindow_begin_resize(SWELL_OSWINDOW wnd)
 {
 #ifdef SWELL_TARGET_WAYLAND
+  HWND hwnd = swell_oswindow_to_hwnd(wnd);
+  if (hwnd && hwnd->m_oswidget)
+  {
+    gtk_window_set_geometry_hints(GTK_WINDOW(hwnd->m_oswidget), NULL, NULL, (GdkWindowHints) 0);
+    return;
+  }
   GdkGeometry geom = {0};
   gdk_window_set_geometry_hints(wnd,&geom,(GdkWindowHints) 0);
 #else
@@ -3116,6 +3122,16 @@ void swell_oswindow_resize(SWELL_OSWINDOW wnd, int reposflag, RECT f)
     f.top -= g_swell_wayland_title_h + SWELL_WAYLAND_BORDER_WIDTH;
     f.right = f.left + w + SWELL_WAYLAND_BORDER_WIDTH*2;
     f.bottom = f.top + h + g_swell_wayland_title_h + SWELL_WAYLAND_BORDER_WIDTH*2;
+  }
+  HWND hwnd = swell_oswindow_to_hwnd(wnd);
+  if (hwnd && hwnd->m_oswidget)
+  {
+    // gdk_window_resize()/move_resize() don't reliably apply to an
+    // already-mapped Wayland surface (e.g. resizing a top-level window
+    // for a live content swap within an already-open view).
+    if (reposflag&2) gtk_window_resize(GTK_WINDOW(hwnd->m_oswidget), wdl_max(f.right-f.left,1), wdl_max(f.bottom-f.top,1));
+    if (reposflag&1) gtk_window_move(GTK_WINDOW(hwnd->m_oswidget), f.left, f.top);
+    return;
   }
 #endif
 #ifdef SWELL_GDK_IMPROVE_WINDOWRECT
