@@ -76,6 +76,12 @@ static Capture* find_capture(Window w)
 // for the general case.
 Capture *g_active_capture = nullptr;
 
+static void set_active_capture(Capture *c)
+{
+    g_active_capture = c;
+    if (g_wm) g_wm->set_active_window(c ? c->parent_win : None);
+}
+
 
 struct bridgeState {
     Display *disp   = nullptr;   // this plugin's connection to :10
@@ -214,7 +220,7 @@ static bool on_button_press(GtkWidget *widget, GdkEventButton *e, gpointer data)
     // would map first and be misattributed to the previously-active capture.
     // Button-press is the earliest reliable "user just started interacting
     // with THIS plugin" signal we have.
-    g_active_capture = c;
+    set_active_capture(c);
     if (c->hwnd) SetFocus(c->hwnd);
     forward_motion(c, e->x, e->y);
     XTestFakeButtonEvent(c->dpy, e->button, True, CurrentTime);
@@ -313,7 +319,7 @@ static void on_toplevel_active(GObject *obj, GParamSpec *, gpointer data)
         if (g_active_capture && g_active_capture != c && has_live_ui(g_active_capture))
             return;
 
-        g_active_capture = c;
+        set_active_capture(c);
         // Update cursor + raise on real activation only, not on hover noise.
         if (c->widget) {
             GdkWindow *gw = gtk_widget_get_window(c->widget);
@@ -333,7 +339,25 @@ static void on_toplevel_active(GObject *obj, GParamSpec *, gpointer data)
         // is just handing focus to the popup canvas / modal we spawned, not
         // telling us the user is done with this plugin.
         if (has_live_ui(c)) return;
-        g_active_capture = nullptr;
+        set_active_capture(nullptr);
+    }
+}
+
+static void connect_toplevel(Capture *c)
+{
+    GtkWidget *toplevel = c->widget ? gtk_widget_get_toplevel(c->widget) : nullptr;
+    if (toplevel == c->active_toplevel) return;
+    if (c->active_toplevel) {
+        g_signal_handlers_disconnect_by_data(c->active_toplevel, c);
+        g_object_remove_weak_pointer(G_OBJECT(c->active_toplevel),
+                                     (gpointer*)&c->active_toplevel);
+        c->active_toplevel = nullptr;
+    }
+    if (toplevel && GTK_IS_WINDOW(toplevel)) {
+        c->active_toplevel = toplevel;
+        g_object_add_weak_pointer(G_OBJECT(toplevel), (gpointer*)&c->active_toplevel);
+        g_signal_connect(toplevel, "notify::is-active", G_CALLBACK(on_toplevel_active), c);
+        on_toplevel_active(G_OBJECT(toplevel), nullptr, c);
     }
 }
 
@@ -356,16 +380,7 @@ static void connect_widget(Capture *c)
         if (settings) g_object_set(settings, "gtk-enable-animations", FALSE, NULL);
     }
 
-    // Track compositor focus on the top-level -- this is the real "user is
-    // interacting with this plugin" signal, not X11 EnterNotify.
-    GtkWidget *toplevel = gtk_widget_get_toplevel(c->widget);
-    if (toplevel && GTK_IS_WINDOW(toplevel)) {
-        g_signal_connect(toplevel, "notify::is-active",
-                         G_CALLBACK(on_toplevel_active), c);
-        c->active_toplevel = toplevel;
-        g_object_add_weak_pointer(G_OBJECT(toplevel),
-                                  (gpointer*)&c->active_toplevel);
-    }
+    connect_toplevel(c);
 
     g_signal_connect(c->widget, "draw",                 G_CALLBACK(on_draw),           c);
     g_signal_connect(c->widget, "button-press-event",   G_CALLBACK(on_button_press),   c);
@@ -408,7 +423,7 @@ static Capture* setup_capture(Display *dpy, Window parent_win, Window plugin_win
     // it is itself the "activate" action -- so treat it as the active capture
     // immediately. notify::is-active keeps this in sync afterwards; this just
     // avoids a race between plugin map and the compositor's focus decision.
-    g_active_capture = c;
+    set_active_capture(c);
     // Raise it too: containers overlap on :10 and XTest input goes to whichever
     // is on top. notify::is-active is hooked only after the new toplevel already
     // has focus, so on_toplevel_active never raises it and input keeps landing on
@@ -426,7 +441,7 @@ static void modal_remove(Capture *c, Window win);
 static void cleanup_capture(Capture *c)
 {
     if (!c) return;
-    if (g_active_capture == c) g_active_capture = nullptr;
+    if (g_active_capture == c) set_active_capture(nullptr);
     // Disconnect notify::is-active BEFORE freeing the capture -- the toplevel
     // (REAPER's main window in embedded/FX-list mode) outlives us, and the
     // compositor routinely changes focus during an FX swap. Without this, the
@@ -1519,7 +1534,7 @@ void xw_size(HWND hwnd)
                 GtkWidget *tl2 = gtk_widget_get_toplevel((GtkWidget*)hwnd->m_oswidget);
                 if (!(tl2 && GTK_IS_WINDOW(tl2))) bs->placed = false;
                 if (size_changed) { bs->last_size_pos = r; bs->has_last_size_pos = true; }
-                if (bs->cap) refresh_gtk_offset(bs->cap);
+                if (bs->cap) { connect_toplevel(bs->cap); refresh_gtk_offset(bs->cap); }
                 return;
             }
         }
@@ -1546,7 +1561,7 @@ void xw_size(HWND hwnd)
     // position, so computing it before the move used stale, pre-resize data. This
     // is what broke popup positioning specifically during a resize (e.g. Virtual Mix
     // Rack expanding the rack to make room for a dragged-in module).
-    if (bs->cap) refresh_gtk_offset(bs->cap);
+    if (bs->cap) { connect_toplevel(bs->cap); refresh_gtk_offset(bs->cap); }
 }
 
 static LRESULT xw_bridgeProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam)
