@@ -3437,21 +3437,6 @@ static GtkClipboard *get_clipboard(void)
 }
 #endif
 
-#ifdef SWELL_TARGET_WAYLAND
-bool OpenClipboard(HWND hwndDlg) 
-{
-  (void)hwndDlg; // not needed for wayland apparently
-  RegisterClipboardFormat(NULL);
-  s_clip_hwnd = NULL;
-  s_clipboard_written = false;
- 
-  GlobalFree(s_clipboard_getstate);
-  s_clipboard_getstate = NULL;
-  s_clipboard_getstate_fmt = NULL;
-  s_clipboard_enumstate.DeleteAll();
-  return true;
-}
-#else
 bool OpenClipboard(HWND hwndDlg) 
 {
   RegisterClipboardFormat(NULL);
@@ -3466,7 +3451,6 @@ bool OpenClipboard(HWND hwndDlg)
 
   return true; 
 }
-#endif
 
 #ifdef SWELL_TARGET_WAYLAND
 static void clipboard_received_func(GtkClipboard *cb, GtkSelectionData *data, gpointer user_data)
@@ -3499,7 +3483,7 @@ static void clipboard_received_func(GtkClipboard *cb, GtkSelectionData *data, gp
 #endif
  
 #ifdef SWELL_TARGET_WAYLAND
-static HANDLE req_clipboard(GdkAtom type)
+static HANDLE req_wayland_clipboard(GdkAtom type)
 {
   if (s_clipboard_getstate_fmt == type) return s_clipboard_getstate;
   if (type == tgtatom() && s_clipboard_getstate_fmt == atomatom())
@@ -3514,9 +3498,14 @@ static HANDLE req_clipboard(GdkAtom type)
  
   return NULL;
 }
-#else
+#endif
+
 static HANDLE req_clipboard(GdkAtom type)
 {
+#ifdef SWELL_TARGET_WAYLAND
+  if (GDK_IS_WAYLAND_DISPLAY(gdk_display_get_default()))
+    return req_wayland_clipboard(type);
+#endif
   if (s_clipboard_getstate_fmt == type) return s_clipboard_getstate;
   if (type == tgtatom() && s_clipboard_getstate_fmt == atomatom())
     return s_clipboard_getstate;
@@ -3580,7 +3569,6 @@ static HANDLE req_clipboard(GdkAtom type)
   }
   return NULL;
 }
-#endif
 
 void CloseClipboard() 
 { 
@@ -3590,7 +3578,7 @@ void CloseClipboard()
 }
 
 #ifdef SWELL_TARGET_WAYLAND
-UINT EnumClipboardFormats(UINT lastfmt)
+static UINT enum_wayland_clipboard_formats(UINT lastfmt)
 {
   if (lastfmt == 0 && !s_clipboard_enumstate.GetSize())
   {
@@ -3614,9 +3602,14 @@ UINT EnumClipboardFormats(UINT lastfmt)
   if (lastfmt) while (s_clipboard_enumstate.Enumerate(x++,&fmt) && fmt != lastfmt);
   return s_clipboard_enumstate.Enumerate(x,&fmt) ? fmt : 0;
 }
-#else
+#endif
+
 UINT EnumClipboardFormats(UINT lastfmt)
 {
+#ifdef SWELL_TARGET_WAYLAND
+  if (GDK_IS_WAYLAND_DISPLAY(gdk_display_get_default()))
+    return enum_wayland_clipboard_formats(lastfmt);
+#endif
   if (lastfmt == 0 && !s_clipboard_enumstate.GetSize())
   {
     HANDLE h = req_clipboard(tgtatom());
@@ -3637,10 +3630,9 @@ UINT EnumClipboardFormats(UINT lastfmt)
   if (lastfmt) while (s_clipboard_enumstate.Enumerate(x++,&fmt) && fmt != lastfmt);
   return s_clipboard_enumstate.Enumerate(x,&fmt) ? fmt : 0;
 }
-#endif
 
 #ifdef SWELL_TARGET_WAYLAND
-HANDLE GetClipboardData(UINT type)
+static HANDLE get_wayland_clipboard_data(UINT type)
 {
   RegisterClipboardFormat(NULL);
 
@@ -3668,9 +3660,14 @@ HANDLE GetClipboardData(UINT type)
 
   return NULL;
 }
-#else
+#endif
+
 HANDLE GetClipboardData(UINT type)
 {
+#ifdef SWELL_TARGET_WAYLAND
+  if (GDK_IS_WAYLAND_DISPLAY(gdk_display_get_default()))
+    return get_wayland_clipboard_data(type);
+#endif
   RegisterClipboardFormat(NULL);
 
   GdkAtom a;
@@ -3681,7 +3678,6 @@ HANDLE GetClipboardData(UINT type)
 
   return NULL;
 }
-#endif
 
 void EmptyClipboard()
 {
@@ -3702,7 +3698,7 @@ static void clipboard_get_func(GtkClipboard *clipboard, GtkSelectionData *select
 #endif
 
 #ifdef SWELL_TARGET_WAYLAND
-void SetClipboardData(UINT type, HANDLE h)
+static void set_wayland_clipboard_data(UINT type, HANDLE h)
 {
   RegisterClipboardFormat(NULL);
   GdkAtom a;
@@ -3737,9 +3733,14 @@ void SetClipboardData(UINT type, HANDLE h)
       s_clipboard_enumstate.Insert(type);
   }
 }
-#else
+#endif
+
 void SetClipboardData(UINT type, HANDLE h)
 {
+#ifdef SWELL_TARGET_WAYLAND
+  if (GDK_IS_WAYLAND_DISPLAY(gdk_display_get_default()))
+    return set_wayland_clipboard_data(type, h);
+#endif
   RegisterClipboardFormat(NULL);
   GdkAtom a;
   if (atom_from_clipboard_type(type,&a))
@@ -3776,7 +3777,6 @@ void SetClipboardData(UINT type, HANDLE h)
       s_clipboard_enumstate.Insert(type);
   }
 }
-#endif
 
 UINT RegisterClipboardFormat(const char *desc)
 {
@@ -4495,7 +4495,9 @@ static bool OnDragEventDelegate(GdkEvent *evt)
       }
     break;
     case GDK_DROP_START:
-#ifndef SWELL_TARGET_WAYLAND
+#ifdef SWELL_TARGET_WAYLAND
+      if (!GDK_IS_WAYLAND_DISPLAY(gdk_display_get_default()))
+#endif
       {
         if (hwnd && hwnd == s_ddrop_forward_last_hwnd && s_ddrop_forward_last_target)
         {
@@ -4523,7 +4525,6 @@ static bool OnDragEventDelegate(GdkEvent *evt)
         }
         if (SWELL_DDrop_onDragLeave) SWELL_DDrop_onDragLeave();
       }
-#endif
     break;
     default: return false;
   }
@@ -4905,40 +4906,45 @@ static LRESULT WINAPI dropSourceWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPAR
   {
     case WM_CREATE:
 #ifdef SWELL_TARGET_WAYLAND
-      if (!swell_dragsrc_widget)
+      if (GDK_IS_WAYLAND_DISPLAY(gdk_display_get_default()))
       {
-        swell_dragsrc_widget = gtk_window_new(GTK_WINDOW_POPUP);
-        gtk_window_set_default_size(GTK_WINDOW(swell_dragsrc_widget), 1, 1);
-        gtk_widget_realize(swell_dragsrc_widget);
+        if (!swell_dragsrc_widget)
+        {
+          swell_dragsrc_widget = gtk_window_new(GTK_WINDOW_POPUP);
+          gtk_window_set_default_size(GTK_WINDOW(swell_dragsrc_widget), 1, 1);
+          gtk_widget_realize(swell_dragsrc_widget);
+        }
+        if (swell_dragsrc_widget)
+        {
+          GtkTargetList *target_list = gtk_target_list_new(NULL, 0);
+          gtk_target_list_add_uri_targets(target_list, 0);
+          POINT p;
+          GetCursorPos(&p);
+          inf->dragctx = gtk_drag_begin_with_coordinates(swell_dragsrc_widget, target_list, GDK_ACTION_COPY, 1, NULL, p.x, p.y);
+          gtk_target_list_unref(target_list);
+          g_signal_connect(swell_dragsrc_widget, "drag-data-get", G_CALLBACK(on_drag_source_data_get), hwnd);
+          g_signal_connect(swell_dragsrc_widget, "drag-end", G_CALLBACK(on_drag_source_end), NULL);
+        }
+        SetCapture(hwnd);
       }
-      if (swell_dragsrc_widget)
-      {
-        GtkTargetList *target_list = gtk_target_list_new(NULL, 0);
-        gtk_target_list_add_uri_targets(target_list, 0);
-        POINT p;
-        GetCursorPos(&p);
-        inf->dragctx = gtk_drag_begin_with_coordinates(swell_dragsrc_widget, target_list, GDK_ACTION_COPY, 1, NULL, p.x, p.y);
-        gtk_target_list_unref(target_list);
-        g_signal_connect(swell_dragsrc_widget, "drag-data-get", G_CALLBACK(on_drag_source_data_get), hwnd);
-        g_signal_connect(swell_dragsrc_widget, "drag-end", G_CALLBACK(on_drag_source_end), NULL);
-      }
-      SetCapture(hwnd);
-#else
-      if (!swell_dragsrc_osw)
-      {
-        GdkWindowAttr attr={0,};
-        attr.title = (char *)"swell drag source";
-        attr.event_mask = GDK_ALL_EVENTS_MASK;
-        attr.wclass = GDK_INPUT_ONLY;
-        attr.window_type = GDK_WINDOW_TOPLEVEL;
-        swell_dragsrc_osw = gdk_window_new(NULL,&attr,0);
-      }
-      if (swell_dragsrc_osw)
-      {
-        inf->dragctx = gdk_drag_begin(swell_dragsrc_osw, g_list_append(NULL,urilistatom()));
-      }
-      SetCapture(hwnd);
+      else
 #endif
+      {
+        if (!swell_dragsrc_osw)
+        {
+          GdkWindowAttr attr={0,};
+          attr.title = (char *)"swell drag source";
+          attr.event_mask = GDK_ALL_EVENTS_MASK;
+          attr.wclass = GDK_INPUT_ONLY;
+          attr.window_type = GDK_WINDOW_TOPLEVEL;
+          swell_dragsrc_osw = gdk_window_new(NULL,&attr,0);
+        }
+        if (swell_dragsrc_osw)
+        {
+          inf->dragctx = gdk_drag_begin(swell_dragsrc_osw, g_list_append(NULL,urilistatom()));
+        }
+        SetCapture(hwnd);
+      }
     break;
     case WM_MOUSEMOVE:
       if (inf->dragctx)
