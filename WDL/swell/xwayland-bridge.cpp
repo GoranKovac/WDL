@@ -24,6 +24,7 @@ struct Capture {
     Pixmap     pixmap      = 0;      // XComposite-named window pixmap; refreshed on resize
     int        pixmap_w    = 0;
     int        pixmap_h    = 0;
+    bool       pixmap_dirty = true;
     Visual    *visual      = nullptr; // plugin_win's visual, cached for cairo_xlib_surface_create
     GtkWidget *widget      = nullptr;
     GtkWidget *active_toplevel = nullptr; // toplevel we hooked notify::is-active on; disconnected in cleanup
@@ -117,6 +118,7 @@ static bool update_pixmap(Capture *c)
     c->pixmap = pixmap;
     c->pixmap_w = w;
     c->pixmap_h = h;
+    c->pixmap_dirty = false;
     return true;
 }
 
@@ -129,13 +131,20 @@ static void destroy_pixmap(Capture *c)
 
 static void refresh_pixmap(Capture *c)
 {
-    if (update_pixmap(c) && c->widget && GTK_IS_WIDGET(c->widget))
+    if (!c) return;
+    c->pixmap_dirty = true;
+    if (c->widget)
         gtk_widget_queue_draw(c->widget);
 }
 
 static bool on_draw(GtkWidget *widget, cairo_t *cr, gpointer data)
 {
     Capture *c = (Capture*)data;
+    if (c && c->pixmap_dirty) {
+        const int old_w = c->pixmap_w, old_h = c->pixmap_h;
+        if (update_pixmap(c) && (old_w != c->pixmap_w || old_h != c->pixmap_h))
+            gtk_widget_queue_draw(widget);
+    }
     if (!c || !c->pixmap || !c->visual) return FALSE;
 
     // Wrap the composite-named pixmap directly as a cairo xlib surface --
@@ -1010,18 +1019,16 @@ static void handle_damage_notify(XDamageNotifyEvent *de)
 
     XDamageSubtract(g_wm_dpy, de->damage, None, None);
 
-    // No capture step with Automatic redirection: re-name the pixmap (see
-    // update_pixmap) and tell GTK to redraw the affected area.
+    // No capture step with Automatic redirection: mark the pixmap dirty (see
+    // update_pixmap) and refresh it on the next draw.
     Capture *c = find_capture(de->drawable);
     if (c && c->widget && GTK_IS_WIDGET(c->widget)) {
-        const int old_w = c->pixmap_w, old_h = c->pixmap_h;
-        if (update_pixmap(c)) {
-            if (c->pixmap_w != old_w || c->pixmap_h != old_h)
-                gtk_widget_queue_draw(c->widget);
-            else
-                swell_gdk_queue_draw_pixels(c->widget, de->area.x, de->area.y,
-                                           de->area.width, de->area.height);
-        }
+        c->pixmap_dirty = true;
+        if (c->pixmap_w != de->geometry.width || c->pixmap_h != de->geometry.height)
+            gtk_widget_queue_draw(c->widget);
+        else
+            swell_gdk_queue_draw_pixels(c->widget, de->area.x, de->area.y,
+                                       de->area.width, de->area.height);
         return;
     }
 
@@ -1477,14 +1484,9 @@ void xw_size(HWND hwnd)
         r.left != bs->last_size_pos.left || r.top != bs->last_size_pos.top ||
         r.right != bs->last_size_pos.right || r.bottom != bs->last_size_pos.bottom;
 
-    // Re-capture the pixmap at the new size -- xw_size runs exactly when the
-    // window is being resized, so the backing pixmap must be refreshed here.
-    // Refresh BEFORE XResizeWindow, matching pre_xvfb's ordering: refresh_pixmap
-    // flushes and re-names, so we snapshot the current server-side state, then
-    // the resize proceeds; the next Damage event will bring the next refresh.
-    // Guard on bs->cap: WM_SIZE/SetWindowPos can fire before the plugin is
-    // captured (e.g. during an FX-list swap), and the container resize also
-    // needs a live capture.
+    // Refresh the pixmap on the next draw after resizing. Guard on bs->cap:
+    // WM_SIZE/SetWindowPos can fire before the plugin is captured (e.g. during
+    // an FX-list swap), and the container resize also needs a live capture.
     if (bs->cap && size_changed) {
         refresh_pixmap(bs->cap);
         place_container(bs->cap->dpy, bs->cap->parent_win, w, h);
