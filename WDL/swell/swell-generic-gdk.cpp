@@ -182,6 +182,11 @@ int g_swell_wayland_title_h; // 0 = compositor has real SSD, use it normally
 #define SWELL_WAYLAND_TITLEBAR_CLOSEBTN_W 36
 int SWELL_WAYLAND_BORDER_WIDTH = 2;
 
+bool swell_is_wayland()
+{
+  return GDK_IS_WAYLAND_DISPLAY(gdk_display_get_default());
+}
+
 static void swell_wayland_init_application_id()
 {
   if (!g_swell_appname || !GDK_IS_WAYLAND_DISPLAY(gdk_display_get_default())) return;
@@ -442,7 +447,7 @@ void swell_oswindow_destroy(HWND hwnd)
     // GTK popup menus don't emit GDK_GRAB_BROKEN on teardown like X11
     // override-redirect menus do, so capture set during menu tracking is
     // never released. Clear it here.
-    if (swell_captured_window && hwnd->m_classname &&
+    if (GDK_IS_WAYLAND_WINDOW(hwnd->m_oswindow) && swell_captured_window && hwnd->m_classname &&
       !strcmp(hwnd->m_classname,"__SWELL_MENU"))
     {
       SendMessage(swell_captured_window,WM_CAPTURECHANGED,0,0);
@@ -707,13 +712,14 @@ void SWELL_initargs(int *argc, char ***argv)
     if (!SWELL_gdk_active)
       SWELL_gdk_active = gdk_init_check(argc,argv) ? 1 : -1;
 #ifdef SWELL_TARGET_WAYLAND
-    if (SWELL_gdk_active > 0 && !SWELL_load_gtk())
+    if (SWELL_gdk_active > 0 && GDK_IS_WAYLAND_DISPLAY(gdk_display_get_default()) && !SWELL_load_gtk())
       SWELL_gdk_active = -1;
 #endif
     if (SWELL_gdk_active > 0)
     {
 #ifdef SWELL_TARGET_WAYLAND
-      init_private_xwayland();
+      if (GDK_IS_WAYLAND_DISPLAY(gdk_display_get_default()))
+        init_private_xwayland();
 #endif
       char buf[1024];
       GetModuleFileName(NULL,buf,sizeof(buf));
@@ -1026,206 +1032,212 @@ void swell_oswindow_manage(HWND hwnd, bool wantfocus)
 
         RECT r = hwnd->m_position;
 #ifdef SWELL_TARGET_WAYLAND
-        bool is_popup_menu = (hwnd->m_classname && strcmp(hwnd->m_classname, "__SWELL_MENU") == 0);
-        bool is_tooltip = (!hwnd->m_parent && !hwnd->m_owner && (hwnd->m_style & WS_CHILD) && (!hwnd->m_title.Get() || !hwnd->m_title.Get()[0]));
-
-        // Imgui fix
-        bool is_interactive_popup = (hwnd->m_style & WS_CHILD) && hwnd->m_owner;
-        if (is_interactive_popup) is_popup_menu = true;
-
-        const bool is_drag_preview = is_tooltip && GetCapture() != NULL;
-
-        bool is_splash = (!hwnd->m_parent && !hwnd->m_owner &&
-                        !(hwnd->m_style & WS_CAPTION) && !(hwnd->m_style & WS_CHILD) &&
-                        (!hwnd->m_title.Get() || !hwnd->m_title.Get()[0]));
-
-        GtkWidget *gtk_win = gtk_window_new((is_popup_menu || is_tooltip) ? GTK_WINDOW_POPUP : GTK_WINDOW_TOPLEVEL);
-
-        gtk_window_set_decorated(GTK_WINDOW(gtk_win), (hwnd->m_style & WS_CAPTION) != 0);
-        const int scale = swell_gdk_window_scale(transient_for);
-
-        gtk_widget_set_app_paintable(gtk_win, TRUE);
-        gtk_widget_set_double_buffered(gtk_win, FALSE);
-        gtk_widget_add_events(gtk_win, GDK_ALL_EVENTS_MASK|GDK_EXPOSURE_MASK);
-
-        if (!is_popup_menu && !is_tooltip)
+        GtkWidget *gtk_win = NULL;
+        if (GDK_IS_WAYLAND_DISPLAY(gdk_display_get_default()))
         {
-          gtk_window_set_title(GTK_WINDOW(gtk_win), hwnd->m_title.Get());
-        }
+          bool is_popup_menu = (hwnd->m_classname && strcmp(hwnd->m_classname, "__SWELL_MENU") == 0);
+          bool is_tooltip = (!hwnd->m_parent && !hwnd->m_owner && (hwnd->m_style & WS_CHILD) && (!hwnd->m_title.Get() || !hwnd->m_title.Get()[0]));
 
-        gtk_window_set_default_size(GTK_WINDOW(gtk_win),
-                                     swell_gdk_ceil(r.right - r.left, scale) + (swell_wayland_needs_manual_titlebar(hwnd) ? SWELL_WAYLAND_BORDER_WIDTH*2 : 0),
-                                     swell_gdk_ceil(r.bottom - r.top, scale) + (swell_wayland_needs_manual_titlebar(hwnd) ? g_swell_wayland_title_h + SWELL_WAYLAND_BORDER_WIDTH*2 : 0));
-        hwnd->m_oswidget = gtk_win;
-        g_signal_connect(gtk_win, "notify::scale-factor", G_CALLBACK(swell_wayland_scale_changed), hwnd);
+          // Imgui fix
+          bool is_interactive_popup = (hwnd->m_style & WS_CHILD) && hwnd->m_owner;
+          if (is_interactive_popup) is_popup_menu = true;
+
+          const bool is_drag_preview = is_tooltip && GetCapture() != NULL;
+
+          bool is_splash = (!hwnd->m_parent && !hwnd->m_owner &&
+                          !(hwnd->m_style & WS_CAPTION) && !(hwnd->m_style & WS_CHILD) &&
+                          (!hwnd->m_title.Get() || !hwnd->m_title.Get()[0]));
+
+          gtk_win = gtk_window_new((is_popup_menu || is_tooltip) ? GTK_WINDOW_POPUP : GTK_WINDOW_TOPLEVEL);
+
+          gtk_window_set_decorated(GTK_WINDOW(gtk_win), (hwnd->m_style & WS_CAPTION) != 0);
+          const int scale = swell_gdk_window_scale(transient_for);
+
+          gtk_widget_set_app_paintable(gtk_win, TRUE);
+          gtk_widget_set_double_buffered(gtk_win, FALSE);
+          gtk_widget_add_events(gtk_win, GDK_ALL_EVENTS_MASK|GDK_EXPOSURE_MASK);
+
+          if (!is_popup_menu && !is_tooltip)
+          {
+            gtk_window_set_title(GTK_WINDOW(gtk_win), hwnd->m_title.Get());
+          }
+
+          gtk_window_set_default_size(GTK_WINDOW(gtk_win),
+                                       swell_gdk_ceil(r.right - r.left, scale) + (swell_wayland_needs_manual_titlebar(hwnd) ? SWELL_WAYLAND_BORDER_WIDTH*2 : 0),
+                                       swell_gdk_ceil(r.bottom - r.top, scale) + (swell_wayland_needs_manual_titlebar(hwnd) ? g_swell_wayland_title_h + SWELL_WAYLAND_BORDER_WIDTH*2 : 0));
+          hwnd->m_oswidget = gtk_win;
+          g_signal_connect(gtk_win, "notify::scale-factor", G_CALLBACK(swell_wayland_scale_changed), hwnd);
 
 #ifdef SWELL_TARGET_WAYLAND
-        if (g_swell_wayland_title_h)
-        {
-          gtk_window_set_titlebar(GTK_WINDOW(gtk_win), gtk_label_new(NULL));
-        }
+          if (g_swell_wayland_title_h)
+          {
+            gtk_window_set_titlebar(GTK_WINDOW(gtk_win), gtk_label_new(NULL));
+          }
 #endif
-        // GTK sizes a toplevel to its content's natural size and asks
-        // the compositor for that — ignoring gtk_window_set_default_size when the
-        // content is larger. That makes dialogs open full-height. A max-size hint
-        // is the only thing GTK won't override, so clamp max to the requested size.
-        if (!is_popup_menu && !is_tooltip && !is_splash)
-        {
-          // GTK ignores set_default_size when content natural size differs, and a
-          // max-only hint just caps (doesn't force). To make the restored size
-          // actually apply on Wayland, pin min=max=restored size — GTK cannot
-          // override an exact min==max constraint. This is released on the FIRST
-          // configure event (see OnConfigureEvent), i.e. once the window has been
-          // mapped at this exact size, after which it is freely resizable.
-          int rw = swell_gdk_ceil(r.right - r.left, scale), rh = swell_gdk_ceil(r.bottom - r.top, scale);
-          if (rw < 1) rw = 1;
-          if (rh < 1) rh = 1;
+          // GTK sizes a toplevel to its content's natural size and asks
+          // the compositor for that — ignoring gtk_window_set_default_size when the
+          // content is larger. That makes dialogs open full-height. A max-size hint
+          // is the only thing GTK won't override, so clamp max to the requested size.
+          if (!is_popup_menu && !is_tooltip && !is_splash)
+          {
+            // GTK ignores set_default_size when content natural size differs, and a
+            // max-only hint just caps (doesn't force). To make the restored size
+            // actually apply on Wayland, pin min=max=restored size — GTK cannot
+            // override an exact min==max constraint. This is released on the FIRST
+            // configure event (see OnConfigureEvent), i.e. once the window has been
+            // mapped at this exact size, after which it is freely resizable.
+            int rw = swell_gdk_ceil(r.right - r.left, scale), rh = swell_gdk_ceil(r.bottom - r.top, scale);
+            if (rw < 1) rw = 1;
+            if (rh < 1) rh = 1;
 #ifdef SWELL_TARGET_WAYLAND
-          if (swell_wayland_needs_manual_titlebar(hwnd))
-          {
-            rw += SWELL_WAYLAND_BORDER_WIDTH*2;
-            rh += g_swell_wayland_title_h + SWELL_WAYLAND_BORDER_WIDTH*2;
-          }
+            if (swell_wayland_needs_manual_titlebar(hwnd))
+            {
+              rw += SWELL_WAYLAND_BORDER_WIDTH*2;
+              rh += g_swell_wayland_title_h + SWELL_WAYLAND_BORDER_WIDTH*2;
+            }
 #endif
-          GdkGeometry gh;
-          gh.min_width = gh.max_width = rw;
-          gh.min_height = gh.max_height = rh;
-          gtk_window_set_geometry_hints(GTK_WINDOW(gtk_win), NULL, &gh,
-            (GdkWindowHints)(GDK_HINT_MIN_SIZE | GDK_HINT_MAX_SIZE));
-        }
-
-        // Tooltip and a menu can't both be showed at same time,
-        // opening a menu closes any active tooltip, 
-        // while a menu is open tooltips cant spawn.
-        if (is_popup_menu && s_wayland_active_tooltip)
-        {
-          if (s_wayland_active_tooltip->m_oswindow)
-            gdk_window_hide(s_wayland_active_tooltip->m_oswindow);
-          s_wayland_active_tooltip = NULL;
-        }
-        if (is_tooltip && !is_drag_preview && PopupMenuIsActive())
-        {
-          // don't show a tooltip while a menu is up
-          gtk_widget_destroy(gtk_win);
-          hwnd->m_oswidget = NULL;
-          return;
-        }
-
-        HWND popup_parent_hwnd = NULL;
-        if (is_popup_menu || is_tooltip)
-        {
-          if (is_tooltip && !is_drag_preview) s_wayland_active_tooltip = hwnd;
-          gtk_window_set_type_hint(GTK_WINDOW(gtk_win), is_tooltip ? GDK_WINDOW_TYPE_HINT_TOOLTIP : GDK_WINDOW_TYPE_HINT_POPUP_MENU);
-
-          HWND parent_hwnd = NULL;
-
-          if (is_popup_menu)
-          {
-            parent_hwnd = hwnd->m_owner;
-            if (transient_for)
-            {
-              while (parent_hwnd && parent_hwnd->m_oswindow != transient_for)
-                parent_hwnd = parent_hwnd->m_parent ? parent_hwnd->m_parent : parent_hwnd->m_owner;
-            }
-          }
-          else
-          {
-            // Anchor to the window that was hovered, not the focused one.
-            if (s_last_hover_oswindow)
-            {
-              HWND hov = swell_oswindow_to_hwnd(s_last_hover_oswindow);
-              if (hov && hov != hwnd && hov->m_oswidget && !(hov->m_style & WS_CHILD))
-                parent_hwnd = hov;
-            }
-
-            if (!parent_hwnd)
-            {
-              if (is_drag_preview)
-              {
-                // The preview must always be visible, and its parent is only a
-                // coordinate base (it is placed by gdk_window_move, not by an anchor
-                // rect), so an imperfect parent is harmless here.
-                parent_hwnd = GetFocus();
-                while (parent_hwnd && !parent_hwnd->m_oswidget)
-                  parent_hwnd = parent_hwnd->m_parent;
-              }
-              else
-              {
-                // Fail closed: without a known hovered window we cannot place the
-                // tooltip correctly, and showing it in the wrong window is worse than
-                // not showing it at all.
-                s_wayland_active_tooltip = NULL;
-                gtk_widget_destroy(gtk_win);
-                hwnd->m_oswidget = NULL;
-                return;
-              }
-            }
+            GdkGeometry gh;
+            gh.min_width = gh.max_width = rw;
+            gh.min_height = gh.max_height = rh;
+            gtk_window_set_geometry_hints(GTK_WINDOW(gtk_win), NULL, &gh,
+              (GdkWindowHints)(GDK_HINT_MIN_SIZE | GDK_HINT_MAX_SIZE));
           }
 
-          if (parent_hwnd && parent_hwnd->m_oswidget)
-            gtk_window_set_transient_for(GTK_WINDOW(gtk_win), GTK_WINDOW(parent_hwnd->m_oswidget));
-          popup_parent_hwnd = parent_hwnd;
-        }
-
-        g_signal_connect(G_OBJECT(gtk_win), "enter-notify-event", G_CALLBACK(swell_wayland_handle_hover_enter), hwnd);
-        g_signal_connect(G_OBJECT(gtk_win), "leave-notify-event", G_CALLBACK(swell_wayland_handle_hover_enter), hwnd);
-        gtk_widget_realize(gtk_win);
-
-        // gtk_window_move is not constrained to the screen,
-        // so popups render outside of the bottom/right edge. Use gdk_window_move_to_rect
-        // so the compositor slides the popup on-screen.
-        // https://bugzilla.mozilla.org/show_bug.cgi?id=1423598
-        if ((is_popup_menu || (is_tooltip && !is_drag_preview)) && popup_parent_hwnd)
-        {
-          GdkWindow *pw = gtk_widget_get_window(gtk_win);
-          GdkWindow *parent_gw = gtk_widget_get_window(popup_parent_hwnd->m_oswidget);
-          if (pw && parent_gw)
+          // Tooltip and a menu can't both be showed at same time,
+          // opening a menu closes any active tooltip,
+          // while a menu is open tooltips cant spawn.
+          if (is_popup_menu && s_wayland_active_tooltip)
           {
-            gint psx = 0, psy = 0;
-            if (is_tooltip)
+            if (s_wayland_active_tooltip->m_oswindow)
+              gdk_window_hide(s_wayland_active_tooltip->m_oswindow);
+            s_wayland_active_tooltip = NULL;
+          }
+          if (is_tooltip && !is_drag_preview && PopupMenuIsActive())
+          {
+            // don't show a tooltip while a menu is up
+            gtk_widget_destroy(gtk_win);
+            hwnd->m_oswidget = NULL;
+            return;
+          }
+
+          HWND popup_parent_hwnd = NULL;
+          if (is_popup_menu || is_tooltip)
+          {
+            if (is_tooltip && !is_drag_preview) s_wayland_active_tooltip = hwnd;
+            gtk_window_set_type_hint(GTK_WINDOW(gtk_win), is_tooltip ? GDK_WINDOW_TYPE_HINT_TOOLTIP : GDK_WINDOW_TYPE_HINT_POPUP_MENU);
+
+            HWND parent_hwnd = NULL;
+
+            if (is_popup_menu)
             {
-              // The anchor rect must be in the parent's coordinate space. r comes
-              // from m_position, so take the parent's origin from m_position too --
-              // mixing in gdk_window_get_origin() (unreliable on Wayland, typically
-              // 0,0) would corrupt the offset and push the tooltip off-anchor.
-              psx = popup_parent_hwnd->m_position.left;
-              psy = popup_parent_hwnd->m_position.top;
+              parent_hwnd = hwnd->m_owner;
+              if (transient_for)
+              {
+                while (parent_hwnd && parent_hwnd->m_oswindow != transient_for)
+                  parent_hwnd = parent_hwnd->m_parent ? parent_hwnd->m_parent : parent_hwnd->m_owner;
+              }
             }
             else
             {
-              gdk_window_get_origin(parent_gw, &psx, &psy);
-              const int parent_scale = swell_gdk_window_scale(parent_gw);
-              psx *= parent_scale;
-              psy *= parent_scale;
+              // Anchor to the window that was hovered, not the focused one.
+              if (s_last_hover_oswindow)
+              {
+                HWND hov = swell_oswindow_to_hwnd(s_last_hover_oswindow);
+                if (hov && hov != hwnd && hov->m_oswidget && !(hov->m_style & WS_CHILD))
+                  parent_hwnd = hov;
+              }
+
+              if (!parent_hwnd)
+              {
+                if (is_drag_preview)
+                {
+                  // The preview must always be visible, and its parent is only a
+                  // coordinate base (it is placed by gdk_window_move, not by an anchor
+                  // rect), so an imperfect parent is harmless here.
+                  parent_hwnd = GetFocus();
+                  while (parent_hwnd && !parent_hwnd->m_oswidget)
+                    parent_hwnd = parent_hwnd->m_parent;
+                }
+                else
+                {
+                  // Fail closed: without a known hovered window we cannot place the
+                  // tooltip correctly, and showing it in the wrong window is worse than
+                  // not showing it at all.
+                  s_wayland_active_tooltip = NULL;
+                  gtk_widget_destroy(gtk_win);
+                  hwnd->m_oswidget = NULL;
+                  return;
+                }
+              }
             }
-            const int parent_scale = swell_gdk_window_scale(parent_gw);
-            GdkRectangle anchor = { swell_gdk_floor(r.left - psx, parent_scale), swell_gdk_floor(r.top - psy, parent_scale), 1, 1 };
-            gdk_window_move_to_rect(pw, &anchor,
-                GDK_GRAVITY_NORTH_WEST, GDK_GRAVITY_NORTH_WEST,
-                (GdkAnchorHints)(GDK_ANCHOR_SLIDE_X | GDK_ANCHOR_SLIDE_Y),
-                0, 0);
+
+            if (parent_hwnd && parent_hwnd->m_oswidget)
+              gtk_window_set_transient_for(GTK_WINDOW(gtk_win), GTK_WINDOW(parent_hwnd->m_oswidget));
+            popup_parent_hwnd = parent_hwnd;
           }
+
+          g_signal_connect(G_OBJECT(gtk_win), "enter-notify-event", G_CALLBACK(swell_wayland_handle_hover_enter), hwnd);
+          g_signal_connect(G_OBJECT(gtk_win), "leave-notify-event", G_CALLBACK(swell_wayland_handle_hover_enter), hwnd);
+          gtk_widget_realize(gtk_win);
+
+          // gtk_window_move is not constrained to the screen,
+          // so popups render outside of the bottom/right edge. Use gdk_window_move_to_rect
+          // so the compositor slides the popup on-screen.
+          // https://bugzilla.mozilla.org/show_bug.cgi?id=1423598
+          if ((is_popup_menu || (is_tooltip && !is_drag_preview)) && popup_parent_hwnd)
+          {
+            GdkWindow *pw = gtk_widget_get_window(gtk_win);
+            GdkWindow *parent_gw = gtk_widget_get_window(popup_parent_hwnd->m_oswidget);
+            if (pw && parent_gw)
+            {
+              gint psx = 0, psy = 0;
+              if (is_tooltip)
+              {
+                // The anchor rect must be in the parent's coordinate space. r comes
+                // from m_position, so take the parent's origin from m_position too --
+                // mixing in gdk_window_get_origin() (unreliable on Wayland, typically
+                // 0,0) would corrupt the offset and push the tooltip off-anchor.
+                psx = popup_parent_hwnd->m_position.left;
+                psy = popup_parent_hwnd->m_position.top;
+              }
+              else
+              {
+                gdk_window_get_origin(parent_gw, &psx, &psy);
+                const int parent_scale = swell_gdk_window_scale(parent_gw);
+                psx *= parent_scale;
+                psy *= parent_scale;
+              }
+              const int parent_scale = swell_gdk_window_scale(parent_gw);
+              GdkRectangle anchor = { swell_gdk_floor(r.left - psx, parent_scale), swell_gdk_floor(r.top - psy, parent_scale), 1, 1 };
+              gdk_window_move_to_rect(pw, &anchor,
+                  GDK_GRAVITY_NORTH_WEST, GDK_GRAVITY_NORTH_WEST,
+                  (GdkAnchorHints)(GDK_ANCHOR_SLIDE_X | GDK_ANCHOR_SLIDE_Y),
+                  0, 0);
+            }
+          }
+          hwnd->m_oswindow = gtk_widget_get_window(gtk_win);
+          if (GDK_IS_WAYLAND_WINDOW(hwnd->m_oswindow) && !(hwnd->m_style & WS_CAPTION))
+            gdk_wayland_window_announce_csd(hwnd->m_oswindow);
         }
-        hwnd->m_oswindow = gtk_widget_get_window(gtk_win);
-        if (GDK_IS_WAYLAND_WINDOW(hwnd->m_oswindow) && !(hwnd->m_style & WS_CAPTION))
-          gdk_wayland_window_announce_csd(hwnd->m_oswindow);
-#else
-        GdkWindowAttr attr={0,};
-        attr.title = (char *)hwnd->m_title.Get();
-        attr.event_mask = GDK_ALL_EVENTS_MASK|GDK_EXPOSURE_MASK;
-        attr.x = r.left;
-        attr.y = r.top;
-        attr.width = r.right-r.left;
-        attr.height = r.bottom-r.top;
-        attr.wclass = GDK_INPUT_OUTPUT;
-        const char *appname = g_swell_appname;
-        attr.wmclass_name = (gchar*)appname;
-        attr.wmclass_class = (gchar*)appname;
-        attr.window_type = GDK_WINDOW_TOPLEVEL;
-        if (GetProp(hwnd,"SWELLGdkAlphaChannel"))
-          attr.visual = gdk_screen_get_rgba_visual(gdk_screen_get_default());
-        hwnd->m_oswindow = gdk_window_new(NULL,&attr,GDK_WA_X|GDK_WA_Y|(appname?GDK_WA_WMCLASS:0)|(attr.visual ? GDK_WA_VISUAL : 0));
+        else
 #endif
+        {
+          GdkWindowAttr attr={0,};
+          attr.title = (char *)hwnd->m_title.Get();
+          attr.event_mask = GDK_ALL_EVENTS_MASK|GDK_EXPOSURE_MASK;
+          attr.x = r.left;
+          attr.y = r.top;
+          attr.width = r.right-r.left;
+          attr.height = r.bottom-r.top;
+          attr.wclass = GDK_INPUT_OUTPUT;
+          const char *appname = g_swell_appname;
+          attr.wmclass_name = (gchar*)appname;
+          attr.wmclass_class = (gchar*)appname;
+          attr.window_type = GDK_WINDOW_TOPLEVEL;
+          if (GetProp(hwnd,"SWELLGdkAlphaChannel"))
+            attr.visual = gdk_screen_get_rgba_visual(gdk_screen_get_default());
+          hwnd->m_oswindow = gdk_window_new(NULL,&attr,GDK_WA_X|GDK_WA_Y|(appname?GDK_WA_WMCLASS:0)|(attr.visual ? GDK_WA_VISUAL : 0));
+        }
  
         if (hwnd->m_oswindow) 
         {
@@ -1262,11 +1274,14 @@ void swell_oswindow_manage(HWND hwnd, bool wantfocus)
             {
               gdk_window_set_transient_for(hwnd->m_oswindow,transient_for);
               if (modal)
+              {
 #ifdef SWELL_TARGET_WAYLAND
-                            gtk_window_set_modal(GTK_WINDOW(gtk_win), TRUE);
-#else
-                            gdk_window_set_modal_hint(hwnd->m_oswindow,true);
+                if (gtk_win)
+                  gtk_window_set_modal(GTK_WINDOW(gtk_win), TRUE);
+                else
 #endif
+                  gdk_window_set_modal_hint(hwnd->m_oswindow,true);
+              }
             }
 
             if (modal) type_hint = GDK_WINDOW_TYPE_HINT_DIALOG;
@@ -1307,7 +1322,7 @@ void swell_oswindow_manage(HWND hwnd, bool wantfocus)
 
 #ifdef SWELL_TARGET_WAYLAND
           //NOTE: WAYLAND Drag and drop from mediaexplorer and filemanager
-          if (!is_popup_menu && !is_tooltip && gtk_win)
+          if (gtk_win && gtk_window_get_window_type(GTK_WINDOW(gtk_win)) == GTK_WINDOW_TOPLEVEL)
           {
             gtk_drag_dest_set(gtk_win, (GtkDestDefaults)(GTK_DEST_DEFAULT_MOTION | GTK_DEST_DEFAULT_DROP), NULL, 0, GDK_ACTION_COPY);
             GtkTargetEntry target = { (gchar*)"text/uri-list", 0, 0 };
@@ -1320,13 +1335,16 @@ void swell_oswindow_manage(HWND hwnd, bool wantfocus)
             gdk_window_fullscreen(hwnd->m_oswindow);
 
 #ifdef SWELL_TARGET_WAYLAND
-          gtk_widget_show(gtk_win);
-#else
-          if (!swell_app_is_inactive && !s_force_window_time)
-            gdk_window_show(hwnd->m_oswindow);
+          if (gtk_win)
+            gtk_widget_show(gtk_win);
           else
-            gdk_window_show_unraised(hwnd->m_oswindow);
 #endif
+          {
+            if (!swell_app_is_inactive && !s_force_window_time)
+              gdk_window_show(hwnd->m_oswindow);
+            else
+              gdk_window_show_unraised(hwnd->m_oswindow);
+          }
 
           if (s_last_desktop>0)
             _gdk_x11_window_move_to_desktop(hwnd->m_oswindow,s_last_desktop-1);
@@ -1369,19 +1387,22 @@ void swell_oswindow_updatetoscreen(HWND hwnd, RECT *rect)
 
     GdkRectangle rrr={rect->left,rect->top,rect->right-rect->left,rect->bottom-rect->top};
 #ifdef SWELL_TARGET_WAYLAND
-    rrr = swell_gdk_logical_rect(rrr, swell_gdk_window_scale(hwnd->m_oswindow));
-    if (swell_wayland_needs_manual_titlebar(hwnd))
+    if (GDK_IS_WAYLAND_WINDOW(hwnd->m_oswindow))
     {
-      rrr.x += SWELL_WAYLAND_BORDER_WIDTH;
-      rrr.y += g_swell_wayland_title_h + SWELL_WAYLAND_BORDER_WIDTH;
-      rrr.width += SWELL_WAYLAND_BORDER_WIDTH;
-      rrr.height += g_swell_wayland_title_h + SWELL_WAYLAND_BORDER_WIDTH;
+      rrr = swell_gdk_logical_rect(rrr, swell_gdk_window_scale(hwnd->m_oswindow));
+      if (swell_wayland_needs_manual_titlebar(hwnd))
+      {
+        rrr.x += SWELL_WAYLAND_BORDER_WIDTH;
+        rrr.y += g_swell_wayland_title_h + SWELL_WAYLAND_BORDER_WIDTH;
+        rrr.width += SWELL_WAYLAND_BORDER_WIDTH;
+        rrr.height += g_swell_wayland_title_h + SWELL_WAYLAND_BORDER_WIDTH;
+      }
+      if (hwnd->m_oswidget)
+        gtk_widget_queue_draw_area(GTK_WIDGET(hwnd->m_oswidget), rrr.x, rrr.y, rrr.width, rrr.height);
+      else
+        gdk_window_invalidate_rect(hwnd->m_oswindow, &rrr, FALSE);
+      return;
     }
-    if (hwnd->m_oswidget)
-      gtk_widget_queue_draw_area(GTK_WIDGET(hwnd->m_oswidget), rrr.x, rrr.y, rrr.width, rrr.height);
-    else
-      gdk_window_invalidate_rect(hwnd->m_oswindow, &rrr, FALSE);
-    return;
 #endif
     gdk_window_begin_paint_rect(hwnd->m_oswindow, &rrr);
 
@@ -1904,12 +1925,11 @@ static void OnWindowStateEvent(GdkEventWindowState *evt)
   {
     bool maximized;
 #ifdef SWELL_TARGET_WAYLAND
-    maximized = hwnd->m_oswidget && GTK_IS_WINDOW(hwnd->m_oswidget)
-                  ? gtk_window_is_maximized(GTK_WINDOW(hwnd->m_oswidget))
-                  : false;
-#else
-    maximized = (evt->new_window_state & GDK_WINDOW_STATE_MAXIMIZED) != 0;
+    if (hwnd->m_oswidget && GTK_IS_WINDOW(hwnd->m_oswidget))
+      maximized = gtk_window_is_maximized(GTK_WINDOW(hwnd->m_oswidget));
+    else
 #endif
+      maximized = (evt->new_window_state & GDK_WINDOW_STATE_MAXIMIZED) != 0;
     hwnd->m_is_maximized = maximized;
     SendMessage(hwnd,WM_SIZE,
         maximized ? SIZE_MAXIMIZED : SIZE_RESTORED, 0);
@@ -2781,7 +2801,7 @@ static void swell_gdkEventHandler(GdkEvent *evt, gpointer data)
             {
 #ifdef SWELL_TARGET_WAYLAND
               SWELL_OSWINDOW old_focus = SWELL_focused_oswindow;
-              if (old_focus && old_focus != fc->window)
+              if (old_focus && old_focus != fc->window && GDK_IS_WAYLAND_WINDOW(old_focus))
                 gdk_window_invalidate_rect(old_focus, NULL, FALSE);
 #endif
               SWELL_focused_oswindow = fc->window;
@@ -3115,6 +3135,7 @@ void SWELL_GetViewPort(RECT *r, const RECT *sourcerect, bool wantWork)
   //TODO: NEEDS WORK AREA SO MENUS DONT GET CROPPED OUTSIDE OF APP BUT MOVED 
   // On Wayland all coordinates are monitor-local (compositor reports surface origins as 0),
   // so return the relevant monitor's geometry with a LOCAL origin (0,0) to match.
+  if (GDK_IS_WAYLAND_DISPLAY(gdk_display_get_default()))
   {
     GdkDisplay *disp = gdk_display_get_default();
     GdkMonitor *mon = SWELL_focused_oswindow ?
@@ -4728,7 +4749,8 @@ HWND SWELL_CreateXBridgeWindow(HWND viewpar, void **wref, const RECT *r)
   HWND hwnd = NULL;
   *wref = NULL;
 #ifdef SWELL_TARGET_WAYLAND
-  return xw_bridge_create(viewpar, wref, r, "REAPERXBridge");
+  if (GDK_IS_WAYLAND_DISPLAY(gdk_display_get_default()))
+    return xw_bridge_create(viewpar, wref, r, "REAPERXBridge");
 #endif
   GdkWindow *ospar = NULL;
   HWND hpar = viewpar;
@@ -5142,7 +5164,7 @@ int SWELL_ShowCursor(BOOL bShow)
     SetCursor((HCURSOR)gdk_cursor_new_for_display(gdk_display_get_default(),GDK_BLANK_CURSOR));
 #ifdef SWELL_TARGET_WAYLAND
     // WAYLAND: relative mouse mode when cursor hidden, or knobs are wonky
-    g_swell_mouse_relmode=true;
+    if (GDK_IS_WAYLAND_DISPLAY(gdk_display_get_default())) g_swell_mouse_relmode=true;
 #else
     //g_swell_mouse_relmode=true;
 #endif

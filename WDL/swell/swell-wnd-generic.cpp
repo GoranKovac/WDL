@@ -7142,36 +7142,39 @@ static HWND recurseOwnedWindowHitTest(HWND h, POINT p, int maxdepth)
 HWND WindowFromPoint(POINT p)
 {
 #ifdef SWELL_TARGET_WAYLAND
-  // imgui fix
-  extern HWND g_wayland_hovered_hwnd;
-  bool hover_hwnd_still_valid = false;
-  if (g_wayland_hovered_hwnd)
+  if (swell_is_wayland())
   {
-    HWND t = SWELL_topwindows;
-    while (t && t != g_wayland_hovered_hwnd) t = t->m_next;
-    if (t)
-      hover_hwnd_still_valid = true;
-    else
-      g_wayland_hovered_hwnd = NULL;
-  }
-  if (hover_hwnd_still_valid)
-  {
-    HWND child = ChildWindowFromPoint(g_wayland_hovered_hwnd, p);
-    return child ? child : g_wayland_hovered_hwnd;
-  }
-
-  SWELL_OSWINDOW hov = s_last_hover_oswindow;
-  if (hov)
-  {
-    HWND hovhwnd = swell_oswindow_to_hwnd(hov);
-    if (hovhwnd)
+    // imgui fix
+    extern HWND g_wayland_hovered_hwnd;
+    bool hover_hwnd_still_valid = false;
+    if (g_wayland_hovered_hwnd)
     {
-      HWND child = ChildWindowFromPoint(hovhwnd, p);
-      return child ? child : hovhwnd;
+      HWND t = SWELL_topwindows;
+      while (t && t != g_wayland_hovered_hwnd) t = t->m_next;
+      if (t)
+        hover_hwnd_still_valid = true;
+      else
+        g_wayland_hovered_hwnd = NULL;
     }
+    if (hover_hwnd_still_valid)
+    {
+      HWND child = ChildWindowFromPoint(g_wayland_hovered_hwnd, p);
+      return child ? child : g_wayland_hovered_hwnd;
+    }
+
+    SWELL_OSWINDOW hov = s_last_hover_oswindow;
+    if (hov)
+    {
+      HWND hovhwnd = swell_oswindow_to_hwnd(hov);
+      if (hovhwnd)
+      {
+        HWND child = ChildWindowFromPoint(hovhwnd, p);
+        return child ? child : hovhwnd;
+      }
+    }
+    return NULL;
   }
-  return NULL;
-#else
+#endif
   HWND h = SWELL_topwindows;
   while (h)
   {
@@ -7183,7 +7186,6 @@ HWND WindowFromPoint(POINT p)
     h = h->m_next;
   }
   return NULL;
-#endif
 }
 
 
