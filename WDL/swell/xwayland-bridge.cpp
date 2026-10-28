@@ -22,20 +22,14 @@ struct Capture {
     int        pixmap_w    = 0;
     int        pixmap_h    = 0;
     Visual    *visual      = nullptr; // plugin_win's visual, cached for cairo_xlib_surface_create
-    int        depth       = 0;
     GtkWidget *widget      = nullptr;
     GtkWidget *active_toplevel = nullptr; // toplevel we hooked notify::is-active on; disconnected in cleanup
     HWND       hwnd        = nullptr;
     //
     Damage     damage      = 0;
-    int        damage_base = 0;
 
     GtkWidget *popup_canvas    = nullptr;
     GtkWidget *canvas_draw     = nullptr;
-    int        canvas_origin_x = 0;
-    int        canvas_origin_y = 0;
-    int        canvas_w        = 0;
-    int        canvas_h        = 0;
     int        gtk_x           = 0;
     int        gtk_y           = 0;
     Window     root_popup      = 0;
@@ -87,31 +81,22 @@ struct bridgeState {
     RECT     last_size_pos = {0,0,0,0}; // last hwnd->m_position xw_size actually acted on, see xw_size
     bool     has_last_size_pos = false;
     GtkWidget *embed_container = nullptr; // resolved via xw_ensure_embed_widget, see xw_bridge_create/xw_size
-    // Host toplevel our widget is currently placed in. Mirrors bs->cur_parent
-    // in SWELL's X11 bridge (swell-generic-gdk.cpp, xbridgeProc WM_SIZE):
-    // REAPER destroys and recreates the FX window when a plugin resizes
-    // itself, and the X11 bridge detects that by comparing this against the
-    // host's current m_oswindow and reparenting into the new one. Without the
-    // equivalent here, our widget is left in the discarded toplevel -- alive
-    // at the GTK level, but with its GdkWindow destroyed, so it never draws.
-    GtkWidget *cur_parent_toplevel = nullptr;
 };
 
-// Refresh the composite-named window pixmap after the plugin window has been
-// (re)configured. Automatic redirection means the X server keeps drawing the
-// window off-screen; we sample it via XCompositeNameWindowPixmap and render
-// with cairo's xlib backend. The pixmap handle becomes invalid on every
-// resize, so we re-name it whenever the size we saw changes.
-static bool ensure_pixmap(Capture *c, int w, int h)
+// (Re-)name the composite pixmap of the plugin window. Automatic redirection
+// means the X server keeps drawing the window off-screen; we sample it via
+// XCompositeNameWindowPixmap and render with cairo's xlib backend. The named
+// pixmap is only a reference to whatever backs the window at naming time, so
+// it goes stale on every resize and on every Present flip (GLX plugin UIs swap
+// the window pixmap for the client's buffer) -- callers re-name on both.
+static bool refresh_pixmap(Capture *c)
 {
-    if (c->pixmap && c->pixmap_w == w && c->pixmap_h == h) return true;
+    if (!c || !c->dpy || !c->plugin_win) return false;
 
-    if (!c->visual) {
-        XWindowAttributes wa;
-        if (!XGetWindowAttributes(c->dpy, c->plugin_win, &wa)) return false;
-        c->visual = wa.visual;
-        c->depth  = wa.depth;
-    }
+    XWindowAttributes wa;
+    if (!XGetWindowAttributes(c->dpy, c->plugin_win, &wa)) return false;
+    if (wa.width <= 0 || wa.height <= 0) return false;
+    if (!c->visual) c->visual = wa.visual;
 
     // Order matters: flush any pending server-side resize first, then rename.
     // Otherwise the newly-named pixmap gets invalidated by the resize we just
@@ -122,8 +107,8 @@ static bool ensure_pixmap(Capture *c, int w, int h)
     c->pixmap  = XCompositeNameWindowPixmap(c->dpy, c->plugin_win);
     if (old) XFreePixmap(c->dpy, old);
 
-    c->pixmap_w = w;
-    c->pixmap_h = h;
+    c->pixmap_w = wa.width;
+    c->pixmap_h = wa.height;
     return c->pixmap != 0;
 }
 
@@ -132,35 +117,6 @@ static void destroy_pixmap(Capture *c)
     if (!c) return;
     if (c->pixmap && c->dpy) { XFreePixmap(c->dpy, c->pixmap); c->pixmap = 0; }
     c->pixmap_w = c->pixmap_h = 0;
-}
-
-// Unconditional composite-pixmap rename. Called whenever we know the pixmap
-// handle is about to become invalid (resize) or already has. Does not skip on
-// unchanged size -- ensure_pixmap does that when size is the guarantee we
-// have; refresh_pixmap is the one to use when the caller knows a resize is in
-// flight.
-static void refresh_pixmap(Capture *c)
-{
-    if (!c || !c->dpy || !c->plugin_win) return;
-
-    // Flush any pending server-side resize before naming, otherwise the
-    // freshly-named pixmap gets invalidated by the resize we just missed and
-    // the next XFreePixmap hits BadPixmap.
-    XFlush(c->dpy);
-
-    Pixmap old = c->pixmap;
-    c->pixmap  = XCompositeNameWindowPixmap(c->dpy, c->plugin_win);
-    if (old) XFreePixmap(c->dpy, old);
-
-    // Track size for ensure_pixmap's fast path.
-    XWindowAttributes wa;
-    if (XGetWindowAttributes(c->dpy, c->plugin_win, &wa)) {
-        c->pixmap_w = wa.width;
-        c->pixmap_h = wa.height;
-        if (!c->visual) { c->visual = wa.visual; c->depth = wa.depth; }
-    }
-
-    if (c->widget && GTK_IS_WIDGET(c->widget)) gtk_widget_queue_draw(c->widget);
 }
 
 static bool on_draw(GtkWidget *, cairo_t *cr, gpointer data)
@@ -406,20 +362,13 @@ static Capture* setup_capture(Display *dpy, Window parent_win, Window plugin_win
     // Automatic redirect the plugin windows never contest hit-testing at all.
     XCompositeRedirectWindow(dpy, plugin_win, CompositeRedirectAutomatic);
 
-    // Cache the visual/depth once so on_draw does not have to XGetWindowAttributes
-    // every frame.
-    XWindowAttributes wa;
-    if (XGetWindowAttributes(dpy, plugin_win, &wa)) {
-        c->visual = wa.visual;
-        c->depth  = wa.depth;
-        ensure_pixmap(c, wa.width, wa.height);
-    }
+    // Also caches the visual so on_draw does not have to
+    // XGetWindowAttributes every frame.
+    refresh_pixmap(c);
 
     int base, err;
-    if (g_wm_dpy && XDamageQueryExtension(g_wm_dpy, &base, &err)) {
-        c->damage      = XDamageCreate(g_wm_dpy, plugin_win, XDamageReportBoundingBox);
-        c->damage_base = base;
-    }
+    if (g_wm_dpy && XDamageQueryExtension(g_wm_dpy, &base, &err))
+        c->damage = XDamageCreate(g_wm_dpy, plugin_win, XDamageReportBoundingBox);
 
     XFlush(dpy);
 
@@ -479,8 +428,8 @@ static bool canvas_draw_cb(GtkWidget *, cairo_t *cr, gpointer data)
     for (const auto &p : c->popups) {
         if (!p.visible || p.pixmap == None) continue;
 
-        int draw_x = p.x - c->canvas_origin_x;
-        int draw_y = p.y - c->canvas_origin_y;
+        int draw_x = p.x;
+        int draw_y = p.y;
 
         if (draw_x + p.w <= clip_x1 || draw_x >= clip_x2 ||
             draw_y + p.h <= clip_y1 || draw_y >= clip_y2)
@@ -502,8 +451,8 @@ static bool canvas_button_press(GtkWidget *, GdkEventButton *e, gpointer data)
     Capture *c = (Capture*)data;
     if (!c || !c->dpy) return false;
 
-    int screen_x = (int)e->x + c->canvas_origin_x;
-    int screen_y = (int)e->y + c->canvas_origin_y;
+    int screen_x = (int)e->x;
+    int screen_y = (int)e->y;
     int x11_x = screen_x - c->gtk_x;
     int x11_y = screen_y - c->gtk_y;
 
@@ -553,8 +502,8 @@ static bool canvas_motion(GtkWidget *, GdkEventMotion *e, gpointer data)
     if (now - last_time < 16) return true;
     last_time = now;
 
-    int screen_x = (int)e->x + c->canvas_origin_x;
-    int screen_y = (int)e->y + c->canvas_origin_y;
+    int screen_x = (int)e->x;
+    int screen_y = (int)e->y;
     int x11_x = screen_x - c->gtk_x;
     int x11_y = screen_y - c->gtk_y;
 
@@ -587,10 +536,6 @@ static void create_popup_canvas(Capture *c)
 
     int sw = gdk_screen_get_width(screen);
     int sh = gdk_screen_get_height(screen);
-    c->canvas_origin_x = 0;
-    c->canvas_origin_y = 0;
-    c->canvas_w = sw;
-    c->canvas_h = sh;
 
     GtkWidget *da = gtk_drawing_area_new();
     gtk_widget_set_size_request(da, sw, sh);
@@ -995,8 +940,8 @@ static bool on_popup_configured(Window w, int cx, int cy, int cw, int ch)
             if (c->canvas_draw) {
                 GdkWindow *cwin = gtk_widget_get_window(c->canvas_draw);
                 if (cwin) {
-                    GdkRectangle old_r = { old_x - c->canvas_origin_x, old_y - c->canvas_origin_y, old_w, old_h };
-                    GdkRectangle new_r = { p.x  - c->canvas_origin_x, p.y  - c->canvas_origin_y, p.w,   p.h   };
+                    GdkRectangle old_r = { old_x, old_y, old_w, old_h };
+                    GdkRectangle new_r = { p.x,   p.y,   p.w,   p.h   };
                     gdk_window_invalidate_rect(cwin, &old_r, FALSE);
                     gdk_window_invalidate_rect(cwin, &new_r, FALSE);
                 } else {
@@ -1016,24 +961,11 @@ static void handle_damage_notify(XDamageNotifyEvent *de)
 
     XDamageSubtract(g_wm_dpy, de->damage, None, None);
 
-    // With Automatic redirection there is no capture step, but the named pixmap
-    // is only a reference to whatever backs the window at naming time. Besides
-    // resizes, Xwayland's Present flips (GLX plugin UIs, e.g. robtk/AVL Drumkits)
-    // swap the window pixmap for the client's buffer on every swap, leaving our
-    // handle on a stale buffer -- so re-name on every damage, then tell GTK to
-    // redraw the affected area.
-    auto rename_pixmap = [](Capture *c) -> bool {
-        if (!c || !c->dpy || !c->plugin_win) return false;
-        XWindowAttributes wa;
-        if (!XGetWindowAttributes(c->dpy, c->plugin_win, &wa)) return false;
-        if (wa.width <= 0 || wa.height <= 0) return false;
-        c->pixmap_w = c->pixmap_h = 0; // defeat ensure_pixmap's same-size fast path
-        return ensure_pixmap(c, wa.width, wa.height);
-    };
-
+    // No capture step with Automatic redirection: re-name the pixmap (see
+    // refresh_pixmap) and tell GTK to redraw the affected area.
     Capture *c = find_capture(de->drawable);
     if (c && c->widget && GTK_IS_WIDGET(c->widget)) {
-        if (rename_pixmap(c)) {
+        if (refresh_pixmap(c)) {
             gtk_widget_queue_draw_area(c->widget, de->area.x, de->area.y,
                                        de->area.width, de->area.height);
         }
@@ -1047,8 +979,8 @@ static void handle_damage_notify(XDamageNotifyEvent *de)
         for (auto &pp : cc->popups) {
             if (pp.x11_win == de->drawable) {
                 if (cc->canvas_draw && GTK_IS_WIDGET(cc->canvas_draw)) {
-                    int inv_x = pp.x - cc->canvas_origin_x + de->area.x;
-                    int inv_y = pp.y - cc->canvas_origin_y + de->area.y;
+                    int inv_x = pp.x + de->area.x;
+                    int inv_y = pp.y + de->area.y;
                     gtk_widget_queue_draw_area(cc->canvas_draw, inv_x, inv_y,
                                                de->area.width, de->area.height);
                 }
@@ -1456,9 +1388,6 @@ void xw_size(HWND hwnd)
             bs->embed_container = fresh;
             bs->placed = false;   // the put/show path below re-places it
         }
-        HWND top = hwnd->m_parent;
-        while (top && !top->m_oswidget) top = top->m_parent;
-        if (top && top->m_oswidget) bs->cur_parent_toplevel = (GtkWidget*)top->m_oswidget;
     }
 
     GtkWidget *container = bs->embed_container;
@@ -1495,7 +1424,8 @@ void xw_size(HWND hwnd)
     // captured (e.g. during an FX-list swap), and the container resize also
     // needs a live capture.
     if (bs->cap && size_changed) {
-        refresh_pixmap(bs->cap);
+        if (refresh_pixmap(bs->cap) && GTK_IS_WIDGET(bs->cap->widget))
+            gtk_widget_queue_draw(bs->cap->widget);
         place_container(bs->cap->dpy, bs->cap->parent_win, w, h);
         XFlush(bs->cap->dpy);
     }
