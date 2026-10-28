@@ -181,7 +181,7 @@ void xw_raise_modals()
     for (auto &kv : g_captures)
     {
         Capture *c = kv.second;
-        if (!c) continue;
+        if (!c || kv.first != c->parent_win) continue;
         if (c->modals.empty()) continue;
         for (auto &md : c->modals)
             if (md.gtk_win)
@@ -949,6 +949,7 @@ static void on_popup_mapped(Window w)
 
     for (auto &kv : g_captures) {
         Capture *cand = kv.second;
+        if (!cand || kv.first != cand->parent_win) continue;
         if (cand && is_window_from_owned_plugin(cand->dpy, w, cand->gui_win)) {
             handle_new_window(w, cand, &attr);
             return;
@@ -960,6 +961,7 @@ static void on_popup_unmapped(Window w)
 {
     for (auto &kv : g_captures) {
         Capture *c = kv.second;
+        if (!c || kv.first != c->parent_win) continue;
         auto it = std::find_if(c->popups.begin(), c->popups.end(),
             [w](const Capture::PopupWin &p){ return p.x11_win == w; });
         if (it != c->popups.end()) { canvas_remove_popup(c, w); return; }
@@ -974,6 +976,7 @@ static bool on_popup_configured(Window w, int cx, int cy, int cw, int ch)
 {
     for (auto &kv : g_captures) {
         Capture *c = kv.second;
+        if (!c || kv.first != c->parent_win) continue;
         for (auto &p : c->popups) {
             if (p.x11_win != w) continue;
             int ox = 0, oy = 0;
@@ -1034,7 +1037,7 @@ static void handle_damage_notify(XDamageNotifyEvent *de)
 
     for (auto &kv : g_captures) {
         Capture *cc = kv.second;
-        if (!cc) continue;
+        if (!cc || kv.first != cc->parent_win) continue;
 
         for (auto &pp : cc->popups) {
             if (pp.x11_win == de->drawable) {
@@ -1190,7 +1193,7 @@ bool xw_bridge_swell_on_button_event_escape()
     for (auto &kv : g_captures)
     {
         Capture *c = kv.second;
-        if (!c) continue;
+        if (!c || kv.first != c->parent_win) continue;
         if (!c->modals.empty()){
             xw_raise_modals();
             any = true;
@@ -1208,7 +1211,7 @@ bool xw_bridge_swell_on_gdk_delete_release()
     bool any = false;
     for (auto &kv : g_captures) {
         Capture *c = kv.second;
-        if (!c) continue;
+        if (!c || kv.first != c->parent_win) continue;
         if (!c->popups.empty()) {
             any = true;
             // Tell the plugin to close its menu FIRST, while we still have the popup
@@ -1623,6 +1626,7 @@ bool xw_bridge_forward_key_to_modal(int keycode, int state, bool is_press)
     for (auto &kv : g_captures)
     {
         Capture *c = kv.second;
+        if (!c || kv.first != c->parent_win) continue;
         if (!c || !c->dpy || c->modals.empty()) continue;
 
         Capture::ModalWin &md = c->modals.back();
