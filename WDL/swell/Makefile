@@ -110,8 +110,9 @@ OBJS = $(SWELL_OBJS)
 
 #Wayland (SWELL_TARGET_WAYLAND) depends on GTK3 so load it automatically
 ifdef WAYLAND
-  SWELL_OBJS += xwayland-bridge.o xwayland-bridge-wm.o
-  LINKEXTRA += -lXcomposite -lXtst -lXfixes
+  SWELL_OBJS += xwayland-bridge.o xwayland-bridge-wm.o xwayland-bridge-display.o
+  CFLAGS += $(shell $(PKG_CONFIG) --cflags wayland-client)
+  LINKEXTRA += -lXcomposite -lXtst -lXfixes $(shell $(PKG_CONFIG) --libs wayland-client)
   override SWELL_GDK_ONLY =
   # spare-window for modal dialogs doesn't resize on an already 
 	# mapped Wayland so disable it
@@ -192,6 +193,7 @@ swell-miscdlg-generic.o: $(SWELL_HEADERS)
 swell-modstub-generic.o: $(SWELL_HEADERS)
 swell-appstub-generic.o: $(SWELL_HEADERS)
 swell-generic-gdk.o xwayland-bridge.o: $(SWELL_HEADERS)
+xwayland-bridge-wm.o xwayland-bridge-display.o: xwayland-bridge-display.h
 
 libSwell$(DLL_EXT): $(OBJS)
 	$(CXX) -shared -o $@ $(CFLAGS) $(LFLAGS) $^ $(LINKEXTRA)

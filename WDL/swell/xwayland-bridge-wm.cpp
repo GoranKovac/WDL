@@ -17,6 +17,7 @@
 #endif
 
 #include "xwayland-bridge-wm.h"
+#include "xwayland-bridge-display.h"
 #include "xwayland-bridge.h"          // g_wm, g_wm_dpy
 #include <X11/extensions/XTest.h>
 #include <X11/extensions/Xcomposite.h>
@@ -83,20 +84,7 @@ XWaylandWM* XWaylandWM::init_bridge_wm(const char *display_name)
 {
     if (s_xwayland_pid > 0) return g_wm;
 
-    s_xwayland_pid = fork();
-    if (s_xwayland_pid == 0) {
-        prctl(PR_SET_PDEATHSIG, SIGTERM);
-        // Rootless Xwayland: each plugin becomes its own X window we manage via
-        // this WM, and we composite-redirect them off-screen with XComposite so
-        // REAPER can display their contents at 0,0 inside its own GTK widget.
-        // Wine has a well-known regression that corrupts input routing when two
-        // top-level windows share the same X coords -- we work around it by
-        // running plugins under Automatic composite redirect and reading back
-        // via a named window pixmap, so overlap is handled by REAPER's own
-        // widget stacking, not by X11 hit-testing.
-        execl("/usr/bin/Xwayland", "Xwayland", display_name, "-rootless", NULL);
-        _exit(1);
-    }
+    s_xwayland_pid = xw_spawn_xwayland(display_name);
     if (s_xwayland_pid < 0) return nullptr;
 
     setenv("DISPLAY", display_name, 1);
