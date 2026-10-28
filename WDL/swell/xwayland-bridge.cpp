@@ -35,6 +35,8 @@ struct Capture {
 
     GtkWidget *popup_canvas    = nullptr;
     GtkWidget *canvas_draw     = nullptr;
+    int        canvas_x        = 0;
+    int        canvas_y        = 0;
     int        gtk_x           = 0;
     int        gtk_y           = 0;
     Window     root_popup      = 0;
@@ -489,8 +491,8 @@ static bool canvas_draw_cb(GtkWidget *widget, cairo_t *cr, gpointer data)
     for (const auto &p : c->popups) {
         if (!p.visible || p.pixmap == None) continue;
 
-        int draw_x = p.x;
-        int draw_y = p.y;
+        int draw_x = p.x - c->canvas_x;
+        int draw_y = p.y - c->canvas_y;
 
         if (draw_x + p.w <= clip_x1 || draw_x >= clip_x2 ||
             draw_y + p.h <= clip_y1 || draw_y >= clip_y2)
@@ -522,8 +524,8 @@ static bool canvas_button_press(GtkWidget *widget, GdkEventButton *e, gpointer d
     if (!c || !c->dpy) return false;
 
     const int scale = swell_gdk_widget_scale(widget);
-    int screen_x = (int)(e->x * scale);
-    int screen_y = (int)(e->y * scale);
+    int screen_x = (int)(e->x * scale) + c->canvas_x;
+    int screen_y = (int)(e->y * scale) + c->canvas_y;
     int x11_x = screen_x - c->gtk_x;
     int x11_y = screen_y - c->gtk_y;
 
@@ -575,8 +577,8 @@ static bool canvas_motion(GtkWidget *widget, GdkEventMotion *e, gpointer data)
     last_time = now;
 
     const int scale = swell_gdk_widget_scale(widget);
-    int screen_x = (int)(e->x * scale);
-    int screen_y = (int)(e->y * scale);
+    int screen_x = (int)(e->x * scale) + c->canvas_x;
+    int screen_y = (int)(e->y * scale) + c->canvas_y;
     int x11_x = screen_x - c->gtk_x;
     int x11_y = screen_y - c->gtk_y;
 
@@ -609,6 +611,9 @@ static void create_popup_canvas(Capture *c)
 
     int sw = gdk_screen_get_width(screen);
     int sh = gdk_screen_get_height(screen);
+    const int scale = swell_gdk_widget_scale(c->widget);
+    c->canvas_x = swell_gdk_floor(c->gtk_x, scale) * scale;
+    c->canvas_y = swell_gdk_floor(c->gtk_y, scale) * scale;
 
     GtkWidget *da = gtk_drawing_area_new();
     gtk_widget_set_size_request(da, sw, sh);
@@ -622,6 +627,11 @@ static void create_popup_canvas(Capture *c)
 
     c->popup_canvas = win;
     c->canvas_draw  = da;
+    gtk_widget_realize(win);
+    GdkRectangle anchor = { 0, 0, 1, 1 };
+    gdk_window_move_to_rect(gtk_widget_get_window(win), &anchor,
+                           GDK_GRAVITY_NORTH_WEST, GDK_GRAVITY_NORTH_WEST,
+                           (GdkAnchorHints)0, c->canvas_x / scale, c->canvas_y / scale);
 }
 
 static void refresh_gtk_offset(Capture *c, int *out_px = nullptr, int *out_py = nullptr)
@@ -1020,8 +1030,8 @@ static bool on_popup_configured(Window w, int cw, int ch)
             if (c->canvas_draw) {
                 GdkWindow *cwin = gtk_widget_get_window(c->canvas_draw);
                 if (cwin) {
-                    GdkRectangle old_r = { old_x, old_y, old_w, old_h };
-                    GdkRectangle new_r = { p.x,   p.y,   p.w,   p.h   };
+                    GdkRectangle old_r = { old_x - c->canvas_x, old_y - c->canvas_y, old_w, old_h };
+                    GdkRectangle new_r = { p.x - c->canvas_x, p.y - c->canvas_y, p.w, p.h };
                     const int scale = swell_gdk_window_scale(cwin);
                     old_r = swell_gdk_logical_rect(old_r, scale);
                     new_r = swell_gdk_logical_rect(new_r, scale);
@@ -1064,8 +1074,8 @@ static void handle_damage_notify(XDamageNotifyEvent *de)
         for (auto &pp : cc->popups) {
             if (pp.x11_win == de->drawable) {
                 if (cc->canvas_draw && GTK_IS_WIDGET(cc->canvas_draw)) {
-                    int inv_x = pp.x + de->area.x;
-                    int inv_y = pp.y + de->area.y;
+                    int inv_x = pp.x + de->area.x - cc->canvas_x;
+                    int inv_y = pp.y + de->area.y - cc->canvas_y;
                     swell_gdk_queue_draw_pixels(cc->canvas_draw, inv_x, inv_y,
                                                de->area.width, de->area.height);
                 }
