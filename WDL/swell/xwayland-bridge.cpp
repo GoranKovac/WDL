@@ -9,6 +9,7 @@
 #include <X11/extensions/Xcomposite.h>
 #include <X11/extensions/Xdamage.h>
 #include <X11/extensions/Xfixes.h>
+#include <X11/extensions/Xrandr.h>
 #include <X11/extensions/shape.h>
 #include <cairo/cairo-xlib.h>
 void xw_size(HWND hwnd);
@@ -35,6 +36,7 @@ struct Capture {
 
     GtkWidget *popup_canvas    = nullptr;
     GtkWidget *canvas_draw     = nullptr;
+    GdkRectangle monitor_bounds = {};
     int        canvas_x        = 0;
     int        canvas_y        = 0;
     int        gtk_x           = 0;
@@ -618,6 +620,40 @@ static bool canvas_motion(GtkWidget *widget, GdkEventMotion *e, gpointer data)
     return true;
 }
 
+static GdkRectangle capture_monitor(Display *dpy, GtkWidget *widget)
+{
+    GdkRectangle bounds = { 0, 0, DisplayWidth(dpy, DefaultScreen(dpy)),
+                                 DisplayHeight(dpy, DefaultScreen(dpy)) };
+    int count = 0;
+    XRRMonitorInfo *monitors = XRRGetMonitors(dpy, DefaultRootWindow(dpy), True, &count);
+    if (!monitors) return bounds;
+
+    GdkWindow *window = widget ? gtk_widget_get_window(widget) : nullptr;
+    GdkMonitor *monitor = window ? gdk_display_get_monitor_at_window(
+                                      gdk_window_get_display(window), window) : nullptr;
+    GdkRectangle target = bounds;
+    if (monitor) {
+        gdk_monitor_get_geometry(monitor, &target);
+        const int scale = gdk_monitor_get_scale_factor(monitor);
+        target.width *= scale;
+        target.height *= scale;
+    }
+    GdkRectangle selected = bounds;
+    int best = -1;
+    for (int i = 0; i < count; ++i) {
+        GdkRectangle candidate = { monitors[i].x, monitors[i].y,
+                                   monitors[i].width, monitors[i].height };
+        if (!gdk_rectangle_intersect(&bounds, &candidate, &candidate)) continue;
+        const int distance = abs(candidate.width - target.width) + abs(candidate.height - target.height);
+        if (best < 0 || distance < best) {
+            best = distance;
+            selected = candidate;
+        }
+    }
+    XRRFreeMonitors(monitors);
+    return selected;
+}
+
 static void create_popup_canvas(Capture *c)
 {
     if (c->popup_canvas) return;
@@ -639,14 +675,14 @@ static void create_popup_canvas(Capture *c)
 
     gtk_window_set_keep_above(GTK_WINDOW(win), TRUE);
 
-    int sw = gdk_screen_get_width(screen);
-    int sh = gdk_screen_get_height(screen);
+    const GdkRectangle bounds = c->monitor_bounds;
     const int scale = swell_gdk_widget_scale(c->widget);
-    c->canvas_x = swell_gdk_floor(c->gtk_x, scale) * scale;
-    c->canvas_y = swell_gdk_floor(c->gtk_y, scale) * scale;
+    c->canvas_x = swell_gdk_floor(bounds.x + c->gtk_x, scale) * scale;
+    c->canvas_y = swell_gdk_floor(bounds.y + c->gtk_y, scale) * scale;
 
     GtkWidget *da = gtk_drawing_area_new();
-    gtk_widget_set_size_request(da, sw, sh);
+    gtk_widget_set_size_request(da, swell_gdk_ceil(bounds.width, scale),
+                                    swell_gdk_ceil(bounds.height, scale));
     gtk_container_add(GTK_CONTAINER(win), da);
 
     gtk_widget_add_events(da, GDK_BUTTON_PRESS_MASK | GDK_BUTTON_RELEASE_MASK | GDK_POINTER_MOTION_MASK);
@@ -1452,12 +1488,13 @@ static GtkWidget* xw_ensure_embed_widget(HWND h)
 // leaves no room left/up of the plugin: knob drags stop dead there. Centring splits
 // the spare room evenly; a plugin bigger than the screen clamps back to 0, so this
 // never pushes a window further off-screen than 0,0 did.
-static void place_container(Display *dpy, Window container, int w, int h)
+static GdkRectangle place_container(Display *dpy, Window container, GtkWidget *widget, int w, int h)
 {
-    const int scr = DefaultScreen(dpy);
-    const int x = wdl_max((DisplayWidth(dpy, scr)  - w) / 2, 0);
-    const int y = wdl_max((DisplayHeight(dpy, scr) - h) / 2, 0);
+    const GdkRectangle bounds = capture_monitor(dpy, widget);
+    const int x = bounds.x + wdl_max((bounds.width - w) / 2, 0);
+    const int y = bounds.y + wdl_max((bounds.height - h) / 2, 0);
     XMoveResizeWindow(dpy, container, x, y, w, h);
+    return bounds;
 }
 
 static bool try_create_plugin(HWND hwnd)
@@ -1480,12 +1517,14 @@ static bool try_create_plugin(HWND hwnd)
              XFree(list);
 
              XWindowAttributes attr;
-             if (XGetWindowAttributes(bs->disp, plugin_win, &attr))
-                 place_container(bs->disp, bs->parent, attr.width, attr.height);
+             if (!XGetWindowAttributes(bs->disp, plugin_win, &attr)) return false;
+             const GdkRectangle bounds = place_container(bs->disp, bs->parent, hwnd->m_oswidget,
+                                                         attr.width, attr.height);
              XFlush(bs->disp);
 
              Capture *c = setup_capture(bs->disp, bs->parent, plugin_win, hwnd);
              c->widget = hwnd->m_oswidget;
+             c->monitor_bounds = bounds;
 
              // Wine plugins nest a child GUI window; native plugins draw directly.
              Window gr, gp, *gk = nullptr; unsigned int gn = 0;
@@ -1598,7 +1637,8 @@ void xw_size(HWND hwnd)
     // an FX-list swap), and the container resize also needs a live capture.
     if (bs->cap && size_changed) {
         refresh_pixmap(bs->cap);
-        place_container(bs->cap->dpy, bs->cap->parent_win, w, h);
+        bs->cap->monitor_bounds = place_container(bs->cap->dpy, bs->cap->parent_win,
+                                                   hwnd->m_oswidget, w, h);
         XFlush(bs->cap->dpy);
     }
 
@@ -1687,17 +1727,17 @@ HWND xw_bridge_create(HWND viewpar, void **wref, const RECT *r, const char *brid
     Window root = RootWindow(disp, screen);
     int w = wdl_max(r->right - r->left, 1);
     int h = wdl_max(r->bottom - r->top, 1);
+    HWND parent = viewpar;
+    while (parent && !parent->m_oswidget) parent = parent->m_parent;
 
     Window container = XCreateSimpleWindow(disp, root, 0, 0, w, h, 0,
                                            BlackPixel(disp, screen),
                                            WhitePixel(disp, screen));
-    place_container(disp, container, w, h);
+    place_container(disp, container, parent ? parent->m_oswidget : nullptr, w, h);
     XMapWindow(disp, container);
     XFlush(disp);
 
     GtkWidget *draw_area = gtk_drawing_area_new();
-    HWND parent = viewpar;
-    while (parent && !parent->m_oswidget) parent = parent->m_parent;
     const int scale = swell_gdk_widget_scale(parent ? parent->m_oswidget : NULL);
     gtk_widget_set_size_request(draw_area, swell_gdk_ceil(w, scale), swell_gdk_ceil(h, scale));
 
