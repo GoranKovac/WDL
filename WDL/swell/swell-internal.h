@@ -1021,6 +1021,10 @@ HWND DialogBoxIsActive(void);
 bool DestroyPopupMenus(void);
 bool PopupMenuIsActive(void);
 HWND ChildWindowFromPoint(HWND h, POINT p);
+#ifdef SWELL_TARGET_WAYLAND
+void swell_wayland_begin_drag(HWND source);
+bool swell_wayland_drag_target(POINT p, HWND *target);
+#endif
 HWND GetFocusIncludeMenus();
 
 void SWELL_RunEvents();

@@ -11,6 +11,7 @@
 #include <X11/extensions/Xfixes.h>
 #include <X11/extensions/Xrandr.h>
 #include <X11/extensions/shape.h>
+#include <X11/keysym.h>
 #include <cairo/cairo-xlib.h>
 void xw_size(HWND hwnd);
 
@@ -196,13 +197,71 @@ static bool on_draw(GtkWidget *widget, cairo_t *cr, gpointer data)
     return TRUE;
 }
 
+static Window s_pointer_window;
+static bool s_pointer_parked;
+
+static void park_pointer(int x, int y)
+{
+    if (!g_wm_dpy) return;
+    if (!s_pointer_window) {
+        XSetWindowAttributes attr = {};
+        attr.override_redirect = True;
+        attr.event_mask = ButtonPressMask | ButtonReleaseMask;
+        s_pointer_window = XCreateWindow(g_wm_dpy, DefaultRootWindow(g_wm_dpy),
+                                         x, y, 1, 1, 0, 0, InputOnly, CopyFromParent,
+                                         CWOverrideRedirect | CWEventMask, &attr);
+    }
+    XMoveWindow(g_wm_dpy, s_pointer_window, x, y);
+    XMapRaised(g_wm_dpy, s_pointer_window);
+    XTestFakeMotionEvent(g_wm_dpy, DefaultScreen(g_wm_dpy), x, y, CurrentTime);
+    XSync(g_wm_dpy, False);
+    s_pointer_parked = true;
+}
+
+static void resume_pointer()
+{
+    if (!s_pointer_parked) return;
+    XUnmapWindow(g_wm_dpy, s_pointer_window);
+    XSync(g_wm_dpy, False);
+    s_pointer_parked = false;
+}
+
 static void forward_motion(Capture *c, double wx, double wy)
 {
+    resume_pointer();
     const int scale = swell_gdk_widget_scale(c->widget);
     Window child; int rx, ry;
     XTranslateCoordinates(c->dpy, c->plugin_win, DefaultRootWindow(c->dpy),
                           (int)(wx * scale), (int)(wy * scale), &rx, &ry, &child);
     XTestFakeMotionEvent(c->dpy, DefaultScreen(c->dpy), rx, ry, CurrentTime);
+}
+
+static gboolean on_crossing(GtkWidget *, GdkEventCrossing *e, gpointer data)
+{
+    Capture *c = (Capture*)data;
+    if (!c || !c->dpy || e->mode != GDK_CROSSING_NORMAL ||
+        e->detail == GDK_NOTIFY_INFERIOR) return FALSE;
+    if (e->type == GDK_ENTER_NOTIFY) {
+        forward_motion(c, e->x, e->y);
+        XFlush(c->dpy);
+    } else if (!(e->state & (GDK_BUTTON1_MASK | GDK_BUTTON2_MASK | GDK_BUTTON3_MASK |
+                            GDK_BUTTON4_MASK | GDK_BUTTON5_MASK)) && c->popups.empty()) {
+        XMotionEvent motion = {};
+        motion.type = MotionNotify;
+        motion.display = c->dpy;
+        motion.window = c->gui_win ? c->gui_win : c->plugin_win;
+        motion.root = DefaultRootWindow(c->dpy);
+        motion.state = e->state;
+        motion.same_screen = True;
+        Window child;
+        if (XTranslateCoordinates(c->dpy, motion.root, motion.window, 0, 0,
+                                  &motion.x, &motion.y, &child)) {
+            XSendEvent(c->dpy, motion.window, True, PointerMotionMask, (XEvent*)&motion);
+            XSync(c->dpy, False);
+        }
+        park_pointer(0, 0);
+    }
+    return FALSE;
 }
 
 void xw_raise_modals()
@@ -390,6 +449,8 @@ static void connect_widget(Capture *c)
     g_object_add_weak_pointer(G_OBJECT(c->widget), (gpointer*)&c->widget);
     gtk_widget_add_events(c->widget,
                           GDK_POINTER_MOTION_MASK |
+                          GDK_ENTER_NOTIFY_MASK |
+                          GDK_LEAVE_NOTIFY_MASK |
                           GDK_BUTTON_PRESS_MASK |
                           GDK_BUTTON_RELEASE_MASK |
                           GDK_SCROLL_MASK);
@@ -409,6 +470,8 @@ static void connect_widget(Capture *c)
     g_signal_connect(c->widget, "button-press-event",   G_CALLBACK(on_button_press),   c);
     g_signal_connect(c->widget, "button-release-event", G_CALLBACK(on_button_release), c);
     g_signal_connect(c->widget, "motion-notify-event",  G_CALLBACK(on_motion),         c);
+    g_signal_connect(c->widget, "enter-notify-event",   G_CALLBACK(on_crossing),       c);
+    g_signal_connect(c->widget, "leave-notify-event",   G_CALLBACK(on_crossing),       c);
     g_signal_connect(c->widget, "scroll-event",         G_CALLBACK(on_scroll),         c);
     gtk_widget_queue_draw(c->widget);
 }
@@ -568,10 +631,13 @@ static bool popup_accepts_input(Display *dpy, Window window)
     return count > 0;
 }
 
+static void dismiss_popups(Capture *c);
+
 static bool canvas_button_press(GtkWidget *widget, GdkEventButton *e, gpointer data)
 {
     Capture *c = (Capture*)data;
     if (!c || !c->dpy) return false;
+    resume_pointer();
 
     const int scale = swell_gdk_widget_scale(widget);
     int screen_x = (int)(e->x * scale) + c->canvas_x;
@@ -595,13 +661,7 @@ static bool canvas_button_press(GtkWidget *widget, GdkEventButton *e, gpointer d
     }
     // Clicked outside any popup — dismiss.
     if (!hit) {
-        if (c->popup_canvas) gtk_widget_hide(c->popup_canvas);
-        XTestFakeMotionEvent(c->dpy, DefaultScreen(c->dpy), x11_x, x11_y, CurrentTime);
-        XFlush(c->dpy);
-        XTestFakeButtonEvent(c->dpy, e->button, True,  CurrentTime);
-        XFlush(c->dpy);
-        XTestFakeButtonEvent(c->dpy, e->button, False, CurrentTime);
-        XFlush(c->dpy);
+        dismiss_popups(c);
         return true;
     }
     return false;
@@ -620,6 +680,7 @@ static bool canvas_motion(GtkWidget *widget, GdkEventMotion *e, gpointer data)
 {
     Capture *c = (Capture*)data;
     if (!c || !c->dpy) return false;
+    resume_pointer();
 
     static guint32 last_time = 0;
     guint32 now = g_get_monotonic_time() / 1000;
@@ -871,6 +932,7 @@ static bool modal_draw_cb(GtkWidget *widget, cairo_t *cr, gpointer data)
 
 static void modal_forward_motion(ModalRender *m, GtkWidget *widget, double wx, double wy)
 {
+    resume_pointer();
     const int scale = swell_gdk_widget_scale(widget);
     Window child; int rx, ry;
     XTranslateCoordinates(m->cap->dpy, m->x11_win, DefaultRootWindow(m->cap->dpy),
@@ -1299,30 +1361,15 @@ static void bridge_handle_event(XEvent *ev)
     }
 }
 
-static void dismiss_popups_by_click(Capture *c)
+static void dismiss_popups(Capture *c)
 {
     if (!c || !c->dpy || c->popups.empty()) return;
-
-    Window rootw = DefaultRootWindow(c->dpy);
-    Window childw; int px = 0, py = 0;
-    XTranslateCoordinates(c->dpy, c->gui_win ? c->gui_win : c->plugin_win,
-                          rootw, 0, 0, &px, &py, &childw);
-
-    // Top-left corner of the plugin: a menu opened from a control is essentially
-    // never covering it. If one is, aim just below that popup instead.
-    int ax = px + 1, ay = py + 1;
-    for (const auto &p : c->popups) {
-        if (!p.visible) continue;
-        const int p10x = p.x - c->gtk_x, p10y = p.y - c->gtk_y;
-        if (ax >= p10x && ax < p10x + p.w && ay >= p10y && ay < p10y + p.h)
-            ay = p10y + p.h + 1;
+    park_pointer(0, 0);
+    if (c->root_popup) {
+        const int keycode = XKeysymToKeycode(c->dpy, XK_Escape);
+        xw_bridge_forward_key(c->hwnd, keycode, 0, true);
+        xw_bridge_forward_key(c->hwnd, keycode, 0, false);
     }
-
-    XTestFakeMotionEvent(c->dpy, DefaultScreen(c->dpy), ax, ay, CurrentTime);
-    XFlush(c->dpy);
-    XTestFakeButtonEvent(c->dpy, Button1, True,  CurrentTime);
-    XTestFakeButtonEvent(c->dpy, Button1, False, CurrentTime);
-    XFlush(c->dpy);
 }
 
 bool xw_bridge_swell_on_button_event_escape()
@@ -1337,7 +1384,7 @@ bool xw_bridge_swell_on_button_event_escape()
             any = true;
         }
         if (!c->popups.empty()){
-            dismiss_popups_by_click(c);
+            dismiss_popups(c);
             any = true;
         }
     }
@@ -1353,12 +1400,12 @@ bool xw_bridge_swell_on_gdk_delete_release()
         if (!c->popups.empty()) {
             any = true;
             // Tell the plugin to close its menu FIRST, while we still have the popup
-            // list -- dismiss_popups_by_click() returns immediately if popups is empty,
+            // list -- dismiss_popups() returns immediately if popups is empty,
             // so doing this after the clear below (as the `if (any)` block used to) was
             // a no-op. Wine was left holding the menu's pointer grab as its window was
             // destroyed, which wedges the plugin and hangs REAPER. Modals are fine
             // because they take no pointer grab.
-            dismiss_popups_by_click(c);
+            dismiss_popups(c);
             for (auto &p : c->popups)
                 if (p.pixmap != None && c->dpy) XFreePixmap(c->dpy, p.pixmap);
             c->popups.clear();
