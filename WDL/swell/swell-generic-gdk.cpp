@@ -3081,7 +3081,10 @@ static void swell_gdkEventHandler(GdkEvent *evt, gpointer data)
     case GDK_DROP_FINISHED:
     case GDK_DRAG_LEAVE:
       if (OnDragEventDelegate(evt))
+      {
+        s_cur_evt = oldEvt;
         return;
+      }
     break;
     case GDK_DRAG_STATUS:
     break;
