@@ -3015,6 +3015,9 @@ void SWELL_RunEvents()
       if (g_get_monotonic_time() >= deadline) break;
 #endif
     }
+#ifdef SWELL_TARGET_WAYLAND
+    gdk_display_flush(gdk_display_get_default());
+#endif
 
     DWORD dt;
     if (s_ddrop_forward_last_has_dropped &&
