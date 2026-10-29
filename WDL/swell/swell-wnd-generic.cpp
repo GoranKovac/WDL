@@ -4662,6 +4662,9 @@ forceMouseMove:
                 NMLISTVIEW nm={{hwnd,hwnd->m_id,LVN_BEGINDRAG},lvs->m_capmode_data1,lvs->GetColumnIndex(lvs->m_capmode_data2)};
                 lvs->m_capmode_state=LISTVIEW_CAP_NONE;
                 SendMessage(GetParent(hwnd),WM_NOTIFY,hwnd->m_id,(LPARAM)&nm);
+#ifdef SWELL_TARGET_WAYLAND
+                swell_wayland_begin_drag(hwnd);
+#endif
               }
             }
           break;
@@ -5933,6 +5936,9 @@ forceMouseMove:
                 nm.itemNew.hItem = item;
                 nm.itemNew.lParam = item ? item->m_param : 0;
                 SendMessage(GetParent(hwnd),WM_NOTIFY,nm.hdr.idFrom,(LPARAM)&nm);
+#ifdef SWELL_TARGET_WAYLAND
+                swell_wayland_begin_drag(hwnd);
+#endif
               }
             }
           break;
@@ -7144,6 +7150,8 @@ HWND WindowFromPoint(POINT p)
 #ifdef SWELL_TARGET_WAYLAND
   if (swell_is_wayland())
   {
+    HWND drag_target;
+    if (swell_wayland_drag_target(p, &drag_target)) return drag_target;
     // imgui fix
     extern HWND g_wayland_hovered_hwnd;
     bool hover_hwnd_still_valid = false;
