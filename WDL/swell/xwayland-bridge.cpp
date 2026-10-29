@@ -9,6 +9,8 @@
 #include <X11/extensions/Xcomposite.h>
 #include <X11/extensions/Xdamage.h>
 #include <X11/extensions/Xfixes.h>
+#include <X11/extensions/Xrandr.h>
+#include <X11/extensions/shape.h>
 #include <cairo/cairo-xlib.h>
 void xw_size(HWND hwnd);
 
@@ -34,12 +36,25 @@ struct Capture {
 
     GtkWidget *popup_canvas    = nullptr;
     GtkWidget *canvas_draw     = nullptr;
+    GdkRectangle monitor_bounds = {};
+    int        canvas_x        = 0;
+    int        canvas_y        = 0;
     int        gtk_x           = 0;
     int        gtk_y           = 0;
     Window     root_popup      = 0;
 
 
-    struct PopupWin { Window x11_win; Pixmap pixmap; int x,y,w,h; bool visible; Damage damage; Visual *visual; };
+    struct PopupWin {
+        Window x11_win;
+        Pixmap pixmap;
+        bool pixmap_dirty;
+        int x,y,w,h;
+        bool visible;
+        Damage damage;
+        Visual *visual;
+        std::vector<XRectangle> shape;
+        bool shape_dirty;
+    };
     std::vector<PopupWin> popups;
 
     // ── Modals (real dialog windows the plugin opens) ──
@@ -49,6 +64,7 @@ struct Capture {
 
 static std::map<Window, Capture*> g_captures;
 static int g_damage_event_base = -1;
+static int g_shape_event_base = -1;
 int g_bridge_damage_error_base = -1;
 
 static void register_capture(Capture *c)
@@ -99,6 +115,26 @@ struct bridgeState {
 // pixmap is only a reference to whatever backs the window at naming time, so
 // it goes stale on every resize and on every Present flip (GLX plugin UIs swap
 // the window pixmap for the client's buffer) -- callers re-name on both.
+static bool name_pixmap(Display *dpy, Window window, Pixmap &current, int &width, int &height)
+{
+    Pixmap pixmap = XCompositeNameWindowPixmap(dpy, window);
+    if (!pixmap) return false;
+
+    Window root;
+    int x, y;
+    unsigned int w, h, border, depth;
+    if (!XGetGeometry(dpy, pixmap, &root, &x, &y, &w, &h, &border, &depth)) {
+        XFreePixmap(dpy, pixmap);
+        return false;
+    }
+
+    if (current) XFreePixmap(dpy, current);
+    current = pixmap;
+    width = w;
+    height = h;
+    return true;
+}
+
 static bool update_pixmap(Capture *c)
 {
     if (!c || !c->dpy || !c->plugin_win) return false;
@@ -109,21 +145,8 @@ static bool update_pixmap(Capture *c)
         c->visual = wa.visual;
     }
 
-    Pixmap pixmap = XCompositeNameWindowPixmap(c->dpy, c->plugin_win);
-    if (!pixmap) return false;
-
-    Window root;
-    int x, y;
-    unsigned int w, h, border, depth;
-    if (!XGetGeometry(c->dpy, pixmap, &root, &x, &y, &w, &h, &border, &depth)) {
-        XFreePixmap(c->dpy, pixmap);
+    if (!name_pixmap(c->dpy, c->plugin_win, c->pixmap, c->pixmap_w, c->pixmap_h))
         return false;
-    }
-
-    if (c->pixmap) XFreePixmap(c->dpy, c->pixmap);
-    c->pixmap = pixmap;
-    c->pixmap_w = w;
-    c->pixmap_h = h;
     c->pixmap_dirty = false;
     return true;
 }
@@ -485,11 +508,21 @@ static bool canvas_draw_cb(GtkWidget *widget, cairo_t *cr, gpointer data)
     double clip_x1, clip_y1, clip_x2, clip_y2;
     cairo_clip_extents(cr, &clip_x1, &clip_y1, &clip_x2, &clip_y2);
 
-    for (const auto &p : c->popups) {
+    for (auto &p : c->popups) {
+        if (p.visible && p.pixmap_dirty) {
+            const int old_w = p.w, old_h = p.h;
+            if (name_pixmap(c->dpy, p.x11_win, p.pixmap, p.w, p.h)) {
+                p.pixmap_dirty = false;
+                if (old_w != p.w || old_h != p.h) {
+                    p.shape_dirty = true;
+                    gtk_widget_queue_draw(widget);
+                }
+            }
+        }
         if (!p.visible || p.pixmap == None) continue;
 
-        int draw_x = p.x;
-        int draw_y = p.y;
+        int draw_x = p.x - c->canvas_x;
+        int draw_y = p.y - c->canvas_y;
 
         if (draw_x + p.w <= clip_x1 || draw_x >= clip_x2 ||
             draw_y + p.h <= clip_y1 || draw_y >= clip_y2)
@@ -498,13 +531,41 @@ static bool canvas_draw_cb(GtkWidget *widget, cairo_t *cr, gpointer data)
         Visual *visual = p.visual ? p.visual : DefaultVisual(c->dpy, DefaultScreen(c->dpy));
         cairo_surface_t *surf = cairo_xlib_surface_create(c->dpy, p.pixmap, visual, p.w, p.h);
         if (surf) {
+            cairo_save(cr);
+            cairo_rectangle(cr, draw_x, draw_y, p.w, p.h);
+            cairo_clip(cr);
+            if (g_shape_event_base >= 0) {
+                if (p.shape_dirty) {
+                    int count = 0, ordering;
+                    XRectangle *rects = XShapeGetRectangles(g_wm_dpy, p.x11_win,
+                                                           ShapeBounding, &count, &ordering);
+                    p.shape.clear();
+                    if (rects) {
+                        p.shape.assign(rects, rects + count);
+                        XFree(rects);
+                    }
+                    p.shape_dirty = false;
+                }
+                for (const auto &r : p.shape)
+                    cairo_rectangle(cr, draw_x + r.x, draw_y + r.y, r.width, r.height);
+                cairo_clip(cr);
+            }
             cairo_set_source_surface(cr, surf, draw_x, draw_y);
             cairo_paint(cr);
+            cairo_restore(cr);
             cairo_surface_destroy(surf);
         }
     }
     cairo_restore(cr);
     return true;
+}
+
+static bool popup_accepts_input(Display *dpy, Window window)
+{
+    int count = 0, ordering;
+    XRectangle *rects = XShapeGetRectangles(dpy, window, ShapeInput, &count, &ordering);
+    if (rects) XFree(rects);
+    return count > 0;
 }
 
 static bool canvas_button_press(GtkWidget *widget, GdkEventButton *e, gpointer data)
@@ -513,8 +574,8 @@ static bool canvas_button_press(GtkWidget *widget, GdkEventButton *e, gpointer d
     if (!c || !c->dpy) return false;
 
     const int scale = swell_gdk_widget_scale(widget);
-    int screen_x = (int)(e->x * scale);
-    int screen_y = (int)(e->y * scale);
+    int screen_x = (int)(e->x * scale) + c->canvas_x;
+    int screen_y = (int)(e->y * scale) + c->canvas_y;
     int x11_x = screen_x - c->gtk_x;
     int x11_y = screen_y - c->gtk_y;
 
@@ -522,7 +583,8 @@ static bool canvas_button_press(GtkWidget *widget, GdkEventButton *e, gpointer d
     for (auto it = c->popups.rbegin(); it != c->popups.rend(); ++it) {
         if (!it->visible) continue;
         if (screen_x >= it->x && screen_x < it->x + it->w &&
-            screen_y >= it->y && screen_y < it->y + it->h) {
+            screen_y >= it->y && screen_y < it->y + it->h &&
+            popup_accepts_input(c->dpy, it->x11_win)) {
             hit = true;
             XTestFakeMotionEvent(c->dpy, DefaultScreen(c->dpy), x11_x, x11_y, CurrentTime);
             XFlush(c->dpy);
@@ -565,8 +627,8 @@ static bool canvas_motion(GtkWidget *widget, GdkEventMotion *e, gpointer data)
     last_time = now;
 
     const int scale = swell_gdk_widget_scale(widget);
-    int screen_x = (int)(e->x * scale);
-    int screen_y = (int)(e->y * scale);
+    int screen_x = (int)(e->x * scale) + c->canvas_x;
+    int screen_y = (int)(e->y * scale) + c->canvas_y;
     int x11_x = screen_x - c->gtk_x;
     int x11_y = screen_y - c->gtk_y;
 
@@ -574,6 +636,40 @@ static bool canvas_motion(GtkWidget *widget, GdkEventMotion *e, gpointer data)
     XFlush(c->dpy);
 
     return true;
+}
+
+static GdkRectangle capture_monitor(Display *dpy, GtkWidget *widget)
+{
+    GdkRectangle bounds = { 0, 0, DisplayWidth(dpy, DefaultScreen(dpy)),
+                                 DisplayHeight(dpy, DefaultScreen(dpy)) };
+    int count = 0;
+    XRRMonitorInfo *monitors = XRRGetMonitors(dpy, DefaultRootWindow(dpy), True, &count);
+    if (!monitors) return bounds;
+
+    GdkWindow *window = widget ? gtk_widget_get_window(widget) : nullptr;
+    GdkMonitor *monitor = window ? gdk_display_get_monitor_at_window(
+                                      gdk_window_get_display(window), window) : nullptr;
+    GdkRectangle target = bounds;
+    if (monitor) {
+        gdk_monitor_get_geometry(monitor, &target);
+        const int scale = gdk_monitor_get_scale_factor(monitor);
+        target.width *= scale;
+        target.height *= scale;
+    }
+    GdkRectangle selected = bounds;
+    int best = -1;
+    for (int i = 0; i < count; ++i) {
+        GdkRectangle candidate = { monitors[i].x, monitors[i].y,
+                                   monitors[i].width, monitors[i].height };
+        if (!gdk_rectangle_intersect(&bounds, &candidate, &candidate)) continue;
+        const int distance = abs(candidate.width - target.width) + abs(candidate.height - target.height);
+        if (best < 0 || distance < best) {
+            best = distance;
+            selected = candidate;
+        }
+    }
+    XRRFreeMonitors(monitors);
+    return selected;
 }
 
 static void create_popup_canvas(Capture *c)
@@ -597,11 +693,14 @@ static void create_popup_canvas(Capture *c)
 
     gtk_window_set_keep_above(GTK_WINDOW(win), TRUE);
 
-    int sw = gdk_screen_get_width(screen);
-    int sh = gdk_screen_get_height(screen);
+    const GdkRectangle bounds = c->monitor_bounds;
+    const int scale = swell_gdk_widget_scale(c->widget);
+    c->canvas_x = swell_gdk_floor(bounds.x + c->gtk_x, scale) * scale;
+    c->canvas_y = swell_gdk_floor(bounds.y + c->gtk_y, scale) * scale;
 
     GtkWidget *da = gtk_drawing_area_new();
-    gtk_widget_set_size_request(da, sw, sh);
+    gtk_widget_set_size_request(da, swell_gdk_ceil(bounds.width, scale),
+                                    swell_gdk_ceil(bounds.height, scale));
     gtk_container_add(GTK_CONTAINER(win), da);
 
     gtk_widget_add_events(da, GDK_BUTTON_PRESS_MASK | GDK_BUTTON_RELEASE_MASK | GDK_POINTER_MOTION_MASK);
@@ -612,6 +711,11 @@ static void create_popup_canvas(Capture *c)
 
     c->popup_canvas = win;
     c->canvas_draw  = da;
+    gtk_widget_realize(win);
+    GdkRectangle anchor = { 0, 0, 1, 1 };
+    gdk_window_move_to_rect(gtk_widget_get_window(win), &anchor,
+                           GDK_GRAVITY_NORTH_WEST, GDK_GRAVITY_NORTH_WEST,
+                           (GdkAnchorHints)0, c->canvas_x / scale, c->canvas_y / scale);
 }
 
 static void refresh_gtk_offset(Capture *c, int *out_px = nullptr, int *out_py = nullptr)
@@ -638,11 +742,25 @@ static void canvas_add_popup(Capture *c, Window x11_win, XWindowAttributes *attr
 {
     if (!c) return;
 
+    // Refresh the cached gtk offset before using it below. Without this,
+    // c->gtk_x/y is only whatever xw_size last stored, which can be stale
+    // when the plugin toplevel has moved (e.g. user drags a floating FX
+    // window) between size events. Removing this call while removing the
+    // slot code was a real bug -- side effect matters more than the out
+    // params ever did.
+    refresh_gtk_offset(c);
+    Window child;
+    int x, y;
+    if (!XTranslateCoordinates(c->dpy, x11_win, DefaultRootWindow(c->dpy),
+                               0, 0, &x, &y, &child)) return;
+    x += c->gtk_x;
+    y += c->gtk_y;
+
     Capture::PopupWin *pp = nullptr;
     for (auto &e : c->popups) if (e.x11_win == x11_win) { pp = &e; break; }
 
     if (pp && pp->pixmap != None &&
-        pp->x == attr->x + c->gtk_x && pp->y == attr->y + c->gtk_y &&
+        pp->x == x && pp->y == y &&
         pp->w == attr->width && pp->h == attr->height)
     {
         pp->visible = true;
@@ -654,14 +772,6 @@ static void canvas_add_popup(Capture *c, Window x11_win, XWindowAttributes *attr
     DEBUG_PRINT("[DNDCOORD] canvas_add_popup win=0x%lx attr=(%d,%d,%d,%d) canvas_was_visible=%d\n",
                 (unsigned long)x11_win, attr->x, attr->y, attr->width, attr->height,
                 c->popup_canvas ? gtk_widget_get_visible(c->popup_canvas) : -1);
-
-    // Refresh the cached gtk offset before using it below. Without this,
-    // c->gtk_x/y is only whatever xw_size last stored, which can be stale
-    // when the plugin toplevel has moved (e.g. user drags a floating FX
-    // window) between size events. Removing this call while removing the
-    // slot code was a real bug -- side effect matters more than the out
-    // params ever did.
-    refresh_gtk_offset(c);
 
     if (!c->popup_canvas) create_popup_canvas(c);
 
@@ -676,24 +786,29 @@ static void canvas_add_popup(Capture *c, Window x11_win, XWindowAttributes *attr
         pp = &c->popups.back();
         if (g_wm_dpy && g_damage_event_base >= 0)
             pp->damage = XDamageCreate(g_wm_dpy, x11_win, XDamageReportBoundingBox);
+        if (g_wm_dpy && g_shape_event_base >= 0)
+            XShapeSelectInput(g_wm_dpy, x11_win, ShapeNotifyMask);
     }
     pp->x11_win = x11_win;
     pp->pixmap  = pixmap;
+    pp->pixmap_dirty = true;
     {
         XWindowAttributes wa_local;
         pp->visual = XGetWindowAttributes(c->dpy, x11_win, &wa_local)
                    ? wa_local.visual : DefaultVisual(c->dpy, DefaultScreen(c->dpy));
     }
-    pp->x = attr->x + c->gtk_x;
-    pp->y = attr->y + c->gtk_y;
+    pp->x = x;
+    pp->y = y;
     DEBUG_PRINT("[POPOFF] win=0x%lx attr=(%d,%d) gtk=(%d,%d) -> pp=(%d,%d)\n",
                 (unsigned long)x11_win, attr->x, attr->y,
                 c->gtk_x, c->gtk_y, pp->x, pp->y);
     pp->w = attr->width;
     pp->h = attr->height;
     pp->visible = true;
+    pp->shape_dirty = true;
 
-    if (c->root_popup == None) c->root_popup = x11_win;
+    if (c->root_popup == None && popup_accepts_input(c->dpy, x11_win))
+        c->root_popup = x11_win;
 
     if (!gtk_widget_get_visible(c->popup_canvas))
         gtk_widget_show_all(c->popup_canvas);
@@ -922,14 +1037,6 @@ static void handle_new_window(Window win, Capture *state, XWindowAttributes *att
 
     bool is_popup = classify_popup(state->dpy, win, attr);
     if (is_popup) {
-        if (attr->width <= 1 || attr->height <= 1) {
-            DEBUG_PRINT("skipping 1x1 window: 0x%lx (%dx%d)\n", (unsigned long)win, attr->width, attr->height);
-            return;
-        }
-        if (attr->width == 12 || attr->height == 12) {
-            DEBUG_PRINT("skipping unnamed shadow juce window: 0x%lx (%dx%d)\n", (unsigned long)win, attr->width, attr->height);
-            return;
-        }
         canvas_add_popup(state, win, attr);
     } else {
         create_modal(state, win, attr);
@@ -987,34 +1094,32 @@ static void on_popup_unmapped(Window w)
     }
 }
 
-static bool on_popup_configured(Window w, int cx, int cy, int cw, int ch)
+static bool on_popup_configured(Window w, int cw, int ch)
 {
     for (auto &kv : g_captures) {
         Capture *c = kv.second;
         if (!c || kv.first != c->parent_win) continue;
         for (auto &p : c->popups) {
             if (p.x11_win != w) continue;
-            int ox = 0, oy = 0;
-            refresh_gtk_offset(c, &ox, &oy);
+            Window child;
+            int x, y;
+            if (!XTranslateCoordinates(c->dpy, w, DefaultRootWindow(c->dpy),
+                                       0, 0, &x, &y, &child)) return true;
+            refresh_gtk_offset(c);
             int old_x = p.x, old_y = p.y, old_w = p.w, old_h = p.h;
-            {
-                int fx = cx, fy = cy;
-                if (fx < ox) fx += ox;
-                if (fy < oy) fy += oy;
-                p.x = fx + c->gtk_x;
-                p.y = fy + c->gtk_y;
-            }
+            p.x = x + c->gtk_x;
+            p.y = y + c->gtk_y;
             bool size_changed = (p.w != cw || p.h != ch);
             p.w = cw; p.h = ch;
             if (size_changed) {
-                if (p.pixmap != None) XFreePixmap(c->dpy, p.pixmap);
-                p.pixmap = XCompositeNameWindowPixmap(c->dpy, w);
+                p.shape_dirty = true;
+                p.pixmap_dirty = true;
             }
             if (c->canvas_draw) {
                 GdkWindow *cwin = gtk_widget_get_window(c->canvas_draw);
                 if (cwin) {
-                    GdkRectangle old_r = { old_x, old_y, old_w, old_h };
-                    GdkRectangle new_r = { p.x,   p.y,   p.w,   p.h   };
+                    GdkRectangle old_r = { old_x - c->canvas_x, old_y - c->canvas_y, old_w, old_h };
+                    GdkRectangle new_r = { p.x - c->canvas_x, p.y - c->canvas_y, p.w, p.h };
                     const int scale = swell_gdk_window_scale(cwin);
                     old_r = swell_gdk_logical_rect(old_r, scale);
                     new_r = swell_gdk_logical_rect(new_r, scale);
@@ -1056,9 +1161,10 @@ static void handle_damage_notify(XDamageNotifyEvent *de)
 
         for (auto &pp : cc->popups) {
             if (pp.x11_win == de->drawable) {
+                pp.pixmap_dirty = true;
                 if (cc->canvas_draw && GTK_IS_WIDGET(cc->canvas_draw)) {
-                    int inv_x = pp.x + de->area.x;
-                    int inv_y = pp.y + de->area.y;
+                    int inv_x = pp.x + de->area.x - cc->canvas_x;
+                    int inv_y = pp.y + de->area.y - cc->canvas_y;
                     swell_gdk_queue_draw_pixels(cc->canvas_draw, inv_x, inv_y,
                                                de->area.width, de->area.height);
                 }
@@ -1149,6 +1255,24 @@ static void bridge_handle_event(XEvent *ev)
         return;
     }
 
+    if (g_shape_event_base >= 0 && ev->type == g_shape_event_base + ShapeNotify) {
+        XShapeEvent *shape = (XShapeEvent *)ev;
+        if (shape->kind != ShapeBounding) return;
+        for (auto &kv : g_captures) {
+            Capture *c = kv.second;
+            if (kv.first != c->parent_win) continue;
+            for (auto &p : c->popups) {
+                if (p.x11_win != shape->window) continue;
+                p.shape_dirty = true;
+                if (c->canvas_draw)
+                    swell_gdk_queue_draw_pixels(c->canvas_draw, p.x - c->canvas_x,
+                                                p.y - c->canvas_y, p.w, p.h);
+                return;
+            }
+        }
+        return;
+    }
+
     if (ev->type == ClientMessage)
     {
         handle_xdnd_from_plugin(&ev->xclient);
@@ -1168,7 +1292,6 @@ static void bridge_handle_event(XEvent *ev)
             break;
         case ConfigureNotify:
             on_popup_configured(ev->xconfigure.window,
-                                ev->xconfigure.x, ev->xconfigure.y,
                                 ev->xconfigure.width, ev->xconfigure.height);
             break;
         default:
@@ -1287,6 +1410,8 @@ void init_private_xwayland()
             g_damage_event_base = base;
             g_bridge_damage_error_base = err;
         }
+        if (XShapeQueryExtension(g_wm_dpy, &base, &err))
+            g_shape_event_base = base;
     }
 
     g_wm->on_unhandled_event = bridge_handle_event;
@@ -1382,12 +1507,13 @@ static GtkWidget* xw_ensure_embed_widget(HWND h)
 // leaves no room left/up of the plugin: knob drags stop dead there. Centring splits
 // the spare room evenly; a plugin bigger than the screen clamps back to 0, so this
 // never pushes a window further off-screen than 0,0 did.
-static void place_container(Display *dpy, Window container, int w, int h)
+static GdkRectangle place_container(Display *dpy, Window container, GtkWidget *widget, int w, int h)
 {
-    const int scr = DefaultScreen(dpy);
-    const int x = wdl_max((DisplayWidth(dpy, scr)  - w) / 2, 0);
-    const int y = wdl_max((DisplayHeight(dpy, scr) - h) / 2, 0);
+    const GdkRectangle bounds = capture_monitor(dpy, widget);
+    const int x = bounds.x + wdl_max((bounds.width - w) / 2, 0);
+    const int y = bounds.y + wdl_max((bounds.height - h) / 2, 0);
     XMoveResizeWindow(dpy, container, x, y, w, h);
+    return bounds;
 }
 
 static bool try_create_plugin(HWND hwnd)
@@ -1410,12 +1536,14 @@ static bool try_create_plugin(HWND hwnd)
              XFree(list);
 
              XWindowAttributes attr;
-             if (XGetWindowAttributes(bs->disp, plugin_win, &attr))
-                 place_container(bs->disp, bs->parent, attr.width, attr.height);
+             if (!XGetWindowAttributes(bs->disp, plugin_win, &attr)) return false;
+             const GdkRectangle bounds = place_container(bs->disp, bs->parent, hwnd->m_oswidget,
+                                                         attr.width, attr.height);
              XFlush(bs->disp);
 
              Capture *c = setup_capture(bs->disp, bs->parent, plugin_win, hwnd);
              c->widget = hwnd->m_oswidget;
+             c->monitor_bounds = bounds;
 
              // Wine plugins nest a child GUI window; native plugins draw directly.
              Window gr, gp, *gk = nullptr; unsigned int gn = 0;
@@ -1528,7 +1656,8 @@ void xw_size(HWND hwnd)
     // an FX-list swap), and the container resize also needs a live capture.
     if (bs->cap && size_changed) {
         refresh_pixmap(bs->cap);
-        place_container(bs->cap->dpy, bs->cap->parent_win, w, h);
+        bs->cap->monitor_bounds = place_container(bs->cap->dpy, bs->cap->parent_win,
+                                                   hwnd->m_oswidget, w, h);
         XFlush(bs->cap->dpy);
     }
 
@@ -1617,17 +1746,17 @@ HWND xw_bridge_create(HWND viewpar, void **wref, const RECT *r, const char *brid
     Window root = RootWindow(disp, screen);
     int w = wdl_max(r->right - r->left, 1);
     int h = wdl_max(r->bottom - r->top, 1);
+    HWND parent = viewpar;
+    while (parent && !parent->m_oswidget) parent = parent->m_parent;
 
     Window container = XCreateSimpleWindow(disp, root, 0, 0, w, h, 0,
                                            BlackPixel(disp, screen),
                                            WhitePixel(disp, screen));
-    place_container(disp, container, w, h);
+    place_container(disp, container, parent ? parent->m_oswidget : nullptr, w, h);
     XMapWindow(disp, container);
     XFlush(disp);
 
     GtkWidget *draw_area = gtk_drawing_area_new();
-    HWND parent = viewpar;
-    while (parent && !parent->m_oswidget) parent = parent->m_parent;
     const int scale = swell_gdk_widget_scale(parent ? parent->m_oswidget : NULL);
     gtk_widget_set_size_request(draw_area, swell_gdk_ceil(w, scale), swell_gdk_ceil(h, scale));
 

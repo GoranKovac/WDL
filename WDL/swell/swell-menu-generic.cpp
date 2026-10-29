@@ -1160,14 +1160,19 @@ static LRESULT WINAPI submenuWndProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM
             if (hh)
             {
 #ifdef SWELL_TARGET_WAYLAND
-              DestroyWindow(hh);
-              hh = new HWND__(NULL,0,NULL,"menu",false,submenuWndProc,NULL, hwnd);
-              SetProp(hh,"SWELL_MenuOwner",GetProp(hwnd,"SWELL_MenuOwner"));
-#else
-              m_trackingMenus.Delete(nextidx);
-              int a = m_trackingMenus.GetSize();
-              while (a > nextidx) DestroyWindow(m_trackingMenus.Get(--a));
+              if (swell_is_wayland())
+              {
+                DestroyWindow(hh);
+                hh = new HWND__(NULL,0,NULL,"menu",false,submenuWndProc,NULL, hwnd);
+                SetProp(hh,"SWELL_MenuOwner",GetProp(hwnd,"SWELL_MenuOwner"));
+              }
+              else
 #endif
+              {
+                m_trackingMenus.Delete(nextidx);
+                int a = m_trackingMenus.GetSize();
+                while (a > nextidx) DestroyWindow(m_trackingMenus.Get(--a));
+              }
             }
             else
             {

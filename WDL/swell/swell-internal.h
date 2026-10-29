@@ -1042,6 +1042,7 @@ void swell_oswindow_invalidate(HWND hwnd, const RECT *r);
 void swell_oswindow_destroy(HWND hwnd);
 void swell_oswindow_manage(HWND hwnd, bool wantfocus);
 #ifdef SWELL_TARGET_WAYLAND
+bool swell_is_wayland();
 void swell_oswindow_resize_mapped(HWND hwnd, int reposflag, RECT f);
 #endif
 void swell_oswindow_maximize(HWND, bool wantmax); // false=restore

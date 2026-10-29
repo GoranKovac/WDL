@@ -400,12 +400,11 @@ bool XWaylandWM::on_map_request(XMapRequestEvent *ev) {
     // Focus per ICCCM §4.1.7. WM_TAKE_FOCUS MUST carry a real timestamp,
     // never CurrentTime, or globally-active clients (input=False) ignore it
     // and then drop synthesized button events.
+    const Time timestamp = get_server_time();
+    if (st.input_hint)
+        XSetInputFocus(dpy_, w, RevertToParent, timestamp);
     if (st.take_focus)
-        send_take_focus(w, get_server_time());
-    // Globally-active windows advertise input=False AND rely on the WM.
-    // If take-focus alone doesn't stick, force focus (the sway/wlroots fix).
-    if (!st.input_hint || st.take_focus)
-        XSetInputFocus(dpy_, w, RevertToParent, get_server_time());
+        send_take_focus(w, timestamp);
 
     return true; // consumed
 }
