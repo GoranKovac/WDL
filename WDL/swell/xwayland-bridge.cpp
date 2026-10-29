@@ -47,6 +47,7 @@ struct Capture {
     struct PopupWin {
         Window x11_win;
         Pixmap pixmap;
+        bool pixmap_dirty;
         int x,y,w,h;
         bool visible;
         Damage damage;
@@ -114,6 +115,26 @@ struct bridgeState {
 // pixmap is only a reference to whatever backs the window at naming time, so
 // it goes stale on every resize and on every Present flip (GLX plugin UIs swap
 // the window pixmap for the client's buffer) -- callers re-name on both.
+static bool name_pixmap(Display *dpy, Window window, Pixmap &current, int &width, int &height)
+{
+    Pixmap pixmap = XCompositeNameWindowPixmap(dpy, window);
+    if (!pixmap) return false;
+
+    Window root;
+    int x, y;
+    unsigned int w, h, border, depth;
+    if (!XGetGeometry(dpy, pixmap, &root, &x, &y, &w, &h, &border, &depth)) {
+        XFreePixmap(dpy, pixmap);
+        return false;
+    }
+
+    if (current) XFreePixmap(dpy, current);
+    current = pixmap;
+    width = w;
+    height = h;
+    return true;
+}
+
 static bool update_pixmap(Capture *c)
 {
     if (!c || !c->dpy || !c->plugin_win) return false;
@@ -124,21 +145,8 @@ static bool update_pixmap(Capture *c)
         c->visual = wa.visual;
     }
 
-    Pixmap pixmap = XCompositeNameWindowPixmap(c->dpy, c->plugin_win);
-    if (!pixmap) return false;
-
-    Window root;
-    int x, y;
-    unsigned int w, h, border, depth;
-    if (!XGetGeometry(c->dpy, pixmap, &root, &x, &y, &w, &h, &border, &depth)) {
-        XFreePixmap(c->dpy, pixmap);
+    if (!name_pixmap(c->dpy, c->plugin_win, c->pixmap, c->pixmap_w, c->pixmap_h))
         return false;
-    }
-
-    if (c->pixmap) XFreePixmap(c->dpy, c->pixmap);
-    c->pixmap = pixmap;
-    c->pixmap_w = w;
-    c->pixmap_h = h;
     c->pixmap_dirty = false;
     return true;
 }
@@ -501,6 +509,16 @@ static bool canvas_draw_cb(GtkWidget *widget, cairo_t *cr, gpointer data)
     cairo_clip_extents(cr, &clip_x1, &clip_y1, &clip_x2, &clip_y2);
 
     for (auto &p : c->popups) {
+        if (p.visible && p.pixmap_dirty) {
+            const int old_w = p.w, old_h = p.h;
+            if (name_pixmap(c->dpy, p.x11_win, p.pixmap, p.w, p.h)) {
+                p.pixmap_dirty = false;
+                if (old_w != p.w || old_h != p.h) {
+                    p.shape_dirty = true;
+                    gtk_widget_queue_draw(widget);
+                }
+            }
+        }
         if (!p.visible || p.pixmap == None) continue;
 
         int draw_x = p.x - c->canvas_x;
@@ -773,6 +791,7 @@ static void canvas_add_popup(Capture *c, Window x11_win, XWindowAttributes *attr
     }
     pp->x11_win = x11_win;
     pp->pixmap  = pixmap;
+    pp->pixmap_dirty = true;
     {
         XWindowAttributes wa_local;
         pp->visual = XGetWindowAttributes(c->dpy, x11_win, &wa_local)
@@ -1094,8 +1113,7 @@ static bool on_popup_configured(Window w, int cw, int ch)
             p.w = cw; p.h = ch;
             if (size_changed) {
                 p.shape_dirty = true;
-                if (p.pixmap != None) XFreePixmap(c->dpy, p.pixmap);
-                p.pixmap = XCompositeNameWindowPixmap(c->dpy, w);
+                p.pixmap_dirty = true;
             }
             if (c->canvas_draw) {
                 GdkWindow *cwin = gtk_widget_get_window(c->canvas_draw);
@@ -1143,6 +1161,7 @@ static void handle_damage_notify(XDamageNotifyEvent *de)
 
         for (auto &pp : cc->popups) {
             if (pp.x11_win == de->drawable) {
+                pp.pixmap_dirty = true;
                 if (cc->canvas_draw && GTK_IS_WIDGET(cc->canvas_draw)) {
                     int inv_x = pp.x + de->area.x - cc->canvas_x;
                     int inv_y = pp.y + de->area.y - cc->canvas_y;
