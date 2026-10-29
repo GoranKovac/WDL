@@ -463,6 +463,7 @@ void swell_oswindow_destroy(HWND hwnd)
 #endif
 #ifdef SWELL_TARGET_WAYLAND
     if (s_wayland_active_tooltip == hwnd) s_wayland_active_tooltip = NULL;
+    if (s_armed_drag_oswindow == hwnd->m_oswindow) s_armed_drag_oswindow = NULL;
     if (s_last_hover_oswindow && s_last_hover_oswindow == hwnd->m_oswindow)
       s_last_hover_oswindow = NULL;
     if (g_wayland_hovered_hwnd == hwnd) g_wayland_hovered_hwnd = NULL;
@@ -2571,9 +2572,10 @@ static void OnButtonEvent(GdkEventButton *b)
   if (b->type == GDK_BUTTON_RELEASE)
     s_armed_drag_oswindow = NULL;
 
-  if (swell_wayland_needs_manual_titlebar(hwnd) && b->type == GDK_BUTTON_PRESS)
+  if (swell_wayland_needs_manual_titlebar(hwnd) && b->button == 1 &&
+      (b->type == GDK_BUTTON_PRESS || b->type == GDK_2BUTTON_PRESS))
   {
-    if ((hwnd->m_style & WS_THICKFRAME) && hwnd->m_oswindow)
+    if (b->type == GDK_BUTTON_PRESS && (hwnd->m_style & WS_THICKFRAME) && hwnd->m_oswindow)
     {
       bool found = false;
       GdkWindowEdge edge = swell_wayland_resize_edge_hittest(hwnd, (int)b->x, (int)b->y, &found);
@@ -2585,6 +2587,13 @@ static void OnButtonEvent(GdkEventButton *b)
     }
 
     const int hit = swell_wayland_titlebar_hittest(hwnd, (int)b->x, (int)b->y);
+    if (b->type == GDK_2BUTTON_PRESS)
+    {
+      s_armed_drag_oswindow = NULL;
+      if (hit == 2 && (hwnd->m_style & WS_THICKFRAME))
+        swell_oswindow_maximize(hwnd, !swell_wayland_is_maximized(hwnd));
+      if (hit) return;
+    }
     if (hit == 1)
     {
       if (IsWindowEnabled(hwnd) && !DestroyPopupMenus() && !SendMessage(hwnd,WM_CLOSE,0,0))
@@ -2603,20 +2612,6 @@ static void OnButtonEvent(GdkEventButton *b)
     }
     else if (hit == 2)
     {
-      static DWORD s_last_titlebar_click_time;
-      static HWND s_last_titlebar_click_hwnd;
-      const bool is_dblclick = s_last_titlebar_click_hwnd == hwnd &&
-                                (b->time - s_last_titlebar_click_time) < 400;
-      if (is_dblclick)
-      {
-        s_last_titlebar_click_hwnd = NULL; // consume, so a third click isn't treated as part of this pair
-        if (hwnd->m_style & WS_THICKFRAME)
-          swell_oswindow_maximize(hwnd, !swell_wayland_is_maximized(hwnd));
-        return;
-      }
-      s_last_titlebar_click_time = b->time;
-      s_last_titlebar_click_hwnd = hwnd;
-
       if (hwnd->m_oswindow)
       {
         s_armed_drag_oswindow = hwnd->m_oswindow;
