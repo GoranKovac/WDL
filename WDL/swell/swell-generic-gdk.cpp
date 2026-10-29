@@ -2149,8 +2149,8 @@ static void OnKeyEvent(GdkEventKey *k)
 
     // No modal, but a plugin popup may still be open. Nothing else dismisses it on the
     // key path, so its grab stays and wedges further input.
-    if (k->type == GDK_KEY_PRESS && g_wm_dpy)
-      xw_bridge_swell_on_button_event_escape();
+    if (k->type == GDK_KEY_PRESS && g_wm_dpy && xw_bridge_swell_on_button_event_escape())
+      return;
   }
 #endif
   int modifiers = 0;

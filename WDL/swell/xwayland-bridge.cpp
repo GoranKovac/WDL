@@ -11,6 +11,7 @@
 #include <X11/extensions/Xfixes.h>
 #include <X11/extensions/Xrandr.h>
 #include <X11/extensions/shape.h>
+#include <X11/keysym.h>
 #include <cairo/cairo-xlib.h>
 void xw_size(HWND hwnd);
 
@@ -630,6 +631,8 @@ static bool popup_accepts_input(Display *dpy, Window window)
     return count > 0;
 }
 
+static void dismiss_popups(Capture *c);
+
 static bool canvas_button_press(GtkWidget *widget, GdkEventButton *e, gpointer data)
 {
     Capture *c = (Capture*)data;
@@ -658,13 +661,7 @@ static bool canvas_button_press(GtkWidget *widget, GdkEventButton *e, gpointer d
     }
     // Clicked outside any popup — dismiss.
     if (!hit) {
-        if (c->popup_canvas) gtk_widget_hide(c->popup_canvas);
-        XTestFakeMotionEvent(c->dpy, DefaultScreen(c->dpy), x11_x, x11_y, CurrentTime);
-        XFlush(c->dpy);
-        XTestFakeButtonEvent(c->dpy, e->button, True,  CurrentTime);
-        XFlush(c->dpy);
-        XTestFakeButtonEvent(c->dpy, e->button, False, CurrentTime);
-        XFlush(c->dpy);
+        dismiss_popups(c);
         return true;
     }
     return false;
@@ -1364,30 +1361,15 @@ static void bridge_handle_event(XEvent *ev)
     }
 }
 
-static void dismiss_popups_by_click(Capture *c)
+static void dismiss_popups(Capture *c)
 {
     if (!c || !c->dpy || c->popups.empty()) return;
-
-    Window rootw = DefaultRootWindow(c->dpy);
-    Window childw; int px = 0, py = 0;
-    XTranslateCoordinates(c->dpy, c->gui_win ? c->gui_win : c->plugin_win,
-                          rootw, 0, 0, &px, &py, &childw);
-
-    // Top-left corner of the plugin: a menu opened from a control is essentially
-    // never covering it. If one is, aim just below that popup instead.
-    int ax = px + 1, ay = py + 1;
-    for (const auto &p : c->popups) {
-        if (!p.visible) continue;
-        const int p10x = p.x - c->gtk_x, p10y = p.y - c->gtk_y;
-        if (ax >= p10x && ax < p10x + p.w && ay >= p10y && ay < p10y + p.h)
-            ay = p10y + p.h + 1;
+    park_pointer(0, 0);
+    if (c->root_popup) {
+        const int keycode = XKeysymToKeycode(c->dpy, XK_Escape);
+        xw_bridge_forward_key(c->hwnd, keycode, 0, true);
+        xw_bridge_forward_key(c->hwnd, keycode, 0, false);
     }
-
-    XTestFakeMotionEvent(c->dpy, DefaultScreen(c->dpy), ax, ay, CurrentTime);
-    XFlush(c->dpy);
-    XTestFakeButtonEvent(c->dpy, Button1, True,  CurrentTime);
-    XTestFakeButtonEvent(c->dpy, Button1, False, CurrentTime);
-    XFlush(c->dpy);
 }
 
 bool xw_bridge_swell_on_button_event_escape()
@@ -1402,7 +1384,7 @@ bool xw_bridge_swell_on_button_event_escape()
             any = true;
         }
         if (!c->popups.empty()){
-            dismiss_popups_by_click(c);
+            dismiss_popups(c);
             any = true;
         }
     }
@@ -1418,12 +1400,12 @@ bool xw_bridge_swell_on_gdk_delete_release()
         if (!c->popups.empty()) {
             any = true;
             // Tell the plugin to close its menu FIRST, while we still have the popup
-            // list -- dismiss_popups_by_click() returns immediately if popups is empty,
+            // list -- dismiss_popups() returns immediately if popups is empty,
             // so doing this after the clear below (as the `if (any)` block used to) was
             // a no-op. Wine was left holding the menu's pointer grab as its window was
             // destroyed, which wedges the plugin and hangs REAPER. Modals are fine
             // because they take no pointer grab.
-            dismiss_popups_by_click(c);
+            dismiss_popups(c);
             for (auto &p : c->popups)
                 if (p.pixmap != None && c->dpy) XFreePixmap(c->dpy, p.pixmap);
             c->popups.clear();
