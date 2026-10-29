@@ -42,7 +42,16 @@ struct Capture {
     Window     root_popup      = 0;
 
 
-    struct PopupWin { Window x11_win; Pixmap pixmap; int x,y,w,h; bool visible; Damage damage; Visual *visual; };
+    struct PopupWin {
+        Window x11_win;
+        Pixmap pixmap;
+        int x,y,w,h;
+        bool visible;
+        Damage damage;
+        Visual *visual;
+        std::vector<XRectangle> shape;
+        bool shape_dirty;
+    };
     std::vector<PopupWin> popups;
 
     // ── Modals (real dialog windows the plugin opens) ──
@@ -52,6 +61,7 @@ struct Capture {
 
 static std::map<Window, Capture*> g_captures;
 static int g_damage_event_base = -1;
+static int g_shape_event_base = -1;
 int g_bridge_damage_error_base = -1;
 
 static void register_capture(Capture *c)
@@ -488,7 +498,7 @@ static bool canvas_draw_cb(GtkWidget *widget, cairo_t *cr, gpointer data)
     double clip_x1, clip_y1, clip_x2, clip_y2;
     cairo_clip_extents(cr, &clip_x1, &clip_y1, &clip_x2, &clip_y2);
 
-    for (const auto &p : c->popups) {
+    for (auto &p : c->popups) {
         if (!p.visible || p.pixmap == None) continue;
 
         int draw_x = p.x - c->canvas_x;
@@ -501,8 +511,28 @@ static bool canvas_draw_cb(GtkWidget *widget, cairo_t *cr, gpointer data)
         Visual *visual = p.visual ? p.visual : DefaultVisual(c->dpy, DefaultScreen(c->dpy));
         cairo_surface_t *surf = cairo_xlib_surface_create(c->dpy, p.pixmap, visual, p.w, p.h);
         if (surf) {
+            cairo_save(cr);
+            cairo_rectangle(cr, draw_x, draw_y, p.w, p.h);
+            cairo_clip(cr);
+            if (g_shape_event_base >= 0) {
+                if (p.shape_dirty) {
+                    int count = 0, ordering;
+                    XRectangle *rects = XShapeGetRectangles(g_wm_dpy, p.x11_win,
+                                                           ShapeBounding, &count, &ordering);
+                    p.shape.clear();
+                    if (rects) {
+                        p.shape.assign(rects, rects + count);
+                        XFree(rects);
+                    }
+                    p.shape_dirty = false;
+                }
+                for (const auto &r : p.shape)
+                    cairo_rectangle(cr, draw_x + r.x, draw_y + r.y, r.width, r.height);
+                cairo_clip(cr);
+            }
             cairo_set_source_surface(cr, surf, draw_x, draw_y);
             cairo_paint(cr);
+            cairo_restore(cr);
             cairo_surface_destroy(surf);
         }
     }
@@ -702,6 +732,8 @@ static void canvas_add_popup(Capture *c, Window x11_win, XWindowAttributes *attr
         pp = &c->popups.back();
         if (g_wm_dpy && g_damage_event_base >= 0)
             pp->damage = XDamageCreate(g_wm_dpy, x11_win, XDamageReportBoundingBox);
+        if (g_wm_dpy && g_shape_event_base >= 0)
+            XShapeSelectInput(g_wm_dpy, x11_win, ShapeNotifyMask);
     }
     pp->x11_win = x11_win;
     pp->pixmap  = pixmap;
@@ -718,6 +750,7 @@ static void canvas_add_popup(Capture *c, Window x11_win, XWindowAttributes *attr
     pp->w = attr->width;
     pp->h = attr->height;
     pp->visible = true;
+    pp->shape_dirty = true;
 
     if (c->root_popup == None && popup_accepts_input(c->dpy, x11_win))
         c->root_popup = x11_win;
@@ -1024,6 +1057,7 @@ static bool on_popup_configured(Window w, int cw, int ch)
             bool size_changed = (p.w != cw || p.h != ch);
             p.w = cw; p.h = ch;
             if (size_changed) {
+                p.shape_dirty = true;
                 if (p.pixmap != None) XFreePixmap(c->dpy, p.pixmap);
                 p.pixmap = XCompositeNameWindowPixmap(c->dpy, w);
             }
@@ -1166,6 +1200,24 @@ static void bridge_handle_event(XEvent *ev)
         return;
     }
 
+    if (g_shape_event_base >= 0 && ev->type == g_shape_event_base + ShapeNotify) {
+        XShapeEvent *shape = (XShapeEvent *)ev;
+        if (shape->kind != ShapeBounding) return;
+        for (auto &kv : g_captures) {
+            Capture *c = kv.second;
+            if (kv.first != c->parent_win) continue;
+            for (auto &p : c->popups) {
+                if (p.x11_win != shape->window) continue;
+                p.shape_dirty = true;
+                if (c->canvas_draw)
+                    swell_gdk_queue_draw_pixels(c->canvas_draw, p.x - c->canvas_x,
+                                                p.y - c->canvas_y, p.w, p.h);
+                return;
+            }
+        }
+        return;
+    }
+
     if (ev->type == ClientMessage)
     {
         handle_xdnd_from_plugin(&ev->xclient);
@@ -1303,6 +1355,8 @@ void init_private_xwayland()
             g_damage_event_base = base;
             g_bridge_damage_error_base = err;
         }
+        if (XShapeQueryExtension(g_wm_dpy, &base, &err))
+            g_shape_event_base = base;
     }
 
     g_wm->on_unhandled_event = bridge_handle_event;
