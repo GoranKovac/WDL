@@ -1190,25 +1190,15 @@ void swell_oswindow_manage(HWND hwnd, bool wantfocus)
             GdkWindow *parent_gw = gtk_widget_get_window(popup_parent_hwnd->m_oswidget);
             if (pw && parent_gw)
             {
-              gint psx = 0, psy = 0;
-              if (is_tooltip)
-              {
-                // The anchor rect must be in the parent's coordinate space. r comes
-                // from m_position, so take the parent's origin from m_position too --
-                // mixing in gdk_window_get_origin() (unreliable on Wayland, typically
-                // 0,0) would corrupt the offset and push the tooltip off-anchor.
-                psx = popup_parent_hwnd->m_position.left;
-                psy = popup_parent_hwnd->m_position.top;
-              }
-              else
-              {
-                gdk_window_get_origin(parent_gw, &psx, &psy);
-                const int parent_scale = swell_gdk_window_scale(parent_gw);
-                psx *= parent_scale;
-                psy *= parent_scale;
-              }
+              const int psx = popup_parent_hwnd->m_position.left;
+              const int psy = popup_parent_hwnd->m_position.top;
               const int parent_scale = swell_gdk_window_scale(parent_gw);
               GdkRectangle anchor = { swell_gdk_floor(r.left - psx, parent_scale), swell_gdk_floor(r.top - psy, parent_scale), 1, 1 };
+              if (swell_wayland_needs_manual_titlebar(popup_parent_hwnd))
+              {
+                anchor.x += SWELL_WAYLAND_BORDER_WIDTH;
+                anchor.y += g_swell_wayland_title_h + SWELL_WAYLAND_BORDER_WIDTH;
+              }
               gdk_window_move_to_rect(pw, &anchor,
                   GDK_GRAVITY_NORTH_WEST, GDK_GRAVITY_NORTH_WEST,
                   (GdkAnchorHints)(GDK_ANCHOR_SLIDE_X | GDK_ANCHOR_SLIDE_Y),
@@ -2281,6 +2271,30 @@ static HWND getMouseTarget(SWELL_OSWINDOW osw, POINT p, const HWND *hwnd_has_osw
   return ChildWindowFromPoint(hwnd,p);
 }
 
+#ifdef SWELL_TARGET_WAYLAND
+static void getMouseCoords(GdkWindow *window, double &x, double &y, double &x_root, double &y_root)
+{
+  HWND hwnd = swell_oswindow_to_hwnd(window);
+  if (swell_wayland_needs_manual_titlebar(hwnd))
+  {
+    x -= SWELL_WAYLAND_BORDER_WIDTH;
+    y -= g_swell_wayland_title_h + SWELL_WAYLAND_BORDER_WIDTH;
+  }
+  const int scale = swell_gdk_window_scale(window);
+  x *= scale;
+  y *= scale;
+  x_root *= scale;
+  y_root *= scale;
+
+  // Wayland has no screen coordinates. Use the same origin as ScreenToClient().
+  if (hwnd && GDK_IS_WAYLAND_WINDOW(window))
+  {
+    x_root = x + hwnd->m_position.left;
+    y_root = y + hwnd->m_position.top;
+  }
+}
+#endif
+
 static void OnMotionEvent(GdkEventMotion *m)
 {
 #ifdef SWELL_TARGET_WAYLAND
@@ -2344,18 +2358,8 @@ static void OnMotionEvent(GdkEventMotion *m)
       if (top->m_oswindow) gdk_window_set_cursor(top->m_oswindow, NULL);
       s_last_edge_cursor_set = false;
     }
-
-    if (swell_wayland_needs_manual_titlebar(top))
-    {
-      m->x -= SWELL_WAYLAND_BORDER_WIDTH;
-      m->y -= g_swell_wayland_title_h + SWELL_WAYLAND_BORDER_WIDTH;
-    }
   }
-  const int scale = swell_gdk_window_scale(m->window);
-  m->x *= scale;
-  m->y *= scale;
-  m->x_root *= scale;
-  m->y_root *= scale;
+  getMouseCoords(m->window, m->x, m->y, m->x_root, m->y_root);
 #endif
   swell_lastMessagePos = MAKELONG(((int)m->x_root&0xffff),((int)m->y_root&0xffff));
 
@@ -2377,16 +2381,7 @@ static void OnScrollEvent(GdkEventScroll *b)
 #ifdef SWELL_TARGET_WAYLAND
   GdkEventScroll pixel_event = *b;
   b = &pixel_event;
-  if (swell_wayland_needs_manual_titlebar(swell_oswindow_to_hwnd(b->window)))
-  {
-    b->x -= SWELL_WAYLAND_BORDER_WIDTH;
-    b->y -= g_swell_wayland_title_h + SWELL_WAYLAND_BORDER_WIDTH;
-  }
-  const int scale = swell_gdk_window_scale(b->window);
-  b->x *= scale;
-  b->y *= scale;
-  b->x_root *= scale;
-  b->y_root *= scale;
+  getMouseCoords(b->window, b->x, b->y, b->x_root, b->y_root);
 #endif
   swell_lastMessagePos = MAKELONG(((int)b->x_root&0xffff),((int)b->y_root&0xffff));
   POINT p={(int)b->x, (int)b->y};
@@ -2502,16 +2497,7 @@ static void OnButtonEvent(GdkEventButton *b)
       return;
     }
   }
-  if (swell_wayland_needs_manual_titlebar(hwnd))
-  {
-    b->x -= SWELL_WAYLAND_BORDER_WIDTH;
-    b->y -= g_swell_wayland_title_h + SWELL_WAYLAND_BORDER_WIDTH;
-  }
-  const int scale = swell_gdk_window_scale(b->window);
-  b->x *= scale;
-  b->y *= scale;
-  b->x_root *= scale;
-  b->y_root *= scale;
+  getMouseCoords(b->window, b->x, b->y, b->x_root, b->y_root);
 #endif
   swell_lastMessagePos = MAKELONG(((int)b->x_root&0xffff),((int)b->y_root&0xffff));
   POINT p={(int)b->x, (int)b->y};
@@ -3219,6 +3205,13 @@ bool GetWindowRect(HWND hwnd, RECT *r)
   if (!hwnd) return false;
   if (hwnd->m_oswindow)
   {
+#ifdef SWELL_TARGET_WAYLAND
+    if (GDK_IS_WAYLAND_WINDOW(hwnd->m_oswindow))
+    {
+      *r = hwnd->m_position;
+      return true;
+    }
+#endif
 #ifdef SWELL_GDK_IMPROVE_WINDOWRECT
     GdkRectangle gr;
     gdk_window_get_frame_extents(hwnd->m_oswindow,&gr);
@@ -3813,6 +3806,23 @@ void GetCursorPos(POINT *pt)
   pt->y=0;
   if (SWELL_gdk_active>0)
   {
+#ifdef SWELL_TARGET_WAYLAND
+    if (GDK_IS_WAYLAND_DISPLAY(gdk_display_get_default()))
+    {
+      GdkWindow *window = gdk_display_get_window_at_pointer(gdk_display_get_default(), NULL, NULL);
+      if (window) window = gdk_window_get_toplevel(window);
+      if (swell_oswindow_to_hwnd(window))
+      {
+        gint px = 0, py = 0;
+        gdk_window_get_pointer(window, &px, &py, NULL);
+        double x = px, y = py, x_root = 0, y_root = 0;
+        getMouseCoords(window, x, y, x_root, y_root);
+        pt->x = (int)x_root;
+        pt->y = (int)y_root;
+        return;
+      }
+    }
+#endif
 //#if SWELL_TARGET_GDK == 3
 //    GdkDevice *dev=NULL;
 //    if (s_cur_evt) dev = gdk_event_get_device(s_cur_evt);
