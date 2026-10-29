@@ -5122,7 +5122,7 @@ void SWELL_SetCursor(HCURSOR curs)
   {
     gdk_window_set_cursor(SWELL_focused_oswindow,(GdkCursor *)curs);
 #ifdef SWELL_TARGET_GDK_CURSORHACK
-    if (GetCapture())
+    if (GetCapture() && !(gdk_options & OPTION_IS_WAYLAND))
     {
       // workaround for a GDK behavior:
       // gdkwindow.c, gdk_window_set_cursor_internal() has a line:
