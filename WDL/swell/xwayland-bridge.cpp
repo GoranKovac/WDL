@@ -196,13 +196,71 @@ static bool on_draw(GtkWidget *widget, cairo_t *cr, gpointer data)
     return TRUE;
 }
 
+static Window s_pointer_window;
+static bool s_pointer_parked;
+
+static void park_pointer(int x, int y)
+{
+    if (!g_wm_dpy) return;
+    if (!s_pointer_window) {
+        XSetWindowAttributes attr = {};
+        attr.override_redirect = True;
+        attr.event_mask = ButtonPressMask | ButtonReleaseMask;
+        s_pointer_window = XCreateWindow(g_wm_dpy, DefaultRootWindow(g_wm_dpy),
+                                         x, y, 1, 1, 0, 0, InputOnly, CopyFromParent,
+                                         CWOverrideRedirect | CWEventMask, &attr);
+    }
+    XMoveWindow(g_wm_dpy, s_pointer_window, x, y);
+    XMapRaised(g_wm_dpy, s_pointer_window);
+    XTestFakeMotionEvent(g_wm_dpy, DefaultScreen(g_wm_dpy), x, y, CurrentTime);
+    XSync(g_wm_dpy, False);
+    s_pointer_parked = true;
+}
+
+static void resume_pointer()
+{
+    if (!s_pointer_parked) return;
+    XUnmapWindow(g_wm_dpy, s_pointer_window);
+    XSync(g_wm_dpy, False);
+    s_pointer_parked = false;
+}
+
 static void forward_motion(Capture *c, double wx, double wy)
 {
+    resume_pointer();
     const int scale = swell_gdk_widget_scale(c->widget);
     Window child; int rx, ry;
     XTranslateCoordinates(c->dpy, c->plugin_win, DefaultRootWindow(c->dpy),
                           (int)(wx * scale), (int)(wy * scale), &rx, &ry, &child);
     XTestFakeMotionEvent(c->dpy, DefaultScreen(c->dpy), rx, ry, CurrentTime);
+}
+
+static gboolean on_crossing(GtkWidget *, GdkEventCrossing *e, gpointer data)
+{
+    Capture *c = (Capture*)data;
+    if (!c || !c->dpy || e->mode != GDK_CROSSING_NORMAL ||
+        e->detail == GDK_NOTIFY_INFERIOR) return FALSE;
+    if (e->type == GDK_ENTER_NOTIFY) {
+        forward_motion(c, e->x, e->y);
+        XFlush(c->dpy);
+    } else if (!(e->state & (GDK_BUTTON1_MASK | GDK_BUTTON2_MASK | GDK_BUTTON3_MASK |
+                            GDK_BUTTON4_MASK | GDK_BUTTON5_MASK)) && c->popups.empty()) {
+        XMotionEvent motion = {};
+        motion.type = MotionNotify;
+        motion.display = c->dpy;
+        motion.window = c->gui_win ? c->gui_win : c->plugin_win;
+        motion.root = DefaultRootWindow(c->dpy);
+        motion.state = e->state;
+        motion.same_screen = True;
+        Window child;
+        if (XTranslateCoordinates(c->dpy, motion.root, motion.window, 0, 0,
+                                  &motion.x, &motion.y, &child)) {
+            XSendEvent(c->dpy, motion.window, True, PointerMotionMask, (XEvent*)&motion);
+            XSync(c->dpy, False);
+        }
+        park_pointer(0, 0);
+    }
+    return FALSE;
 }
 
 void xw_raise_modals()
@@ -390,6 +448,8 @@ static void connect_widget(Capture *c)
     g_object_add_weak_pointer(G_OBJECT(c->widget), (gpointer*)&c->widget);
     gtk_widget_add_events(c->widget,
                           GDK_POINTER_MOTION_MASK |
+                          GDK_ENTER_NOTIFY_MASK |
+                          GDK_LEAVE_NOTIFY_MASK |
                           GDK_BUTTON_PRESS_MASK |
                           GDK_BUTTON_RELEASE_MASK |
                           GDK_SCROLL_MASK);
@@ -409,6 +469,8 @@ static void connect_widget(Capture *c)
     g_signal_connect(c->widget, "button-press-event",   G_CALLBACK(on_button_press),   c);
     g_signal_connect(c->widget, "button-release-event", G_CALLBACK(on_button_release), c);
     g_signal_connect(c->widget, "motion-notify-event",  G_CALLBACK(on_motion),         c);
+    g_signal_connect(c->widget, "enter-notify-event",   G_CALLBACK(on_crossing),       c);
+    g_signal_connect(c->widget, "leave-notify-event",   G_CALLBACK(on_crossing),       c);
     g_signal_connect(c->widget, "scroll-event",         G_CALLBACK(on_scroll),         c);
     gtk_widget_queue_draw(c->widget);
 }
@@ -572,6 +634,7 @@ static bool canvas_button_press(GtkWidget *widget, GdkEventButton *e, gpointer d
 {
     Capture *c = (Capture*)data;
     if (!c || !c->dpy) return false;
+    resume_pointer();
 
     const int scale = swell_gdk_widget_scale(widget);
     int screen_x = (int)(e->x * scale) + c->canvas_x;
@@ -620,6 +683,7 @@ static bool canvas_motion(GtkWidget *widget, GdkEventMotion *e, gpointer data)
 {
     Capture *c = (Capture*)data;
     if (!c || !c->dpy) return false;
+    resume_pointer();
 
     static guint32 last_time = 0;
     guint32 now = g_get_monotonic_time() / 1000;
@@ -871,6 +935,7 @@ static bool modal_draw_cb(GtkWidget *widget, cairo_t *cr, gpointer data)
 
 static void modal_forward_motion(ModalRender *m, GtkWidget *widget, double wx, double wy)
 {
+    resume_pointer();
     const int scale = swell_gdk_widget_scale(widget);
     Window child; int rx, ry;
     XTranslateCoordinates(m->cap->dpy, m->x11_win, DefaultRootWindow(m->cap->dpy),
