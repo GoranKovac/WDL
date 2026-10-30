@@ -136,10 +136,17 @@ static void relay_wayland(std::shared_ptr<WaylandConnection> connection, bool fr
         }
         if (from_server && is_registry) {
             if (opcode == 0 && message.body.size() >= 2) {
-                static const char interface[] = "zxdg_output_manager_v1";
-                if (message.body[1] == sizeof(interface) &&
-                    (message.body.size() - 2) * sizeof(uint32_t) >= sizeof(interface) &&
-                    !memcmp(&message.body[2], interface, sizeof(interface))) {
+                // xwayland_shell_v1: wlroots compositors (e.g. mango) advertise it to
+                // every client but kill any non-compositor Xwayland that binds it.
+                static const char *const hidden[] = { "zxdg_output_manager_v1", "xwayland_shell_v1" };
+                bool hide = false;
+                for (const char *interface : hidden) {
+                    const size_t len = strlen(interface) + 1;
+                    if (message.body[1] == len &&
+                        (message.body.size() - 2) * sizeof(uint32_t) >= len &&
+                        !memcmp(&message.body[2], interface, len)) { hide = true; break; }
+                }
+                if (hide) {
                     hidden_globals.insert({object, message.body[0]});
                     continue;
                 }
