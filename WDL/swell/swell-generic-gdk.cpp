@@ -104,6 +104,26 @@ static guint32 _gdk_x11_window_get_desktop(GdkWindow *window)
 }
 
 #ifdef SWELL_TARGET_WAYLAND
+static void swell_wayland_set_geometry_hints(HWND hwnd, const GdkGeometry *hints)
+{
+  GObject *window = G_OBJECT(hwnd->m_oswidget);
+  GdkGeometry *last = (GdkGeometry*)g_object_get_data(window, "swell-geometry-hints");
+  if (last && last->min_width == hints->min_width && last->min_height == hints->min_height &&
+      last->max_width == hints->max_width && last->max_height == hints->max_height) return;
+  if (!last)
+  {
+    last = new GdkGeometry{};
+    g_object_set_data_full(window, "swell-geometry-hints", last,
+        [](gpointer data) { delete (GdkGeometry*)data; });
+  }
+  last->min_width = hints->min_width;
+  last->min_height = hints->min_height;
+  last->max_width = hints->max_width;
+  last->max_height = hints->max_height;
+  gtk_window_set_geometry_hints(GTK_WINDOW(window), NULL, last,
+      (GdkWindowHints)(GDK_HINT_MIN_SIZE | GDK_HINT_MAX_SIZE));
+}
+
 HWND g_wayland_hovered_hwnd = NULL;
 
 gboolean swell_wayland_handle_hover_enter(GtkWidget *widget, GdkEventCrossing *event, gpointer user_data)
@@ -617,8 +637,7 @@ void swell_recalcMinMaxInfo(HWND hwnd)
   }
   if (hwnd->m_oswidget)
   {
-    gtk_window_set_geometry_hints(GTK_WINDOW(hwnd->m_oswidget), NULL, &h,
-        (GdkWindowHints)(GDK_HINT_MIN_SIZE | GDK_HINT_MAX_SIZE));
+    swell_wayland_set_geometry_hints(hwnd, &h);
     return;
   }
 #endif
@@ -1119,8 +1138,7 @@ void swell_oswindow_manage(HWND hwnd, bool wantfocus)
             GdkGeometry gh;
             gh.min_width = gh.max_width = rw;
             gh.min_height = gh.max_height = rh;
-            gtk_window_set_geometry_hints(GTK_WINDOW(gtk_win), NULL, &gh,
-              (GdkWindowHints)(GDK_HINT_MIN_SIZE | GDK_HINT_MAX_SIZE));
+            swell_wayland_set_geometry_hints(hwnd, &gh);
           }
 
           // Tooltip and a menu can't both be showed at same time,
@@ -3562,8 +3580,7 @@ void swell_oswindow_resize_mapped(HWND hwnd, int reposflag, RECT f)
   memset(&gh,0,sizeof(gh));
   gh.min_width = gh.max_width = w;
   gh.min_height = gh.max_height = h;
-  gtk_window_set_geometry_hints(GTK_WINDOW(hwnd->m_oswidget), NULL, &gh,
-    (GdkWindowHints)(GDK_HINT_MIN_SIZE | GDK_HINT_MAX_SIZE));
+  swell_wayland_set_geometry_hints(hwnd, &gh);
   // GTK only sends hints that differ from the last ones it sent, which may not
   // be what the compositor has now -- send them on the GdkWindow too.
   gdk_window_set_geometry_hints(hwnd->m_oswindow, &gh,
@@ -3606,8 +3623,7 @@ void swell_oswindow_postresize(HWND hwnd, RECT f)
     }
     if (hwnd->m_oswidget)
     {
-      gtk_window_set_geometry_hints(GTK_WINDOW(hwnd->m_oswidget), NULL, &h,
-          (GdkWindowHints)(GDK_HINT_MIN_SIZE | GDK_HINT_MAX_SIZE));
+      swell_wayland_set_geometry_hints(hwnd, &h);
       return;
     }
 #endif
