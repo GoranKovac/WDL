@@ -5,6 +5,7 @@
 #endif
 #include <gdk/gdkwayland.h>
 #include "xwayland-bridge.h"
+#include "xwayland-bridge-gl.h"
 #include "swell-gdk-scale.h"
 #include <X11/extensions/Xcomposite.h>
 #include <X11/extensions/Xdamage.h>
@@ -125,6 +126,7 @@ public:
 
 struct Capture {
     CaptureImage image;
+    CaptureGL gl;
     Display   *dpy         = nullptr;
     Window     parent_win  = 0;
     Window     plugin_win  = 0;
@@ -320,6 +322,9 @@ static bool on_draw(GtkWidget *widget, cairo_t *cr, gpointer data)
             gtk_widget_queue_draw(widget);
     }
     if (!c || !c->pixmap || !c->visual) return FALSE;
+
+    if (c->gl.draw(widget, cr, c->dpy, c->pixmap, c->visual,
+                   c->pixmap_w, c->pixmap_h, refresh)) return TRUE;
 
     cairo_surface_t *surf = c->image.read(c->dpy, c->pixmap, c->visual,
                                         c->pixmap_w, c->pixmap_h, refresh);
@@ -591,6 +596,11 @@ static void on_realize(GtkWidget *widget, gpointer)
     gdk_window_set_event_compression(gtk_widget_get_window(widget), FALSE);
 }
 
+static void on_unrealize(GtkWidget *, gpointer data)
+{
+    ((Capture*)data)->gl.reset();
+}
+
 static void connect_widget(Capture *c)
 {
     if (!c->widget) return;
@@ -615,6 +625,7 @@ static void connect_widget(Capture *c)
     connect_toplevel(c);
 
     g_signal_connect(c->widget, "realize", G_CALLBACK(on_realize), c);
+    g_signal_connect(c->widget, "unrealize", G_CALLBACK(on_unrealize), c);
     if (gtk_widget_get_realized(c->widget)) on_realize(c->widget, c);
     g_signal_connect(c->widget, "draw",                 G_CALLBACK(on_draw),           c);
     g_signal_connect(c->widget, "button-press-event",   G_CALLBACK(on_button_press),   c);
@@ -699,6 +710,7 @@ static void cleanup_capture(Capture *c)
     if (c->damage && g_wm_dpy) XDamageDestroy(g_wm_dpy, c->damage);
     if (g_wm_dpy) XFlush(g_wm_dpy);
     destroy_pixmap(c);
+    c->gl.reset();
     c->image.reset();
     Display *d = c->dpy;
     c->dpy = nullptr;
