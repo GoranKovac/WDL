@@ -1366,9 +1366,14 @@ static void dismiss_popups(Capture *c)
     if (!c || !c->dpy || c->popups.empty()) return;
     park_pointer(0, 0);
     if (c->root_popup) {
+        int levels = 0;
+        for (const auto &p : c->popups)
+            if (p.visible && popup_accepts_input(c->dpy, p.x11_win)) ++levels;
         const int keycode = XKeysymToKeycode(c->dpy, XK_Escape);
-        xw_bridge_forward_key(c->hwnd, keycode, 0, true);
-        xw_bridge_forward_key(c->hwnd, keycode, 0, false);
+        for (int i = 0; i < wdl_max(levels, 1); ++i) {
+            xw_bridge_forward_key(c->hwnd, keycode, 0, true);
+            xw_bridge_forward_key(c->hwnd, keycode, 0, false);
+        }
     }
 }
 
