@@ -163,6 +163,7 @@ static HWND s_wayland_drag_source, s_wayland_drag_destination;
 static GtkWidget *s_wayland_drag_widget;
 static POINT s_wayland_drag_position;
 static bool s_wayland_drag_released, s_wayland_drag_cancelled;
+static bool s_wayland_drag_outside_release;
 static gboolean swell_wayland_drag_motion(GtkWidget *, GdkDragContext *, gint, gint, guint, gpointer);
 static gboolean swell_wayland_drag_drop(GtkWidget *, GdkDragContext *, gint, gint, guint, gpointer);
 static void swell_wayland_drag_leave(GtkWidget *, GdkDragContext *, guint, gpointer);
@@ -2350,6 +2351,7 @@ static bool swell_wayland_drag_update(GtkWidget *widget, GdkDragContext *context
   if (!s_wayland_drag_source || gtk_drag_get_source_widget(context) != s_wayland_drag_widget)
     return false;
   swell_wayland_drag_set_destination(hwnd);
+  if (hwnd && hwnd->m_oswindow) s_last_hover_oswindow = hwnd->m_oswindow;
   double px = x, py = y, rx = 0, ry = 0;
   getMouseCoords(gtk_widget_get_window(widget), px, py, rx, ry);
   s_wayland_drag_position.x = (int)rx;
@@ -2384,6 +2386,16 @@ static void swell_wayland_drag_leave(GtkWidget *, GdkDragContext *context, guint
   swell_wayland_drag_set_destination(NULL);
 }
 
+static gboolean swell_wayland_drag_failed(GtkWidget *, GdkDragContext *, GtkDragResult result, gpointer)
+{
+  if (!s_wayland_drag_source || !s_wayland_drag_outside_release ||
+      result == GTK_DRAG_RESULT_USER_CANCELLED) return FALSE;
+  swell_wayland_drag_set_destination(NULL);
+  s_wayland_drag_released = true;
+  swell_wayland_drag_mouse(WM_LBUTTONUP);
+  return TRUE;
+}
+
 static void swell_wayland_drag_end(GtkWidget *widget, GdkDragContext *, gpointer)
 {
   if (!s_wayland_drag_source) return;
@@ -2415,7 +2427,9 @@ void swell_wayland_begin_drag(HWND source)
   s_wayland_drag_widget = (GtkWidget*)g_object_ref(widget);
   s_wayland_drag_released = false;
   s_wayland_drag_cancelled = false;
+  s_wayland_drag_outside_release = false;
   g_signal_connect(widget, "drag-end", G_CALLBACK(swell_wayland_drag_end), &s_wayland_drag_source);
+  g_signal_connect(widget, "drag-failed", G_CALLBACK(swell_wayland_drag_failed), &s_wayland_drag_source);
   GtkTargetEntry target = { (gchar*)"application/x-swell-drag", GTK_TARGET_SAME_APP, 1 };
   GtkTargetList *targets = gtk_target_list_new(&target, 1);
   GdkDragContext *context = gtk_drag_begin_with_coordinates(widget, targets, GDK_ACTION_COPY,
@@ -2423,12 +2437,32 @@ void swell_wayland_begin_drag(HWND source)
   gtk_target_list_unref(targets);
   if (!context) swell_wayland_drag_end(widget, NULL, NULL);
 }
+
+static bool swell_wayland_is_docker_tab(HWND hwnd)
+{
+  return hwnd && hwnd->m_classname && !strcmp(hwnd->m_classname, "WDLTabCtrl") &&
+         hwnd->m_parent && !strcmp(hwnd->m_parent->m_title.Get(), "REAPER_dock");
+}
+
+static bool swell_wayland_check_docker_drag(const GdkEventMotion *m)
+{
+  if (!(m->state & GDK_BUTTON1_MASK) || !swell_wayland_is_docker_tab(GetCapture())) return false;
+  GdkWindow *top = gdk_window_get_toplevel(m->window);
+  if (!top) return false;
+  if (m->x >= 0 && m->y >= 0 &&
+      m->x < gdk_window_get_width(top) && m->y < gdk_window_get_height(top)) return false;
+  swell_wayland_begin_drag(NULL);
+  if (!s_wayland_drag_source) return false;
+  s_wayland_drag_outside_release = true;
+  return true;
+}
 #endif
 
 static void OnMotionEvent(GdkEventMotion *m)
 {
 #ifdef SWELL_TARGET_WAYLAND
   if (s_wayland_drag_source) return;
+  if (swell_wayland_check_docker_drag(m)) return;
   GdkEventMotion pixel_event = *m;
   m = &pixel_event;
   if (s_armed_drag_oswindow)
