@@ -241,8 +241,6 @@ static bool on_draw(GtkWidget *widget, cairo_t *cr, gpointer data)
     }
     if (!c || !c->pixmap.pixmap) return FALSE;
 
-    if (c->gl.draw(widget, cr, c->pixmap, refresh)) return TRUE;
-
     cairo_surface_t *surf = read_pixels(c, c->pixmap, c->image, refresh);
     if (surf) {
         if (cairo_surface_status(surf) == CAIRO_STATUS_SUCCESS) {
@@ -256,6 +254,26 @@ static bool on_draw(GtkWidget *widget, cairo_t *cr, gpointer data)
         cairo_surface_destroy(surf);
     }
     return TRUE;
+}
+
+static Capture *find_capture(GdkWindow *window)
+{
+    for (auto &kv : g_captures) {
+        Capture *c = kv.second;
+        if (kv.first == c->parent_win && c->widget && gtk_widget_get_window(c->widget) == window) return c;
+    }
+    return nullptr;
+}
+
+bool xw_bridge_draw(GdkWindow *window)
+{
+    Capture *c = find_capture(window);
+    if (!c || !c->gl.enabled()) return false;
+    if (c->pixmap_dirty) update_pixmap(c);
+    if (!c->pixmap.pixmap) return false;
+    if (c->gl.draw(c->widget, c->pixmap)) return true;
+    c->pixmap_dirty = true;
+    return false;
 }
 
 static xcb_window_t s_pointer_window;
@@ -1803,6 +1821,11 @@ static void xw_view_realize(GtkWidget *widget)
 static void xw_view_class_init(XwViewClass *klass)
 {
     GTK_WIDGET_CLASS(klass)->realize = xw_view_realize;
+    GTK_WIDGET_CLASS(klass)->unmap = [](GtkWidget *widget) {
+        Capture *c = find_capture(gtk_widget_get_window(widget));
+        if (c) c->gl.reset();
+        GTK_WIDGET_CLASS(xw_view_parent_class)->unmap(widget);
+    };
 }
 
 static void xw_view_init(XwView *)

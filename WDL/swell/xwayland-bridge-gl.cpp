@@ -5,15 +5,10 @@
 #include <xcb/dri3.h>
 #include <xcb/sync.h>
 #include <drm_fourcc.h>
+#include <wayland-egl.h>
 #include <unistd.h>
 #include <limits.h>
 #include <vector>
-
-static void invalidate_gl_window(GdkWindow *window, cairo_region_t *region)
-{
-    cairo_rectangle_int_t rect = { 0, 0, gdk_window_get_width(window), gdk_window_get_height(window) };
-    cairo_region_union_rectangle(region, &rect);
-}
 
 struct CaptureDmaBuf {
     xcb_dri3_buffers_from_pixmap_reply_t *reply = nullptr;
@@ -95,7 +90,8 @@ struct CaptureDmaBuf {
 bool CaptureGL::make_current()
 {
     gdk_gl_context_make_current(context);
-    return gdk_gl_context_get_current() == context && eglGetCurrentDisplay() != EGL_NO_DISPLAY;
+    if (gdk_gl_context_get_current() != context || eglGetCurrentDisplay() == EGL_NO_DISPLAY) return false;
+    return target == EGL_NO_SURFACE || eglMakeCurrent(display, target, target, eglGetCurrentContext());
 }
 
 void CaptureGL::reset()
@@ -110,19 +106,25 @@ void CaptureGL::reset()
         GdkGLContext *previous = gdk_gl_context_get_current();
         if (previous) g_object_ref(previous);
         if (make_current()) {
-            if (pending_read) glDeleteSync((GLsync)pending_read);
-            glDeleteFramebuffers(2, framebuffers);
-            glDeleteTextures(2, textures);
+            glDeleteFramebuffers(1, &framebuffer);
+            glDeleteTextures(1, &texture);
         }
-        pending_read = nullptr;
         if (previous && previous != context) gdk_gl_context_make_current(previous);
         else gdk_gl_context_clear_current();
         if (previous) g_object_unref(previous);
         g_object_unref(context);
         context = nullptr;
     }
-    textures[0] = textures[1] = framebuffers[0] = framebuffers[1] = 0;
-    width = height = depth = 0;
+    if (target != EGL_NO_SURFACE) eglDestroySurface(display, target);
+    if (native_window) wl_egl_window_destroy(native_window);
+    if (context_window) gdk_window_destroy(context_window);
+    context_window = nullptr;
+    target = EGL_NO_SURFACE;
+    display = EGL_NO_DISPLAY;
+    native_window = nullptr;
+    surface = nullptr;
+    texture = framebuffer = 0;
+    width = height = 0;
 }
 
 bool CaptureGL::read(const CapturePixmap &pixmap, GdkWindow *window)
@@ -135,12 +137,17 @@ bool CaptureGL::read(const CapturePixmap &pixmap, GdkWindow *window)
         buffer.reply->bpp != 32 || buffer.reply->depth != pixmap.format.depth) return false;
 
     if (!context) {
+        GdkWindowAttr attr = {};
+        attr.window_type = GDK_WINDOW_TEMP;
+        attr.wclass = GDK_INPUT_OUTPUT;
+        attr.width = attr.height = 1;
+        attr.visual = gdk_window_get_visual(window);
+        context_window = gdk_window_new(gdk_screen_get_root_window(gdk_window_get_screen(window)),
+                                        &attr, GDK_WA_VISUAL);
         GError *error = nullptr;
-        context = gdk_window_create_gl_context(window, &error);
+        context = gdk_window_create_gl_context(context_window, &error);
         if (error) g_error_free(error);
         if (!context) return false;
-        gdk_window_set_invalidate_handler(window, invalidate_gl_window);
-        gdk_window_invalidate_rect(window, nullptr, FALSE);
         gdk_gl_context_set_required_version(context, 3, 2);
         error = nullptr;
         bool realized = gdk_gl_context_realize(context, &error);
@@ -153,64 +160,65 @@ bool CaptureGL::read(const CapturePixmap &pixmap, GdkWindow *window)
     if (!make_current() ||
         epoxy_gl_version() < (epoxy_is_desktop_gl() ? 32 : 30) ||
         !epoxy_has_gl_extension("GL_OES_EGL_image")) return false;
-    if (pending_read) {
-        glWaitSync((GLsync)pending_read, 0, GL_TIMEOUT_IGNORED);
-        glDeleteSync((GLsync)pending_read);
-        pending_read = nullptr;
+    display = eglGetCurrentDisplay();
+    const int scale = gdk_window_get_scale_factor(window);
+    const int next_width = gdk_window_get_width(window) * scale;
+    const int next_height = gdk_window_get_height(window) * scale;
+    if (!native_window) {
+        EGLint id, count, min_interval;
+        EGLConfig config;
+        if (!eglQueryContext(display, eglGetCurrentContext(), EGL_CONFIG_ID, &id)) return false;
+        const EGLint attributes[] = { EGL_CONFIG_ID, id, EGL_NONE };
+        if (!eglChooseConfig(display, attributes, &config, 1, &count) || count != 1) return false;
+        if (!eglGetConfigAttrib(display, config, EGL_MIN_SWAP_INTERVAL, &min_interval) || min_interval > 0)
+            return false;
+        surface = gdk_wayland_window_get_wl_surface(window);
+        if (!surface) return false;
+        native_window = wl_egl_window_create(surface, next_width, next_height);
+        if (!native_window) return false;
+        target = eglCreateWindowSurface(display, config, (EGLNativeWindowType)native_window, nullptr);
+        if (target == EGL_NO_SURFACE || !make_current() || !eglSwapInterval(display, 0)) return false;
     }
-    EGLDisplay egl_display = eglGetCurrentDisplay();
-    EGLImageKHR image = buffer.import(egl_display);
+    if (width != next_width || height != next_height) {
+        width = next_width;
+        height = next_height;
+        wl_egl_window_resize(native_window, width, height, 0, 0);
+    }
+    wl_surface_set_buffer_scale(surface, scale);
+    EGLImageKHR image = buffer.import(display);
     if (image == EGL_NO_IMAGE_KHR) return false;
-    if (!textures[0]) {
-        glGenTextures(2, textures);
-        glGenFramebuffers(2, framebuffers);
+    if (!texture) {
+        glGenTextures(1, &texture);
+        glGenFramebuffers(1, &framebuffer);
     }
-    glBindTexture(GL_TEXTURE_2D, textures[0]);
+    glBindTexture(GL_TEXTURE_2D, texture);
     glEGLImageTargetTexture2DOES(GL_TEXTURE_2D, image);
-    eglDestroyImageKHR(egl_display, image);
+    eglDestroyImageKHR(display, image);
     if (glGetError() != GL_NO_ERROR) return false;
-    glBindFramebuffer(GL_READ_FRAMEBUFFER, framebuffers[0]);
-    glFramebufferTexture2D(GL_READ_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, textures[0], 0);
+    glBindFramebuffer(GL_READ_FRAMEBUFFER, framebuffer);
+    glFramebufferTexture2D(GL_READ_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, texture, 0);
     if (glCheckFramebufferStatus(GL_READ_FRAMEBUFFER) != GL_FRAMEBUFFER_COMPLETE) return false;
 
-    glBindTexture(GL_TEXTURE_2D, textures[1]);
-    if (width != w || height != h || depth != pixmap.format.depth) {
-        glTexImage2D(GL_TEXTURE_2D, 0, pixmap.format.direct.alpha_mask ? GL_RGBA8 : GL_RGB8,
-                     w, h, 0, GL_RGBA, GL_UNSIGNED_BYTE, nullptr);
-        width = w; height = h; depth = pixmap.format.depth;
-    }
-    glBindFramebuffer(GL_DRAW_FRAMEBUFFER, framebuffers[1]);
-    glFramebufferTexture2D(GL_DRAW_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, textures[1], 0);
-    if (glCheckFramebufferStatus(GL_DRAW_FRAMEBUFFER) != GL_FRAMEBUFFER_COMPLETE) return false;
+    glBindFramebuffer(GL_DRAW_FRAMEBUFFER, 0);
     glDisable(GL_SCISSOR_TEST);
-    glBlitFramebuffer(0, 0, w, h, 0, h, w, 0, GL_COLOR_BUFFER_BIT, GL_NEAREST);
+    glClearColor(0, 0, 0, 0);
+    glClear(GL_COLOR_BUFFER_BIT);
+    glBlitFramebuffer(0, 0, w, h, 0, height, w, height-h, GL_COLOR_BUFFER_BIT, GL_NEAREST);
     glBindFramebuffer(GL_FRAMEBUFFER, 0);
-    glFlush();
     return glGetError() == GL_NO_ERROR;
 }
 
-bool CaptureGL::draw(GtkWidget *widget, cairo_t *cr, const CapturePixmap &pixmap, bool refresh)
+bool CaptureGL::draw(GtkWidget *widget, const CapturePixmap &pixmap)
 {
     if (disabled) return false;
-    const int w = pixmap.width, h = pixmap.height;
     GdkWindow *window = gtk_widget_get_window(widget);
     if (!window || !GDK_IS_WAYLAND_WINDOW(window)) return false;
-    if (context && gdk_gl_context_get_window(context) != window) reset();
+    if (surface && surface != gdk_wayland_window_get_wl_surface(window)) reset();
     GdkGLContext *previous = gdk_gl_context_get_current();
     if (previous) g_object_ref(previous);
-    bool success = true;
-    if (!context || refresh || width != w || height != h)
-        success = read(pixmap, window);
-    if (success) success = make_current();
-    if (success) {
-        cairo_save(cr);
-        gdk_cairo_draw_from_gl(cr, window, textures[1], GL_TEXTURE,
-                              gtk_widget_get_scale_factor(widget), 0, 0, w, h);
-        cairo_restore(cr);
-        if (pending_read) glDeleteSync((GLsync)pending_read);
-        pending_read = glFenceSync(GL_SYNC_GPU_COMMANDS_COMPLETE, 0);
-        glFlush();
-    } else {
+    bool success = read(pixmap, window);
+    if (success) success = eglSwapBuffers(display, target);
+    if (!success) {
         reset();
         disabled = true;
     }
