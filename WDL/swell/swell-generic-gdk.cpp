@@ -553,9 +553,17 @@ void swell_oswindow_focus(HWND hwnd)
         {
           GdkDisplay *display = gdk_window_get_display(hwnd->m_oswindow);
           Display *dpy = gdk_x11_display_get_xdisplay(display);
+#if SWELL_TARGET_GDK == 2
+          gdk_error_trap_push();
+#else
           gdk_x11_display_error_trap_push (display);
+#endif
           XSetInputFocus(dpy,GDK_WINDOW_XID(hwnd->m_oswindow),RevertToNone,CurrentTime);
+#if SWELL_TARGET_GDK == 2
+          gdk_error_trap_pop();
+#else
           gdk_x11_display_error_trap_pop_ignored (display);
+#endif
         }
       }
       update_menubar_activations();
@@ -1970,7 +1978,10 @@ static void OnWindowStateEvent(GdkEventWindowState *evt)
   }
 }
 
-#define IS_DEAD_KEY(x) ((x) >= DEF_GKY(dead_grave) && (x) <= DEF_GKY(dead_greek))
+#ifndef GDK_KEY_dead_greek
+#define GDK_KEY_dead_greek XK_dead_greek
+#endif
+#define IS_DEAD_KEY(x) ((x) >= DEF_GKY(dead_grave) && (x) <= GDK_KEY_dead_greek)
 
 #include "gtkimcontextsimpleseqs.h"
 
@@ -2584,6 +2595,7 @@ static void OnScrollEvent(GdkEventScroll *b)
     POINT p2={(int)b->x_root, (int)b->y_root};
     // p2 is screen coordinates for WM_MOUSEWHEEL
 
+#if SWELL_TARGET_GDK >= 3
     if (b->direction == GDK_SCROLL_SMOOTH)
     {
       const double dy = b->delta_y * 120.0, dx = b->delta_x * 120.0;
@@ -2595,6 +2607,7 @@ static void OnScrollEvent(GdkEventScroll *b)
       if (hwnd) hwnd->Release();
     }
     else
+#endif
     {
     int msg=(b->direction == GDK_SCROLL_UP || b->direction == GDK_SCROLL_DOWN) ? WM_MOUSEWHEEL :
             (b->direction == GDK_SCROLL_LEFT || b->direction == GDK_SCROLL_RIGHT) ? WM_MOUSEHWHEEL : 0;
