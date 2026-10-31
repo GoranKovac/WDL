@@ -3150,9 +3150,22 @@ void SWELL_RunEvents()
     GMainContext *ctx=g_main_context_default();
 #ifdef SWELL_TARGET_WAYLAND
     const gint64 deadline = g_get_monotonic_time() + 4000;
+    guint wait_source = 0;
 #endif
-    while (g_main_context_iteration(ctx,FALSE))
+    for (;;)
     {
+      bool dispatched = g_main_context_iteration(ctx,FALSE);
+#ifdef SWELL_TARGET_WAYLAND
+      if (!dispatched && xw_bridge_has_pending_draw() && g_get_monotonic_time() < deadline)
+      {
+        if (!wait_source)
+          wait_source = g_timeout_add_full(G_PRIORITY_HIGH,
+            max(1, (int)((deadline - g_get_monotonic_time() + 999) / 1000)),
+            [](gpointer) -> gboolean { return G_SOURCE_CONTINUE; }, NULL, NULL);
+        dispatched = g_main_context_iteration(ctx,TRUE);
+      }
+#endif
+      if (!dispatched) break;
       GdkEvent *evt;
       while (gdk_events_pending() && (evt = gdk_event_get()))
       {
@@ -3167,6 +3180,7 @@ void SWELL_RunEvents()
 #endif
     }
 #ifdef SWELL_TARGET_WAYLAND
+    if (wait_source) g_source_remove(wait_source);
     gdk_display_flush(gdk_display_get_default());
 #endif
 

@@ -170,6 +170,18 @@ struct Capture {
 
 static std::map<Window, Capture*> g_captures;
 
+bool xw_bridge_has_pending_draw()
+{
+    for (auto &kv : g_captures) {
+        Capture *c = kv.second;
+        if (kv.first == c->parent_win && c->widget && c->pixmap_dirty &&
+            gtk_widget_get_mapped(c->widget) &&
+            !(gdk_window_get_state(gtk_widget_get_window(gtk_widget_get_toplevel(c->widget))) &
+              GDK_WINDOW_STATE_ICONIFIED)) return true;
+    }
+    return false;
+}
+
 void xw_clip_capture_regions(GdkWindow *window, cairo_region_t *region)
 {
     for (auto &kv : g_captures) {
@@ -574,6 +586,11 @@ static void connect_toplevel(Capture *c)
     }
 }
 
+static void on_realize(GtkWidget *widget, gpointer)
+{
+    gdk_window_set_event_compression(gtk_widget_get_window(widget), FALSE);
+}
+
 static void connect_widget(Capture *c)
 {
     if (!c->widget) return;
@@ -597,6 +614,8 @@ static void connect_widget(Capture *c)
 
     connect_toplevel(c);
 
+    g_signal_connect(c->widget, "realize", G_CALLBACK(on_realize), c);
+    if (gtk_widget_get_realized(c->widget)) on_realize(c->widget, c);
     g_signal_connect(c->widget, "draw",                 G_CALLBACK(on_draw),           c);
     g_signal_connect(c->widget, "button-press-event",   G_CALLBACK(on_button_press),   c);
     g_signal_connect(c->widget, "button-release-event", G_CALLBACK(on_button_release), c);
