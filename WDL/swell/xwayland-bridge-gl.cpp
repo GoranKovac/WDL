@@ -193,7 +193,7 @@ bool CaptureGL::draw(GtkWidget *widget, cairo_t *cr, const CapturePixmap &pixmap
 {
     if (disabled) return false;
     const int w = pixmap.width, h = pixmap.height;
-    GdkWindow *window = gtk_widget_get_window(gtk_widget_get_toplevel(widget));
+    GdkWindow *window = gtk_widget_get_window(widget);
     if (!window || !GDK_IS_WAYLAND_WINDOW(window)) return false;
     if (context && gdk_gl_context_get_window(context) != window) reset();
     GdkGLContext *previous = gdk_gl_context_get_current();

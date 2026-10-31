@@ -188,6 +188,7 @@ static cairo_surface_t *read_pixels(Capture *c, CapturePixmap &pixmap, CaptureIm
 static bool on_draw(GtkWidget *widget, cairo_t *cr, gpointer data)
 {
     Capture *c = (Capture*)data;
+    if (!gtk_cairo_should_draw_window(cr, gtk_widget_get_window(widget))) return FALSE;
     const bool refresh = c && c->pixmap_dirty;
     if (c && c->pixmap_dirty) {
         const int old_w = c->pixmap.width, old_h = c->pixmap.height;
@@ -245,9 +246,10 @@ static void resume_pointer()
 static void forward_motion(Capture *c, double wx, double wy)
 {
     resume_pointer();
+    XRaiseWindow(g_wm_dpy, c->parent_win);
     const int scale = swell_gdk_widget_scale(c->widget);
     Window child; int rx, ry;
-    XTranslateCoordinates(c->dpy, c->plugin_win, DefaultRootWindow(c->dpy),
+    XTranslateCoordinates(g_wm_dpy, c->plugin_win, DefaultRootWindow(c->dpy),
                           (int)(wx * scale), (int)(wy * scale), &rx, &ry, &child);
     XTestFakeMotionEvent(c->dpy, DefaultScreen(c->dpy), rx, ry, CurrentTime);
 }
@@ -1774,6 +1776,40 @@ static void xw_scale_changed(GtkWidget *, GParamSpec *, gpointer data)
     xw_size((HWND)data);
 }
 
+struct XwView { GtkDrawingArea parent; };
+struct XwViewClass { GtkDrawingAreaClass parent; };
+G_DEFINE_TYPE(XwView, xw_view, GTK_TYPE_DRAWING_AREA)
+
+static void xw_view_realize(GtkWidget *widget)
+{
+    GtkAllocation allocation;
+    gtk_widget_get_allocation(widget, &allocation);
+    GdkWindowAttr attr = {};
+    attr.window_type = GDK_WINDOW_SUBSURFACE;
+    attr.wclass = GDK_INPUT_OUTPUT;
+    attr.x = allocation.x;
+    attr.y = allocation.y;
+    attr.width = allocation.width;
+    attr.height = allocation.height;
+    attr.visual = gtk_widget_get_visual(widget);
+    attr.event_mask = gtk_widget_get_events(widget) | GDK_EXPOSURE_MASK;
+    GdkWindow *window = gdk_window_new(gdk_screen_get_root_window(gtk_widget_get_screen(widget)), &attr,
+                                      GDK_WA_X | GDK_WA_Y | GDK_WA_VISUAL);
+    gdk_window_set_transient_for(window, gtk_widget_get_window(gtk_widget_get_toplevel(widget)));
+    gtk_widget_set_realized(widget, TRUE);
+    gtk_widget_register_window(widget, window);
+    gtk_widget_set_window(widget, window);
+}
+
+static void xw_view_class_init(XwViewClass *klass)
+{
+    GTK_WIDGET_CLASS(klass)->realize = xw_view_realize;
+}
+
+static void xw_view_init(XwView *)
+{
+}
+
 HWND xw_bridge_create(HWND viewpar, void **wref, const RECT *r, const char *bridge_class_name)
 {
     HWND hwnd = nullptr;
@@ -1800,7 +1836,7 @@ HWND xw_bridge_create(HWND viewpar, void **wref, const RECT *r, const char *brid
     XMapWindow(disp, container);
     XFlush(disp);
 
-    GtkWidget *draw_area = gtk_drawing_area_new();
+    GtkWidget *draw_area = GTK_WIDGET(g_object_new(xw_view_get_type(), nullptr));
     const int scale = swell_gdk_widget_scale(parent ? parent->m_oswidget : NULL);
     gtk_widget_set_size_request(draw_area, swell_gdk_ceil(w, scale), swell_gdk_ceil(h, scale));
 
