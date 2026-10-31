@@ -13,13 +13,118 @@
 #include <X11/extensions/shape.h>
 #include <X11/keysym.h>
 #include <cairo/cairo-xlib.h>
+#include <X11/Xlib-xcb.h>
+#include <X11/extensions/XShm.h>
+#include <X11/extensions/Xrender.h>
+#include <xcb/shm.h>
+#include <sys/mman.h>
+#include <fcntl.h>
+#include <stdint.h>
+#include <unistd.h>
 void xw_size(HWND hwnd);
 
 XWaylandWM     *g_wm           = nullptr;
 Display *g_wm_dpy       = nullptr;
 
+class CaptureImage {
+    Display *dpy = nullptr;
+    XImage *image = nullptr;
+    XShmSegmentInfo shm = {};
+    size_t image_size = 0;
+    cairo_surface_t *surface = nullptr;
+    bool attached = false, disabled = false;
+
+    bool create(Display *display, Visual *visual, int w, int h)
+    {
+        dpy = display;
+        XRenderPictFormat *format = XRenderFindVisualFormat(dpy, visual);
+        if (!format || format->type != PictTypeDirect ||
+            (format->depth != 24 && format->depth != 32) ||
+            visual->red_mask != 0xff0000 || visual->green_mask != 0xff00 ||
+            visual->blue_mask != 0xff ||
+            (format->direct.alphaMask &&
+             (format->direct.alphaMask != 0xff || format->direct.alpha != 24))) return false;
+
+        int major, minor;
+        Bool pixmaps;
+        if (!XShmQueryVersion(dpy, &major, &minor, &pixmaps) ||
+            major < 1 || (major == 1 && minor < 2)) return false;
+        xcb_connection_t *connection = XGetXCBConnection(dpy);
+        if (!connection || xcb_connection_has_error(connection) || w <= 0 || h <= 0) return false;
+
+        image = XShmCreateImage(dpy, visual, format->depth, ZPixmap, nullptr, &shm, w, h);
+        const unsigned int endian = 1;
+        if (!image || image->bits_per_pixel != 32 || image->bytes_per_line <= 0 ||
+            image->byte_order != (*(const char*)&endian ? LSBFirst : MSBFirst) ||
+            (size_t)h > SIZE_MAX / (size_t)image->bytes_per_line) return false;
+
+        image_size = (size_t)image->bytes_per_line * h;
+        int fd = memfd_create("swell-plugin", MFD_CLOEXEC | MFD_ALLOW_SEALING);
+        if (fd < 0) return false;
+        if (ftruncate(fd, image_size) < 0 ||
+            fcntl(fd, F_ADD_SEALS, F_SEAL_SHRINK | F_SEAL_GROW | F_SEAL_SEAL) < 0) {
+            close(fd);
+            return false;
+        }
+        void *mapping = mmap(nullptr, image_size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+        if (mapping == MAP_FAILED) { close(fd); return false; }
+        shm.shmaddr = (char*)mapping;
+        image->data = shm.shmaddr;
+        shm.shmseg = xcb_generate_id(connection);
+        XFlush(dpy);
+        xcb_generic_error_t *error = xcb_request_check(connection,
+            xcb_shm_attach_fd_checked(connection, shm.shmseg, fd, False));
+        attached = !error && !xcb_connection_has_error(connection);
+        free(error);
+        if (!attached) return false;
+
+        surface = cairo_image_surface_create_for_data((unsigned char*)image->data,
+            format->direct.alphaMask ? CAIRO_FORMAT_ARGB32 : CAIRO_FORMAT_RGB24,
+            w, h, image->bytes_per_line);
+        return cairo_surface_status(surface) == CAIRO_STATUS_SUCCESS;
+    }
+
+public:
+    ~CaptureImage() { reset(); }
+
+    void reset()
+    {
+        if (surface) cairo_surface_destroy(surface);
+        surface = nullptr;
+        if (attached) XShmDetach(dpy, &shm);
+        attached = false;
+        if (image) { image->data = nullptr; XDestroyImage(image); }
+        image = nullptr;
+        if (shm.shmaddr) munmap(shm.shmaddr, image_size);
+        shm.shmaddr = nullptr;
+        image_size = 0;
+    }
+
+    cairo_surface_t *read(Display *display, Pixmap pixmap, Visual *visual, int w, int h,
+                          bool refresh)
+    {
+        if (disabled) return nullptr;
+        if (image && (image->width != w || image->height != h)) reset();
+        if (image && !refresh) return cairo_surface_reference(surface);
+        if (!image && !create(display, visual, w, h)) {
+            reset();
+            disabled = true;
+            return nullptr;
+        }
+        cairo_surface_flush(surface);
+        if (!XShmGetImage(dpy, pixmap, image, 0, 0, AllPlanes)) {
+            reset();
+            disabled = true;
+            return nullptr;
+        }
+        cairo_surface_mark_dirty(surface);
+        return cairo_surface_reference(surface);
+    }
+};
+
 
 struct Capture {
+    CaptureImage image;
     Display   *dpy         = nullptr;
     Window     parent_win  = 0;
     Window     plugin_win  = 0;
@@ -112,7 +217,7 @@ struct bridgeState {
 
 // (Re-)name the composite pixmap of the plugin window. Automatic redirection
 // means the X server keeps drawing the window off-screen; we sample it via
-// XCompositeNameWindowPixmap and render with cairo's xlib backend. The named
+// XCompositeNameWindowPixmap and render with cairo. The named
 // pixmap is only a reference to whatever backs the window at naming time, so
 // it goes stale on every resize and on every Present flip (GLX plugin UIs swap
 // the window pixmap for the client's buffer) -- callers re-name on both.
@@ -170,6 +275,7 @@ static void refresh_pixmap(Capture *c)
 static bool on_draw(GtkWidget *widget, cairo_t *cr, gpointer data)
 {
     Capture *c = (Capture*)data;
+    const bool refresh = c && c->pixmap_dirty;
     if (c && c->pixmap_dirty) {
         const int old_w = c->pixmap_w, old_h = c->pixmap_h;
         if (update_pixmap(c) && (old_w != c->pixmap_w || old_h != c->pixmap_h))
@@ -177,12 +283,11 @@ static bool on_draw(GtkWidget *widget, cairo_t *cr, gpointer data)
     }
     if (!c || !c->pixmap || !c->visual) return FALSE;
 
-    // Wrap the composite-named pixmap directly as a cairo xlib surface --
-    // no capture/copy step. The X server keeps this pixmap in sync with the
-    // off-screen plugin window because we requested Automatic redirection.
-    cairo_surface_t *surf = cairo_xlib_surface_create(c->dpy, c->pixmap,
-                                                      c->visual,
-                                                      c->pixmap_w, c->pixmap_h);
+    cairo_surface_t *surf = c->image.read(c->dpy, c->pixmap, c->visual,
+                                        c->pixmap_w, c->pixmap_h, refresh);
+    if (!surf)
+        surf = cairo_xlib_surface_create(c->dpy, c->pixmap, c->visual,
+                                        c->pixmap_w, c->pixmap_h);
     if (surf) {
         if (cairo_surface_status(surf) == CAIRO_STATUS_SUCCESS) {
             const int scale = swell_gdk_widget_scale(widget);
@@ -549,6 +654,7 @@ static void cleanup_capture(Capture *c)
     if (c->damage && g_wm_dpy) XDamageDestroy(g_wm_dpy, c->damage);
     if (g_wm_dpy) XFlush(g_wm_dpy);
     destroy_pixmap(c);
+    c->image.reset();
     Display *d = c->dpy;
     c->dpy = nullptr;
     if (d) XCloseDisplay(d);
@@ -1204,8 +1310,6 @@ static void handle_damage_notify(XDamageNotifyEvent *de)
 
     XDamageSubtract(g_wm_dpy, de->damage, None, None);
 
-    // No capture step with Automatic redirection: mark the pixmap dirty (see
-    // update_pixmap) and refresh it on the next draw.
     Capture *c = find_capture(de->drawable);
     if (c && c->widget && GTK_IS_WIDGET(c->widget)) {
         c->pixmap_dirty = true;
