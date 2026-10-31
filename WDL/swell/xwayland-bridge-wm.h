@@ -59,12 +59,13 @@ class XWaylandWM {
 public:
     explicit XWaylandWM(Display *dpy);
 
-    // One-shot bring-up: spawn Xwayland on the given display, install the X error
+    // One-shot bring-up: spawn Xwayland on a free display, install the X error
     // handler, open the WM connection, construct + announce the WM, and attach a
     // GIO watch that pumps events on the GLib main loop. Returns the global WM
     // instance (also stored in g_wm) or nullptr on failure. Infrastructure that
     // has nothing to do with the bridge lives here.
-    static XWaylandWM* init_bridge_wm(const char *display_name = ":10");
+    static XWaylandWM* init_bridge_wm();
+    static const char *display_name();
 
     // Call once after creating your root/parent windows to announce ourselves
     // as the WM (needed for native plugins that check _NET_SUPPORTING_WM_CHECK)

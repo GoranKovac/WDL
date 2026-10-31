@@ -5,8 +5,9 @@
 #include <signal.h>
 #include <stdlib.h>
 #include <stdio.h>
+#include <poll.h>
+#include <glib.h>
 
-#ifdef SWELL_TARGET_WAYLAND
 #include <wayland-client.h>
 #include <sys/socket.h>
 #include <fcntl.h>
@@ -157,11 +158,10 @@ static void relay_wayland(std::shared_ptr<WaylandConnection> connection, bool fr
     }
     connection->stop();
 }
-#endif
 
-pid_t xw_spawn_xwayland(const char *display_name)
+pid_t xw_spawn_xwayland(char *display_name, size_t size)
 {
-#ifdef SWELL_TARGET_WAYLAND
+    if (size < 3) return -1;
     wl_display *display = wl_display_connect(nullptr);
     if (!display) return -1;
     int sockets[2];
@@ -176,21 +176,28 @@ pid_t xw_spawn_xwayland(const char *display_name)
         close(sockets[1]);
         return -1;
     }
-#endif
+    int ready[2];
+    if (pipe2(ready, O_CLOEXEC) < 0) {
+        close(sockets[1]);
+        return -1;
+    }
     const pid_t pid = fork();
     if (pid == 0) {
         prctl(PR_SET_PDEATHSIG, SIGTERM);
-#ifdef SWELL_TARGET_WAYLAND
+        close(ready[0]);
+        char ready_fd[32];
+        snprintf(ready_fd, sizeof(ready_fd), "%d", ready[1]);
+        if (fcntl(ready[1], F_SETFD, 0) < 0) _exit(1);
         close(sockets[0]);
         close(server);
         char socket_name[32];
         snprintf(socket_name, sizeof(socket_name), "%d", sockets[1]);
         if (fcntl(sockets[1], F_SETFD, 0) < 0 || setenv("WAYLAND_SOCKET", socket_name, 1)) _exit(1);
-#endif
-        execl("/usr/bin/Xwayland", "Xwayland", display_name, "-rootless", (char*)nullptr);
+        execl("/usr/bin/Xwayland", "Xwayland", "-displayfd", ready_fd,
+              "-rootless", "-nolisten", "tcp", (char*)nullptr);
         _exit(1);
     }
-#ifdef SWELL_TARGET_WAYLAND
+    close(ready[1]);
     close(sockets[1]);
     if (pid > 0) {
         std::thread to_server, to_client;
@@ -198,6 +205,7 @@ pid_t xw_spawn_xwayland(const char *display_name)
             to_server = std::thread(relay_wayland, connection, false);
             to_client = std::thread(relay_wayland, connection, true);
         } catch (...) {
+            close(ready[0]);
             connection->stop();
             if (to_server.joinable()) to_server.join();
             if (to_client.joinable()) to_client.join();
@@ -208,6 +216,31 @@ pid_t xw_spawn_xwayland(const char *display_name)
         to_server.detach();
         to_client.detach();
     }
-#endif
-    return pid;
+    display_name[0] = ':';
+    size_t length = 1;
+    const gint64 deadline = g_get_monotonic_time() + 10000000;
+    while (pid > 0 && length < size) {
+        const int remaining = (deadline - g_get_monotonic_time()) / 1000;
+        if (remaining <= 0) break;
+        pollfd fd = { ready[0], POLLIN, 0 };
+        const int result = poll(&fd, 1, remaining);
+        if (result < 0 && errno == EINTR) continue;
+        if (result <= 0) break;
+        const ssize_t count = read(ready[0], display_name + length, size - length);
+        if (count < 0 && errno == EINTR) continue;
+        if (count <= 0) break;
+        length += count;
+        if (display_name[length - 1] == '\n') {
+            display_name[--length] = 0;
+            if (length <= 1 || strspn(display_name + 1, "0123456789") != length - 1) break;
+            close(ready[0]);
+            return pid;
+        }
+    }
+    close(ready[0]);
+    if (pid > 0) {
+        kill(pid, SIGTERM);
+        while (waitpid(pid, nullptr, 0) < 0 && errno == EINTR) {}
+    }
+    return -1;
 }

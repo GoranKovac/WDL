@@ -1446,7 +1446,7 @@ bool xw_bridge_swell_on_gdk_delete_release()
 
 void init_private_xwayland()
 {
-    if (!XWaylandWM::init_bridge_wm(":10")) return;
+    if (!XWaylandWM::init_bridge_wm()) return;
 
     if (g_wm_dpy) {
         int base, err;
@@ -1779,7 +1779,7 @@ HWND xw_bridge_create(HWND viewpar, void **wref, const RECT *r, const char *brid
     HWND hwnd = nullptr;
     *wref = nullptr;
 
-    Display *disp = XOpenDisplay(":10");
+    Display *disp = XOpenDisplay(XWaylandWM::display_name());
     if (!disp) {
         hwnd = new HWND__(viewpar, 0, r, NULL, false, NULL);
         hwnd->m_classname = bridge_class_name;
