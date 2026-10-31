@@ -146,6 +146,7 @@ static void _gdk_x11_window_move_to_desktop(GdkWindow *window, guint32 desktop)
 
 #ifdef SWELL_TARGET_WAYLAND
 static void swell_wl_sizepin_release(GdkFrameClock *clock, gpointer data);
+static gboolean swell_wayland_draw(GtkWidget *widget, cairo_t *cr, gpointer data);
 #endif
 
 #ifndef SWELL_WINDOWSKEY_GDK_MASK
@@ -1062,7 +1063,7 @@ void swell_oswindow_manage(HWND hwnd, bool wantfocus)
           const int scale = swell_gdk_window_scale(transient_for);
 
           gtk_widget_set_app_paintable(gtk_win, TRUE);
-          gtk_widget_set_double_buffered(gtk_win, FALSE);
+          g_signal_connect(gtk_win, "draw", G_CALLBACK(swell_wayland_draw), hwnd);
           gtk_widget_add_events(gtk_win, GDK_ALL_EVENTS_MASK|GDK_EXPOSURE_MASK);
 
           if (!is_popup_menu && !is_tooltip)
@@ -1674,7 +1675,7 @@ static bool swell_wayland_is_maximized(HWND hwnd)
   return hwnd && hwnd->m_is_maximized;
 }
 
-static void swell_wayland_paint_manual_titlebar(HWND hwnd, GdkWindow *window)
+static void swell_wayland_paint_manual_titlebar(HWND hwnd, GdkWindow *window, cairo_t *cr)
 {
   const int scale = swell_gdk_window_scale(window);
   const int w = swell_gdk_ceil(hwnd->m_position.right - hwnd->m_position.left, scale);
@@ -1685,7 +1686,7 @@ static void swell_wayland_paint_manual_titlebar(HWND hwnd, GdkWindow *window)
   const int full_h = g_swell_wayland_title_h + logical_h + bw*2; // top border + titlebar + content + bottom border
   const bool is_focused = (hwnd->m_oswindow == SWELL_focused_oswindow);
 
-  cairo_t *cr = gdk_cairo_create(window);
+  cairo_save(cr);
   cairo_set_antialias(cr, CAIRO_ANTIALIAS_NONE);
 
   if (is_focused)
@@ -1752,7 +1753,7 @@ static void swell_wayland_paint_manual_titlebar(HWND hwnd, GdkWindow *window)
     cairo_stroke(cr);
   }
 
-  cairo_destroy(cr);
+  cairo_restore(cr);
 }
 
 static int swell_wayland_titlebar_hittest(HWND hwnd, int x, int y)
@@ -1800,7 +1801,7 @@ static GdkWindowEdge swell_wayland_resize_edge_hittest(HWND hwnd, int x, int y, 
 }
 #endif
 
-static void OnExposeEvent(GdkEventExpose *exp)
+static void OnExposeEvent(GdkEventExpose *exp, cairo_t *draw_ctx = NULL)
 {
   HWND hwnd = swell_oswindow_to_hwnd(exp->window);
   if (!hwnd) return;
@@ -1849,14 +1850,15 @@ static void OnExposeEvent(GdkEventExpose *exp)
 #ifdef SWELL_TARGET_WAYLAND
   rrr = swell_gdk_logical_rect(rrr, scale);
 #endif
-  gdk_window_begin_paint_rect(exp->window, &rrr);
+  if (!draw_ctx) gdk_window_begin_paint_rect(exp->window, &rrr);
 
   if (tmpbm.getWidth()>0 && tmpbm.getHeight()>0) 
   {
     void SWELL_internalLICEpaint(HWND hwnd, LICE_IBitmap *bmout, int bmout_xpos, int bmout_ypos, bool forceref);
     SWELL_internalLICEpaint(hwnd, &tmpbm, r.left, r.top, forceref);
 
-    cairo_t *crc = gdk_cairo_create (exp->window);
+    cairo_t *crc = draw_ctx ? draw_ctx : gdk_cairo_create(exp->window);
+    cairo_save(crc);
 #ifdef SWELL_TARGET_WAYLAND
     cairo_scale(crc, 1.0 / scale, 1.0 / scale);
 #endif
@@ -1864,18 +1866,36 @@ static void OnExposeEvent(GdkEventExpose *exp)
     cairo_surface_t *temp_surface = (cairo_surface_t*)bm->Extended(0xca140,NULL);
     if (temp_surface) cairo_set_source_surface(crc, temp_surface, bw, title_h + bw);
     cairo_paint(crc);
-    cairo_destroy(crc);
+    cairo_restore(crc);
+    if (!draw_ctx) cairo_destroy(crc);
     if (temp_surface) bm->Extended(0xca140,temp_surface); // release
   }
 
 #ifdef SWELL_TARGET_WAYLAND
     if (swell_wayland_needs_manual_titlebar(hwnd))
-      swell_wayland_paint_manual_titlebar(hwnd, exp->window);
+    {
+      cairo_t *crc = draw_ctx ? draw_ctx : gdk_cairo_create(exp->window);
+      swell_wayland_paint_manual_titlebar(hwnd, exp->window, crc);
+      if (!draw_ctx) cairo_destroy(crc);
+    }
 #endif
 
-    gdk_window_end_paint(exp->window);
+    if (!draw_ctx) gdk_window_end_paint(exp->window);
 #endif
 }
+
+#ifdef SWELL_TARGET_WAYLAND
+static gboolean swell_wayland_draw(GtkWidget *widget, cairo_t *cr, gpointer data)
+{
+  HWND hwnd = (HWND)data;
+  GdkWindow *window = gtk_widget_get_window(widget);
+  if (window != hwnd->m_oswindow || !gtk_cairo_should_draw_window(cr, window)) return FALSE;
+  GdkEventExpose exp = {};
+  exp.window = window;
+  if (gdk_cairo_get_clip_rectangle(cr, &exp.area)) OnExposeEvent(&exp, cr);
+  return FALSE;
+}
+#endif
 
 static void OnConfigureEvent(GdkEventConfigure *cfg)
 {
@@ -2956,6 +2976,9 @@ static void swell_gdkEventHandler(GdkEvent *evt, gpointer data)
      }
     break;
     case GDK_EXPOSE: // paint! GdkEventExpose...
+#ifdef SWELL_TARGET_WAYLAND
+      if (GDK_IS_WAYLAND_WINDOW(evt->any.window)) break;
+#endif
       OnExposeEvent((GdkEventExpose *)evt);
     break;
     case GDK_CONFIGURE: // size/move, GdkEventConfigure
