@@ -19,9 +19,10 @@
 #include "xwayland-bridge-wm.h"
 #include "xwayland-bridge-display.h"
 #include "xwayland-bridge.h"          // g_wm, g_wm_dpy
-#include <X11/extensions/XTest.h>
-#include <X11/extensions/Xcomposite.h>
-#include <X11/extensions/Xfixes.h>
+#include <X11/Xlib-xcb.h>
+#include <xcb/xtest.h>
+#include <xcb/xfixes.h>
+#include <xcb/composite.h>
 #include <cstring>
 #include <cstdio>
 #include <cstdlib>
@@ -35,7 +36,8 @@
 #include <algorithm>
 
 // ─── Construction ─────────────────────────────────────────────────────────────
-XWaylandWM::XWaylandWM(Display *dpy) : dpy_(dpy) {
+XWaylandWM::XWaylandWM(xcb_connection_t *connection) : connection_(connection),
+    root_(xcb_setup_roots_iterator(xcb_get_setup(connection)).data->root) {
     init_atoms();
 }
 
@@ -72,35 +74,43 @@ static int wm_x11_error_handler(Display *dpy, XErrorEvent *err)
 struct WMEventSource {
     GSource source;
     GPollFD poll;
+    xcb_generic_event_t *event;
 };
 
-static gboolean wm_event_prepare(GSource *, gint *timeout)
+static gboolean wm_event_prepare(GSource *source, gint *timeout)
 {
     *timeout = -1;
-    return g_wm_dpy && XEventsQueued(g_wm_dpy, QueuedAlready);
+    WMEventSource *wm_source = (WMEventSource*)source;
+    if (!wm_source->event && g_wm)
+        wm_source->event = xcb_poll_for_queued_event(g_wm->connection());
+    return wm_source->event != nullptr;
 }
 
 static gboolean wm_event_check(GSource *source)
 {
     WMEventSource *wm_source = (WMEventSource*)source;
-    return (wm_source->poll.revents & G_IO_IN) ||
-        (g_wm_dpy && XEventsQueued(g_wm_dpy, QueuedAlready));
+    if (!wm_source->event && g_wm)
+        wm_source->event = xcb_poll_for_event(g_wm->connection());
+    return wm_source->event || (wm_source->poll.revents & (G_IO_HUP | G_IO_ERR));
 }
 
-static gboolean wm_event_dispatch(GSource *, GSourceFunc, gpointer)
+static gboolean wm_event_dispatch(GSource *source, GSourceFunc, gpointer)
 {
+    WMEventSource *wm_source = (WMEventSource*)source;
     const gint64 deadline = g_get_monotonic_time() + 2000;
-    for (int n = 0; n < 64 && g_wm_dpy && XPending(g_wm_dpy); ++n) {
-        XEvent ev;
-        XNextEvent(g_wm_dpy, &ev);
-        if (g_wm) {
-            g_wm->handle_event(&ev);
-            if (g_wm->on_unhandled_event) g_wm->on_unhandled_event(&ev);
-        }
+    for (int n = 0; n < 64 && g_wm; ++n) {
+        xcb_generic_event_t *ev = wm_source->event;
+        wm_source->event = nullptr;
+        if (!ev) ev = xcb_poll_for_event(g_wm->connection());
+        if (!ev) break;
+        g_wm->handle_event(ev);
+        if (g_wm->on_unhandled_event) g_wm->on_unhandled_event(ev);
+        free(ev);
         if (g_get_monotonic_time() >= deadline) break;
     }
-    if (g_wm_dpy) XFlush(g_wm_dpy);
-    return TRUE;
+    if (!g_wm || xcb_connection_has_error(g_wm->connection())) return G_SOURCE_REMOVE;
+    xcb_flush(g_wm->connection());
+    return G_SOURCE_CONTINUE;
 }
 
 const char *XWaylandWM::display_name()
@@ -127,7 +137,8 @@ XWaylandWM* XWaylandWM::init_bridge_wm()
     }
 
     setenv("DISPLAY", s_xwayland_display, 1);
-    g_wm = new XWaylandWM(g_wm_dpy);
+    XSetEventQueueOwner(g_wm_dpy, XCBOwnsEventQueue);
+    g_wm = new XWaylandWM(XGetXCBConnection(g_wm_dpy));
 
     Window support = XCreateSimpleWindow(g_wm_dpy, DefaultRootWindow(g_wm_dpy),
                                          -2, -2, 1, 1, 0, 0, 0);
@@ -140,7 +151,7 @@ XWaylandWM* XWaylandWM::init_bridge_wm()
     GSource *source = g_source_new(&funcs, sizeof(WMEventSource));
     WMEventSource *wm_source = (WMEventSource*)source;
     wm_source->poll.fd = ConnectionNumber(g_wm_dpy);
-    wm_source->poll.events = G_IO_IN;
+    wm_source->poll.events = G_IO_IN | G_IO_HUP | G_IO_ERR;
     g_source_add_poll(source, &wm_source->poll);
     g_source_set_priority(source, GDK_PRIORITY_REDRAW + 1);
     g_source_attach(source, nullptr);
@@ -153,33 +164,34 @@ XWaylandWM* XWaylandWM::init_bridge_wm()
 // ─── Atom initialisation ──────────────────────────────────────────────────────
 
 void XWaylandWM::init_atoms() {
-    // ICCCM
-    atoms_.WM_PROTOCOLS       = XInternAtom(dpy_, "WM_PROTOCOLS",       False);
-    atoms_.WM_DELETE_WINDOW   = XInternAtom(dpy_, "WM_DELETE_WINDOW",   False);
-    atoms_.WM_TAKE_FOCUS      = XInternAtom(dpy_, "WM_TAKE_FOCUS",      False);
-    atoms_.WM_STATE           = XInternAtom(dpy_, "WM_STATE",           False);
-    atoms_.WM_CHANGE_STATE    = XInternAtom(dpy_, "WM_CHANGE_STATE",    False);
-    atoms_.WM_HINTS           = XInternAtom(dpy_, "WM_HINTS",           False);
-    atoms_.WM_NORMAL_HINTS    = XInternAtom(dpy_, "WM_NORMAL_HINTS",    False);
-    atoms_.WM_TRANSIENT_FOR   = XInternAtom(dpy_, "WM_TRANSIENT_FOR",   False);
-    atoms_.WM_NAME            = XInternAtom(dpy_, "WM_NAME",            False);
-    atoms_.WM_CLASS           = XInternAtom(dpy_, "WM_CLASS",           False);
-    // EWMH
-    atoms_._NET_WM_STATE              = XInternAtom(dpy_, "_NET_WM_STATE",              False);
-    atoms_._NET_WM_STATE_MODAL        = XInternAtom(dpy_, "_NET_WM_STATE_MODAL",        False);
-    atoms_._NET_WM_STATE_ABOVE        = XInternAtom(dpy_, "_NET_WM_STATE_ABOVE",        False);
-    atoms_._NET_ACTIVE_WINDOW         = XInternAtom(dpy_, "_NET_ACTIVE_WINDOW",         False);
-    atoms_._NET_WM_WINDOW_TYPE        = XInternAtom(dpy_, "_NET_WM_WINDOW_TYPE",        False);
-    atoms_._NET_WM_WINDOW_TYPE_DIALOG = XInternAtom(dpy_, "_NET_WM_WINDOW_TYPE_DIALOG", False);
-    atoms_._NET_WM_WINDOW_TYPE_POPUP_MENU
-                                      = XInternAtom(dpy_, "_NET_WM_WINDOW_TYPE_POPUP_MENU", False);
-    atoms_._NET_WM_WINDOW_TYPE_TOOLTIP= XInternAtom(dpy_, "_NET_WM_WINDOW_TYPE_TOOLTIP",False);
-    atoms_._NET_WM_WINDOW_TYPE_NORMAL = XInternAtom(dpy_, "_NET_WM_WINDOW_TYPE_NORMAL", False);
-    atoms_._NET_SUPPORTING_WM_CHECK   = XInternAtom(dpy_, "_NET_SUPPORTING_WM_CHECK",   False);
-    atoms_._NET_WM_NAME               = XInternAtom(dpy_, "_NET_WM_NAME",               False);
-    atoms_._NET_SUPPORTED             = XInternAtom(dpy_, "_NET_SUPPORTED",             False);
-    atoms_._NET_WM_BYPASS_COMPOSITOR  = XInternAtom(dpy_, "_NET_WM_BYPASS_COMPOSITOR",  False);
-    atoms_._XWAYLAND_ALLOW_COMMITS    = XInternAtom(dpy_, "_XWAYLAND_ALLOW_COMMITS",    False);
+    xcb_intern_atom_cookie_t *cookies = xcb_ewmh_init_atoms(connection_, &atoms_);
+    struct { const char *name; xcb_atom_t *atom; } extra[] = {
+        { "WM_DELETE_WINDOW", &atoms_.WM_DELETE_WINDOW },
+        { "WM_TAKE_FOCUS", &atoms_.WM_TAKE_FOCUS },
+        { "WM_STATE", &atoms_.WM_STATE },
+        { "_XWAYLAND_ALLOW_COMMITS", &atoms_._XWAYLAND_ALLOW_COMMITS },
+        { "_REAPERX_TIMESTAMP", &atoms_._REAPERX_TIMESTAMP },
+        { "XdndSelection", &atoms_.XdndSelection },
+        { "XdndAware", &atoms_.XdndAware },
+        { "XdndEnter", &atoms_.XdndEnter },
+        { "XdndPosition", &atoms_.XdndPosition },
+        { "XdndStatus", &atoms_.XdndStatus },
+        { "XdndDrop", &atoms_.XdndDrop },
+        { "XdndFinished", &atoms_.XdndFinished },
+        { "XdndLeave", &atoms_.XdndLeave },
+        { "XdndActionCopy", &atoms_.XdndActionCopy },
+        { "text/uri-list", &atoms_.uri_list },
+        { "XWB_DND_DATA", &atoms_.dnd_data }
+    };
+    xcb_intern_atom_cookie_t requests[sizeof(extra) / sizeof(extra[0])];
+    for (size_t i = 0; i < sizeof(extra) / sizeof(extra[0]); ++i)
+        requests[i] = xcb_intern_atom(connection_, false, strlen(extra[i].name), extra[i].name);
+    xcb_ewmh_init_atoms_replies(&atoms_, cookies, nullptr);
+    for (size_t i = 0; i < sizeof(extra) / sizeof(extra[0]); ++i) {
+        xcb_intern_atom_reply_t *reply = xcb_intern_atom_reply(connection_, requests[i], nullptr);
+        if (reply) *extra[i].atom = reply->atom;
+        free(reply);
+    }
 }
 
 // Our manual redirect gives every toplevel a wl_surface on the host compositor,
@@ -192,62 +204,32 @@ void XWaylandWM::init_atoms() {
 // client (the one holding SubstructureRedirect on root) may set this property,
 // and it must be CARDINAL/32 with one item or Xwayland ignores it.
 void XWaylandWM::disallow_commits(Window w) {
-    long zero = 0;
-    XChangeProperty(dpy_, w, atoms_._XWAYLAND_ALLOW_COMMITS, XA_CARDINAL, 32,
-                    PropModeReplace, (unsigned char*)&zero, 1);
+    const uint32_t zero = 0;
+    xcb_change_property(connection_, XCB_PROP_MODE_REPLACE, w, atoms_._XWAYLAND_ALLOW_COMMITS,
+                        XCB_ATOM_CARDINAL, 32, 1, &zero);
 }
 
 // ─── WM announcement (needed by native plugins that check for a WM) ───────────
 
 void XWaylandWM::announce_wm(Window support_win) {
     support_win_ = support_win;
-    Window root = DefaultRootWindow(dpy_);
-    set_active_window(None);
-
-    // _NET_SUPPORTING_WM_CHECK on root → support_win
-    XChangeProperty(dpy_, root,
-                    atoms_._NET_SUPPORTING_WM_CHECK, XA_WINDOW, 32,
-                    PropModeReplace, (unsigned char*)&support_win, 1);
-    // Same on support_win itself
-    XChangeProperty(dpy_, support_win,
-                    atoms_._NET_SUPPORTING_WM_CHECK, XA_WINDOW, 32,
-                    PropModeReplace, (unsigned char*)&support_win, 1);
-
-    // _NET_WM_NAME on support_win
-    const char *wm_name = "REAPERXBridge";
-    XChangeProperty(dpy_, support_win,
-                    atoms_._NET_WM_NAME,
-                    XInternAtom(dpy_, "UTF8_STRING", False), 8,
-                    PropModeReplace, (const unsigned char*)wm_name, strlen(wm_name));
-
-    // Advertise supported EWMH atoms
-    Atom supported[] = {
-        atoms_._NET_WM_STATE,
-        atoms_._NET_WM_STATE_MODAL,
-        atoms_._NET_WM_STATE_ABOVE,
-        atoms_._NET_ACTIVE_WINDOW,
-        atoms_._NET_WM_WINDOW_TYPE,
-        atoms_._NET_WM_WINDOW_TYPE_DIALOG,
-        atoms_._NET_WM_WINDOW_TYPE_POPUP_MENU,
-        atoms_._NET_WM_WINDOW_TYPE_NORMAL,
-        atoms_._NET_SUPPORTING_WM_CHECK,
-        atoms_._NET_WM_NAME,
+    set_active_window(XCB_NONE);
+    xcb_ewmh_set_supporting_wm_check(&atoms_, root_, support_win);
+    xcb_ewmh_set_supporting_wm_check(&atoms_, support_win, support_win);
+    const char *name = "REAPERXBridge";
+    xcb_ewmh_set_wm_name(&atoms_, support_win, strlen(name), name);
+    xcb_atom_t supported[] = {
+        atoms_._NET_WM_STATE, atoms_._NET_WM_STATE_MODAL, atoms_._NET_WM_STATE_ABOVE,
+        atoms_._NET_ACTIVE_WINDOW, atoms_._NET_WM_WINDOW_TYPE,
+        atoms_._NET_WM_WINDOW_TYPE_DIALOG, atoms_._NET_WM_WINDOW_TYPE_POPUP_MENU,
+        atoms_._NET_WM_WINDOW_TYPE_NORMAL, atoms_._NET_SUPPORTING_WM_CHECK, atoms_._NET_WM_NAME
     };
-    XChangeProperty(dpy_, root,
-                    atoms_._NET_SUPPORTED, XA_ATOM, 32,
-                    PropModeReplace, (unsigned char*)supported,
-                    sizeof(supported)/sizeof(supported[0]));
-
-    XFlush(dpy_);
-    DEBUG_PRINT("[WM] announced on root=0x%lx support_win=0x%lx\n", root, support_win);
-
-    XSelectInput(dpy_, root,
-                 SubstructureRedirectMask |
-                 SubstructureNotifyMask   |
-                 PropertyChangeMask);
-    XFlush(dpy_);
-    DEBUG_PRINT("[WM] SubstructureRedirect on root selected\n");
-
+    xcb_ewmh_set_supported(&atoms_, 0, sizeof(supported) / sizeof(supported[0]), supported);
+    const uint32_t mask = XCB_EVENT_MASK_SUBSTRUCTURE_REDIRECT |
+                          XCB_EVENT_MASK_SUBSTRUCTURE_NOTIFY | XCB_EVENT_MASK_PROPERTY_CHANGE;
+    xcb_change_window_attributes(connection_, root_, XCB_CW_EVENT_MASK, &mask);
+    const uint32_t support_mask = XCB_EVENT_MASK_PROPERTY_CHANGE;
+    xcb_change_window_attributes(connection_, support_win, XCB_CW_EVENT_MASK, &support_mask);
     // Manually redirect every current and future child of root, the way every
     // real Xwayland window manager does (Mutter, KWin and wlroots all do this;
     // Mutter's teardown code calls it "the most important part of cleanup").
@@ -267,30 +249,15 @@ void XWaylandWM::announce_wm(Window support_win) {
     //
     // Only one client may hold CompositeRedirectManual, but we are the sole WM
     // on our own private display, so there is nothing to contend with.
-    XCompositeRedirectSubwindows(dpy_, root, CompositeRedirectManual);
-    XFlush(dpy_);
-    DEBUG_PRINT("[WM] CompositeRedirectManual on root subwindows\n");
-    
-    // Verify it actually got set
-    Atom actual; int fmt; unsigned long n, left;
-    unsigned char *data = nullptr;
-    if (XGetWindowProperty(dpy_, root, atoms_._NET_SUPPORTING_WM_CHECK,
-                           0, 1, False, XA_WINDOW,
-                           &actual, &fmt, &n, &left, &data) == Success && data) {
-        DEBUG_PRINT("[WM] _NET_SUPPORTING_WM_CHECK verified: 0x%lx\n",
-                    (unsigned long)*(Window*)data);
-        XFree(data);
-    } else {
-        DEBUG_PRINT("[WM] _NET_SUPPORTING_WM_CHECK NOT SET - announce failed\n");
-    }
+    xcb_composite_redirect_subwindows(connection_, root_, XCB_COMPOSITE_REDIRECT_MANUAL);
+    xcb_flush(connection_);
 }
 
 void XWaylandWM::set_active_window(Window window) {
     if (active_window_ == window) return;
     active_window_ = window;
-    XChangeProperty(dpy_, DefaultRootWindow(dpy_), atoms_._NET_ACTIVE_WINDOW,
-                    XA_WINDOW, 32, PropModeReplace, (unsigned char*)&window, 1);
-    XFlush(dpy_);
+    xcb_ewmh_set_active_window(&atoms_, 0, window);
+    xcb_flush(connection_);
 }
 
 // ─── Window tracking ──────────────────────────────────────────────────────────
@@ -305,31 +272,50 @@ void XWaylandWM::track_window(Window w) {
     read_wm_hints(w, st);
 
     // Subscribe to property changes so we can react to hint updates
-    XSelectInput(dpy_, w, PropertyChangeMask | StructureNotifyMask);
+    const uint32_t mask = XCB_EVENT_MASK_PROPERTY_CHANGE | XCB_EVENT_MASK_STRUCTURE_NOTIFY;
+    xcb_change_window_attributes(connection_, w, XCB_CW_EVENT_MASK, &mask);
 
     states_[w] = st;
 }
 
 void XWaylandWM::untrack_window(Window w) {
     states_.erase(w);
+    if (pending_focus_ == w) pending_focus_ = XCB_NONE;
 }
 
 // ─── Main event dispatcher ────────────────────────────────────────────────────
 
-bool XWaylandWM::handle_event(XEvent *ev) {
-    // DEBUG_PRINT("[WM] handle_event type=%d win=0x%lx\n", ev->type, ev->xany.window);
+bool XWaylandWM::handle_event(xcb_generic_event_t *ev) {
     if (dnd_handle_event(ev)) return true;
-    switch (ev->type) {
-    case CreateNotify:     return on_create_notify(&ev->xcreatewindow);
-    case MapRequest:      DEBUG_PRINT("[WM] -> MapRequest\n");       return on_map_request(&ev->xmaprequest);
-    case ConfigureRequest: DEBUG_PRINT("[WM] -> ConfigureRequest\n"); return on_configure_request(&ev->xconfigurerequest);
-    case ReparentNotify:   DEBUG_PRINT("[WM] -> ReparentNotify\n");   return on_reparent_notify(&ev->xreparent);
-    case UnmapNotify:      DEBUG_PRINT("[WM] -> UnmapNotify\n");      return on_unmap_notify(&ev->xunmap);
-    case DestroyNotify:    DEBUG_PRINT("[WM] -> DestroyNotify\n");    return on_destroy_notify(&ev->xdestroywindow);
-    default:
-    DEBUG_PRINT("[WM] -> unhandled (type=%d)\n", ev->type);
-        return false;
+    switch (ev->response_type & 0x7f) {
+    case XCB_CREATE_NOTIFY: return on_create_notify((xcb_create_notify_event_t*)ev);
+    case XCB_MAP_REQUEST: return on_map_request((xcb_map_request_event_t*)ev);
+    case XCB_CONFIGURE_REQUEST: return on_configure_request((xcb_configure_request_event_t*)ev);
+    case XCB_REPARENT_NOTIFY: return on_reparent_notify((xcb_reparent_notify_event_t*)ev);
+    case XCB_UNMAP_NOTIFY: return on_unmap_notify((xcb_unmap_notify_event_t*)ev);
+    case XCB_DESTROY_NOTIFY: return on_destroy_notify((xcb_destroy_notify_event_t*)ev);
+    case XCB_PROPERTY_NOTIFY: {
+        xcb_property_notify_event_t *property = (xcb_property_notify_event_t*)ev;
+        if (property->window == support_win_ && property->atom == atoms_._REAPERX_TIMESTAMP) {
+            if (property->sequence != focus_sequence_) return true;
+            auto it = states_.find(pending_focus_);
+            if (it != states_.end()) {
+                if (it->second.input_hint)
+                    xcb_set_input_focus(connection_, XCB_INPUT_FOCUS_PARENT, pending_focus_, property->time);
+                if (it->second.take_focus) send_take_focus(pending_focus_, property->time);
+            }
+            pending_focus_ = XCB_NONE;
+            return true;
+        }
+        auto it = states_.find(property->window);
+        if (it != states_.end()) {
+            if (property->atom == atoms_.WM_PROTOCOLS) read_wm_protocols(property->window, it->second);
+            if (property->atom == XCB_ATOM_WM_HINTS) read_wm_hints(property->window, it->second);
+        }
+        break;
     }
+    }
+    return false;
 }
 
 // ─── CreateNotify ─────────────────────────────────────────────────────────────
@@ -337,8 +323,8 @@ bool XWaylandWM::handle_event(XEvent *ev) {
 // disallow_commits). Non-override-redirect windows reach us here before their
 // MapRequest, so the property is in place before the first commit; for
 // override-redirect ones Xwayland picks the change up live.
-bool XWaylandWM::on_create_notify(XCreateWindowEvent *ev) {
-    if (ev->parent == DefaultRootWindow(dpy_))
+bool XWaylandWM::on_create_notify(xcb_create_notify_event_t *ev) {
+    if (ev->parent == root_)
         disallow_commits(ev->window);
     return false;
 }
@@ -347,106 +333,65 @@ bool XWaylandWM::on_create_notify(XCreateWindowEvent *ev) {
 // Native plugins call XMapWindow; because we set SubstructureRedirect on the
 // container, the X server redirects this to us as a MapRequest.  We MUST call
 // XMapWindow ourselves or the window never appears.
-bool XWaylandWM::on_map_request(XMapRequestEvent *ev) {
-    DEBUG_PRINT("[WM] on_map_request win=0x%lx parent=0x%lx\n", ev->window, ev->parent);
-    Window w = ev->window;
-
-    // If we're not tracking this yet, start now
-    if (!states_.count(w))
-        track_window(w);
-
-    auto &st = states_[w];
-
-    // Honour the request: map the window
-    XMapWindow(dpy_, w);
-    DEBUG_PRINT("[WM] XMapWindow called for 0x%lx\n", ev->window);
-
-    // Set WM_STATE = Normal (ICCCM §4.1.3.1)
-    set_wm_state(w, WM_STATE_NORMAL);
-
-    // Focus per ICCCM §4.1.7. WM_TAKE_FOCUS MUST carry a real timestamp,
-    // never CurrentTime, or globally-active clients (input=False) ignore it
-    // and then drop synthesized button events.
-    const Time timestamp = get_server_time();
-    if (st.input_hint)
-        XSetInputFocus(dpy_, w, RevertToParent, timestamp);
-    if (st.take_focus)
-        send_take_focus(w, timestamp);
-
-    return true; // consumed
+bool XWaylandWM::on_map_request(xcb_map_request_event_t *ev) {
+    track_window(ev->window);
+    xcb_map_window(connection_, ev->window);
+    set_wm_state(ev->window, WM_STATE_NORMAL);
+    const WMWindowState &state = states_[ev->window];
+    if (state.input_hint || state.take_focus) {
+        pending_focus_ = ev->window;
+        focus_sequence_ = xcb_change_property(connection_, XCB_PROP_MODE_APPEND, support_win_,
+            atoms_._REAPERX_TIMESTAMP, XCB_ATOM_ATOM, 32, 0, nullptr).sequence;
+    }
+    return true;
 }
 
 // ─── ConfigureRequest ─────────────────────────────────────────────────────────
 // Native plugins send ConfigureRequest to move/resize themselves.
 // We MUST respond with XConfigureWindow or they stall waiting.
 
-bool XWaylandWM::on_configure_request(XConfigureRequestEvent *ev) {
+bool XWaylandWM::on_configure_request(xcb_configure_request_event_t *ev) {
     honour_configure_request(ev);
     return true;
 }
 
-void XWaylandWM::honour_configure_request(XConfigureRequestEvent *ev) {
-
-    DEBUG_PRINT("[WM] honour_configure_request win=0x%lx x=%d y=%d w=%d h=%d mask=0x%lx\n",
-                ev->window, ev->x, ev->y, ev->width, ev->height, ev->value_mask);
-    Window w = ev->window;
-
-    XWindowChanges wc{};
-    wc.x            = ev->x;
-    wc.y            = ev->y;
-    wc.width        = ev->width;
-    wc.height       = ev->height;
-    wc.border_width = ev->border_width;
-    wc.sibling      = ev->above;
-    wc.stack_mode   = ev->detail;
-
-    // Honour the client's requested position too. Plugins (esp. JUCE menus)
-    // specify their own on-screen location via the ConfigureRequest / size
-    // hints; stripping CWX|CWY is what made menus land center-screen.
-    unsigned long mask = ev->value_mask;
-
-    // If the client didn't put a position in the ConfigureRequest, fall back
-    // to its WM_NORMAL_HINTS program/user-specified location (gravity Static).
-    if (!(mask & (CWX | CWY))) {
-        XSizeHints hints{}; long supplied = 0;
-        if (XGetWMNormalHints(dpy_, w, &hints, &supplied) &&
-            (hints.flags & (PPosition | USPosition))) {
-            wc.x = hints.x;
-            wc.y = hints.y;
-            mask |= CWX | CWY;
+void XWaylandWM::honour_configure_request(xcb_configure_request_event_t *ev) {
+    xcb_configure_window_value_list_t values = {};
+    values.x = ev->x; values.y = ev->y;
+    values.width = ev->width; values.height = ev->height;
+    values.border_width = ev->border_width;
+    values.sibling = ev->sibling; values.stack_mode = ev->stack_mode;
+    uint16_t mask = ev->value_mask;
+    if (!(mask & (XCB_CONFIG_WINDOW_X | XCB_CONFIG_WINDOW_Y))) {
+        xcb_size_hints_t hints = {};
+        if (xcb_icccm_get_wm_normal_hints_reply(connection_,
+            xcb_icccm_get_wm_normal_hints(connection_, ev->window), &hints, nullptr) &&
+            (hints.flags & (XCB_ICCCM_SIZE_HINT_P_POSITION | XCB_ICCCM_SIZE_HINT_US_POSITION))) {
+            values.x = hints.x; values.y = hints.y;
+            mask |= XCB_CONFIG_WINDOW_X | XCB_CONFIG_WINDOW_Y;
         }
     }
-
-    if (mask)
-        XConfigureWindow(dpy_, w, mask, &wc);
-
-    // Always send synthetic ConfigureNotify so client knows its actual position
-    // This stops the client from looping waiting for acknowledgment
-    XWindowAttributes attr{};
-    if (XGetWindowAttributes(dpy_, w, &attr)) {
-        XEvent synth{};
-        synth.type                       = ConfigureNotify;
-        synth.xconfigure.event           = w;
-        synth.xconfigure.window          = w;
-        synth.xconfigure.x               = attr.x;
-        synth.xconfigure.y               = attr.y;
-        synth.xconfigure.width           = attr.width;
-        synth.xconfigure.height          = attr.height;
-        synth.xconfigure.border_width    = attr.border_width;
-        synth.xconfigure.above           = None;
-        synth.xconfigure.override_redirect = attr.override_redirect;
-        XSendEvent(dpy_, w, False, StructureNotifyMask, &synth);
+    if (mask) xcb_configure_window_aux(connection_, ev->window, mask, &values);
+    xcb_get_geometry_reply_t *geometry = xcb_get_geometry_reply(connection_,
+        xcb_get_geometry(connection_, ev->window), nullptr);
+    if (geometry) {
+        xcb_configure_notify_event_t event = {};
+        event.response_type = XCB_CONFIGURE_NOTIFY;
+        event.event = event.window = ev->window;
+        event.x = geometry->x; event.y = geometry->y;
+        event.width = geometry->width; event.height = geometry->height;
+        event.border_width = geometry->border_width;
+        xcb_send_event(connection_, false, ev->window, XCB_EVENT_MASK_STRUCTURE_NOTIFY, (const char*)&event);
+        free(geometry);
     }
-
-    DEBUG_PRINT("[WM] XConfigureWindow done for 0x%lx\n", w);
-    XFlush(dpy_);
+    xcb_flush(connection_);
 }
 
 // ─── ReparentNotify ───────────────────────────────────────────────────────────
-bool XWaylandWM::on_reparent_notify(XReparentEvent *ev) {
+bool XWaylandWM::on_reparent_notify(xcb_reparent_notify_event_t *ev) {
     // A window moved under root became a toplevel without a CreateNotify there,
     // so it needs the commit block too (see disallow_commits).
-    if (ev->parent == DefaultRootWindow(dpy_)) {
+    if (ev->parent == root_) {
         disallow_commits(ev->window);
         return false;
     }
@@ -455,90 +400,62 @@ bool XWaylandWM::on_reparent_notify(XReparentEvent *ev) {
 }
 
 // ─── UnmapNotify ──────────────────────────────────────────────────────────────
-bool XWaylandWM::on_unmap_notify(XUnmapEvent *ev) {
+bool XWaylandWM::on_unmap_notify(xcb_unmap_notify_event_t *ev) {
     auto it = states_.find(ev->window);
     if (it == states_.end()) return false;
 
     set_wm_state(ev->window, WM_STATE_WITHDRAWN);
+    if (pending_focus_ == ev->window) pending_focus_ = XCB_NONE;
 
     return false; // let bridge also handle
 }
 
 // ─── DestroyNotify ────────────────────────────────────────────────────────────
-bool XWaylandWM::on_destroy_notify(XDestroyWindowEvent *ev) {
+bool XWaylandWM::on_destroy_notify(xcb_destroy_notify_event_t *ev) {
     untrack_window(ev->window);
     return false;
 }
 
 // ─── WM_TAKE_FOCUS / WM_DELETE_WINDOW ────────────────────────────────────────
-// Obtain a valid server timestamp (ICCCM forbids CurrentTime for WM_TAKE_FOCUS).
-// Trick: do a zero-length append to a property on our support window and read
-// the timestamp back off the resulting PropertyNotify.
-Time XWaylandWM::get_server_time() {
-    if (support_win_ == None) return CurrentTime; // last resort
-    static Atom timestamp_atom = XInternAtom(dpy_, "_REAPERX_TIMESTAMP", False);
-    XSelectInput(dpy_, support_win_, PropertyChangeMask);
-    XChangeProperty(dpy_, support_win_, timestamp_atom, XA_ATOM, 32,
-                    PropModeAppend, nullptr, 0);
-    XFlush(dpy_);
-    for (;;) {
-        XEvent ev;
-        XWindowEvent(dpy_, support_win_, PropertyChangeMask, &ev);
-        if (ev.type == PropertyNotify &&
-            ev.xproperty.atom == timestamp_atom) {
-            return ev.xproperty.time;
-        }
-    }
-}
-
-void XWaylandWM::send_take_focus(Window w, Time t) {
-    xwm_send_protocol_message(dpy_, w, atoms_.WM_TAKE_FOCUS, t);
+void XWaylandWM::send_take_focus(Window w, xcb_timestamp_t t) {
+    xcb_client_message_event_t event = {};
+    event.response_type = XCB_CLIENT_MESSAGE;
+    event.window = w;
+    event.type = atoms_.WM_PROTOCOLS;
+    event.format = 32;
+    event.data.data32[0] = atoms_.WM_TAKE_FOCUS;
+    event.data.data32[1] = t;
+    xcb_send_event(connection_, false, w, XCB_EVENT_MASK_NO_EVENT, (const char*)&event);
 }
 
 // ─── WM_STATE property helper ─────────────────────────────────────────────────
 // ICCCM §4.1.3.1  WM_STATE = { state, icon_window }
 void XWaylandWM::set_wm_state(Window w, int state) {
-    long data[2] = { state, None };
-    XChangeProperty(dpy_, w,
-                    atoms_.WM_STATE, atoms_.WM_STATE, 32,
-                    PropModeReplace, (unsigned char*)data, 2);
+    const uint32_t data[] = { (uint32_t)state, XCB_NONE };
+    xcb_change_property(connection_, XCB_PROP_MODE_REPLACE, w, atoms_.WM_STATE, atoms_.WM_STATE, 32, 2, data);
 }
 
 // ─── Read WM_PROTOCOLS ────────────────────────────────────────────────────────
 void XWaylandWM::read_wm_protocols(Window w, WMWindowState &st) {
-    Atom *protocols = nullptr;
-    int n = 0;
-    if (XGetWMProtocols(dpy_, w, &protocols, &n)) {
-        for (int i = 0; i < n; ++i) {
-            if (protocols[i] == atoms_.WM_TAKE_FOCUS)
-                st.take_focus = true;
-        }
-        XFree(protocols);
-    }
+    st.take_focus = false;
+    xcb_icccm_get_wm_protocols_reply_t protocols;
+    if (!xcb_icccm_get_wm_protocols_reply(connection_,
+        xcb_icccm_get_wm_protocols(connection_, w, atoms_.WM_PROTOCOLS), &protocols, nullptr)) return;
+    for (uint32_t i = 0; i < protocols.atoms_len; ++i)
+        if (protocols.atoms[i] == atoms_.WM_TAKE_FOCUS) st.take_focus = true;
+    xcb_icccm_get_wm_protocols_reply_wipe(&protocols);
 }
 
 // ─── Read WM_HINTS ────────────────────────────────────────────────────────────
 void XWaylandWM::read_wm_hints(Window w, WMWindowState &st) {
-    XWMHints *hints = XGetWMHints(dpy_, w);
-    if (!hints) return;
-    if (hints->flags & InputHint)
-        st.input_hint = (hints->input != 0);
-    XFree(hints);
+    xcb_icccm_wm_hints_t hints;
+    st.input_hint = true;
+    if (xcb_icccm_get_wm_hints_reply(connection_, xcb_icccm_get_wm_hints(connection_, w), &hints, nullptr) &&
+        (hints.flags & XCB_ICCCM_WM_HINT_INPUT)) st.input_hint = hints.input;
 }
 
 
-void xwm_send_protocol_message(Display *dpy, Window w, Atom protocol, Time t) {
-    Atom wm_protocols = XInternAtom(dpy, "WM_PROTOCOLS", False);
-    XEvent ev{};
-    ev.type                 = ClientMessage;
-    ev.xclient.window       = w;
-    ev.xclient.message_type = wm_protocols;
-    ev.xclient.format       = 32;
-    ev.xclient.data.l[0]    = (long)protocol;
-    ev.xclient.data.l[1]    = (long)t;
-    XSendEvent(dpy, w, False, NoEventMask, &ev);
-    XFlush(dpy);
-}
+
 
 bool is_window_from_owned_plugin(Display *dpy, Window org_win, Window gui_win) {
     // Check if this window has the same PID as our plugin
@@ -705,86 +622,70 @@ bool classify_popup(Display *dpy, Window win, XWindowAttributes *attr) {
 
 void XWaylandWM::dnd_init()
 {
-    if (!dpy_ || dnd_catcher_) return;
-
-    int err_base = 0;
-    if (!XFixesQueryExtension(dpy_, &dnd_xfixes_evt_base_, &err_base)) {
-        return;
-    }
-
-    a_XdndSelection_  = XInternAtom(dpy_, "XdndSelection",  False);
-    a_XdndAware_      = XInternAtom(dpy_, "XdndAware",      False);
-    a_XdndEnter_      = XInternAtom(dpy_, "XdndEnter",      False);
-    a_XdndPosition_   = XInternAtom(dpy_, "XdndPosition",   False);
-    a_XdndStatus_     = XInternAtom(dpy_, "XdndStatus",     False);
-    a_XdndDrop_       = XInternAtom(dpy_, "XdndDrop",       False);
-    a_XdndFinished_   = XInternAtom(dpy_, "XdndFinished",   False);
-    a_XdndLeave_      = XInternAtom(dpy_, "XdndLeave",      False);
-    a_XdndActionCopy_ = XInternAtom(dpy_, "XdndActionCopy", False);
-    a_uri_list_       = XInternAtom(dpy_, "text/uri-list",  False);
-    a_dnd_prop_       = XInternAtom(dpy_, "XWB_DND_DATA",   False);
-
-    const int scr  = DefaultScreen(dpy_);
-    Window     root = RootWindow(dpy_, scr);
-
-    XSetWindowAttributes swa;
-    swa.override_redirect = True;   // the WM must not manage or reparent this
-    dnd_catcher_ = XCreateWindow(dpy_, root, 0, 0,
-                                  WidthOfScreen(ScreenOfDisplay(dpy_, scr)),
-                                  HeightOfScreen(ScreenOfDisplay(dpy_, scr)),
-                                  0, CopyFromParent, InputOnly, CopyFromParent,
-                                  CWOverrideRedirect, &swa);
-
-    const long ver = 5;   // XDND protocol version
-    XChangeProperty(dpy_, dnd_catcher_, a_XdndAware_, XA_ATOM, 32,
-                    PropModeReplace, (unsigned char*)&ver, 1);
-
-    // Tell us when someone takes the XdndSelection -- that is a drag starting.
-    XFixesSelectSelectionInput(dpy_, root, a_XdndSelection_,
-                               XFixesSetSelectionOwnerNotifyMask);
-    XFlush(dpy_);
+    if (dnd_catcher_) return;
+    const xcb_query_extension_reply_t *extension = xcb_get_extension_data(connection_, &xcb_xfixes_id);
+    if (!extension || !extension->present) return;
+    xcb_xfixes_query_version_reply_t *version = xcb_xfixes_query_version_reply(connection_,
+        xcb_xfixes_query_version(connection_, 5, 0), nullptr);
+    if (!version) return;
+    free(version);
+    dnd_xfixes_evt_base_ = extension->first_event;
+    xcb_screen_t *screen = xcb_setup_roots_iterator(xcb_get_setup(connection_)).data;
+    dnd_catcher_ = xcb_generate_id(connection_);
+    const uint32_t override_redirect = true;
+    xcb_create_window(connection_, XCB_COPY_FROM_PARENT, dnd_catcher_, root_, 0, 0,
+        screen->width_in_pixels, screen->height_in_pixels, 0, XCB_WINDOW_CLASS_INPUT_ONLY,
+        XCB_COPY_FROM_PARENT, XCB_CW_OVERRIDE_REDIRECT, &override_redirect);
+    const uint32_t ver = 5;
+    xcb_change_property(connection_, XCB_PROP_MODE_REPLACE, dnd_catcher_, atoms_.XdndAware,
+                        XCB_ATOM_ATOM, 32, 1, &ver);
+    xcb_xfixes_select_selection_input(connection_, root_, atoms_.XdndSelection,
+                                      XCB_XFIXES_SELECTION_EVENT_MASK_SET_SELECTION_OWNER);
+    xcb_flush(connection_);
 }
 
 // Mapped only while a drag is in flight: an InputOnly window under the pointer would
 // otherwise swallow the XTest events used to drive plugins.
 void XWaylandWM::dnd_catcher_show(bool on)
 {
-    if (!dnd_catcher_ || !dpy_) return;
-    if (on) { XMapRaised(dpy_, dnd_catcher_); }
-    else    { XUnmapWindow(dpy_, dnd_catcher_); dnd_source_ = 0; }
-    XFlush(dpy_);
+    if (!dnd_catcher_) return;
+    if (on) {
+        const uint32_t above = XCB_STACK_MODE_ABOVE;
+        xcb_configure_window(connection_, dnd_catcher_, XCB_CONFIG_WINDOW_STACK_MODE, &above);
+        xcb_map_window(connection_, dnd_catcher_);
+    } else {
+        xcb_unmap_window(connection_, dnd_catcher_);
+        dnd_source_ = XCB_NONE;
+    }
+    xcb_flush(connection_);
 }
 
-void XWaylandWM::dnd_send_status(Window src, bool accept)
+void XWaylandWM::dnd_send_status(Window src, bool accepted)
 {
-    XClientMessageEvent m; memset(&m, 0, sizeof(m));
-    m.type         = ClientMessage;
-    m.display      = dpy_;
-    m.window       = src;
-    m.message_type = a_XdndStatus_;
-    m.format       = 32;
-    m.data.l[0]    = (long)dnd_catcher_;
-    m.data.l[1]    = accept ? 1 : 0;   // bit 0: will accept
-    m.data.l[2]    = 0;                // no silent rect: keep the positions coming
-    m.data.l[3]    = 0;
-    m.data.l[4]    = accept ? (long)a_XdndActionCopy_ : None;
-    XSendEvent(dpy_, src, False, NoEventMask, (XEvent*)&m);
-    XFlush(dpy_);
+    xcb_client_message_event_t event = {};
+    event.response_type = XCB_CLIENT_MESSAGE;
+    event.window = src;
+    event.type = atoms_.XdndStatus;
+    event.format = 32;
+    event.data.data32[0] = dnd_catcher_;
+    event.data.data32[1] = accepted ? 1 : 0;
+    event.data.data32[4] = accepted ? atoms_.XdndActionCopy : XCB_NONE;
+    xcb_send_event(connection_, false, src, XCB_EVENT_MASK_NO_EVENT, (const char*)&event);
+    xcb_flush(connection_);
 }
 
 void XWaylandWM::dnd_send_finished(Window src, bool accepted)
 {
-    XClientMessageEvent m; memset(&m, 0, sizeof(m));
-    m.type         = ClientMessage;
-    m.display      = dpy_;
-    m.window       = src;
-    m.message_type = a_XdndFinished_;
-    m.format       = 32;
-    m.data.l[0]    = (long)dnd_catcher_;
-    m.data.l[1]    = accepted ? 1 : 0;
-    m.data.l[2]    = accepted ? (long)a_XdndActionCopy_ : None;
-    XSendEvent(dpy_, src, False, NoEventMask, (XEvent*)&m);
-    XFlush(dpy_);
+    xcb_client_message_event_t event = {};
+    event.response_type = XCB_CLIENT_MESSAGE;
+    event.window = src;
+    event.type = atoms_.XdndFinished;
+    event.format = 32;
+    event.data.data32[0] = dnd_catcher_;
+    event.data.data32[1] = accepted ? 1 : 0;
+    event.data.data32[2] = accepted ? atoms_.XdndActionCopy : XCB_NONE;
+    xcb_send_event(connection_, false, src, XCB_EVENT_MASK_NO_EVENT, (const char*)&event);
+    xcb_flush(connection_);
 }
 
 // Clears the fetched/pending payload. Called whenever a drag concludes (Drop or
@@ -799,32 +700,32 @@ void XWaylandWM::dnd_reset_payload()
 }
 
 // Returns true if the event was part of a plugin drag-out and is fully handled.
-bool XWaylandWM::dnd_handle_event(XEvent *ev)
+bool XWaylandWM::dnd_handle_event(xcb_generic_event_t *ev)
 {
-    if (!dnd_catcher_ || !dpy_) return false;
+    if (!dnd_catcher_ || !connection_) return false;
 
     // Drag started / ended: yabridge (un)claims XdndSelection.
     if (dnd_xfixes_evt_base_ >= 0 &&
-        ev->type == dnd_xfixes_evt_base_ + XFixesSelectionNotify)
+        (ev->response_type & 0x7f) == dnd_xfixes_evt_base_ + XCB_XFIXES_SELECTION_NOTIFY)
     {
-        XFixesSelectionNotifyEvent *se = (XFixesSelectionNotifyEvent*)ev;
-        if (se->selection == a_XdndSelection_) {
+        xcb_xfixes_selection_notify_event_t *se = (xcb_xfixes_selection_notify_event_t*)ev;
+        if (se->selection == atoms_.XdndSelection) {
             if (se->owner != None) dnd_reset_payload();
             dnd_catcher_show(se->owner != None);
         }
         return true;
     }
 
-    if (ev->type == ClientMessage && ev->xclient.window == dnd_catcher_)
+    if ((ev->response_type & 0x7f) == XCB_CLIENT_MESSAGE && ((xcb_client_message_event_t*)ev)->window == dnd_catcher_)
     {
-        const Atom   mt  = ev->xclient.message_type;
-        const Window src = (Window)ev->xclient.data.l[0];
+        const Atom   mt  = ((xcb_client_message_event_t*)ev)->type;
+        const Window src = (Window)((xcb_client_message_event_t*)ev)->data.data32[0];
 
-        if (mt == a_XdndEnter_) {
+        if (mt == atoms_.XdndEnter) {
             dnd_source_ = src;
             return true;
         }
-        if (mt == a_XdndPosition_) {
+        if (mt == atoms_.XdndPosition) {
             // Accepting is what lets yabridge's drag loop proceed and release its
             // pointer grab, which is what unfreezes the plugin.
             dnd_send_status(src, true);
@@ -837,24 +738,23 @@ bool XWaylandWM::dnd_handle_event(XEvent *ev)
             if (!dnd_requested_) {
                 dnd_requested_ = true;
                 dnd_source_    = src;
-                XConvertSelection(dpy_, a_XdndSelection_, a_uri_list_,
-                                  a_dnd_prop_, dnd_catcher_, CurrentTime);
-                XFlush(dpy_);
+                xcb_convert_selection(connection_, dnd_catcher_, atoms_.XdndSelection, atoms_.uri_list,
+                                      atoms_.dnd_data, XCB_CURRENT_TIME);
+                xcb_flush(connection_);
             }
             return true;
         }
-        if (mt == a_XdndLeave_) {
+        if (mt == atoms_.XdndLeave) {
             dnd_catcher_show(false);
             dnd_reset_payload();
             return true;
         }
-        if (mt == a_XdndDrop_) {
+        if (mt == atoms_.XdndDrop) {
             if (!dnd_have_uri_) {   // fallback: ask now, late but better than never
-                const Time when = (Time)ev->xclient.data.l[2];
-                XConvertSelection(dpy_, a_XdndSelection_, a_uri_list_,
-                                  a_dnd_prop_, dnd_catcher_,
-                                  when ? when : CurrentTime);
-                XFlush(dpy_);
+                const Time when = (Time)((xcb_client_message_event_t*)ev)->data.data32[2];
+                xcb_convert_selection(connection_, dnd_catcher_, atoms_.XdndSelection, atoms_.uri_list,
+                                      atoms_.dnd_data, when);
+                xcb_flush(connection_);
                 dnd_source_ = src;
                 return true;
             }
@@ -866,25 +766,21 @@ bool XWaylandWM::dnd_handle_event(XEvent *ev)
         return true;
     }
 
-    if (ev->type == SelectionNotify && ev->xselection.requestor == dnd_catcher_)
+    if ((ev->response_type & 0x7f) == XCB_SELECTION_NOTIFY && ((xcb_selection_notify_event_t*)ev)->requestor == dnd_catcher_)
     {
-        Atom  actual = None; int fmt = 0;
-        unsigned long n = 0, after = 0; unsigned char *data = nullptr;
-        if (ev->xselection.property != None &&
-            XGetWindowProperty(dpy_, dnd_catcher_, a_dnd_prop_, 0, 65536, True,
-                               AnyPropertyType, &actual, &fmt, &n, &after, &data)
-            == Success && data)
-        {
-            size_t len = (size_t)n;
-            if (len >= sizeof(dnd_uri_)) len = sizeof(dnd_uri_) - 1;
-            memcpy(dnd_uri_, data, len);
-            dnd_uri_[len] = 0;
-            dnd_have_uri_ = true;
-            dnd_pending_  = true;
-            XFree(data);
-            // The caller's dnd_has_pending()/dnd_take_pending_path() pick this up from
-            // a real input event handler to start its native drag while the button is
-            // still held.
+        if (((xcb_selection_notify_event_t*)ev)->property != XCB_NONE) {
+            xcb_get_property_reply_t *reply = xcb_get_property_reply(connection_,
+                xcb_get_property(connection_, true, dnd_catcher_, atoms_.dnd_data,
+                                 atoms_.uri_list, 0, sizeof(dnd_uri_) / 4), nullptr);
+            if (reply && reply->format == 8 && !reply->bytes_after) {
+                size_t len = xcb_get_property_value_length(reply);
+                if (len < sizeof(dnd_uri_)) {
+                    memcpy(dnd_uri_, xcb_get_property_value(reply), len);
+                    dnd_uri_[len] = 0;
+                    dnd_have_uri_ = dnd_pending_ = true;
+                }
+            }
+            free(reply);
         }
         return true;
     }
@@ -944,10 +840,14 @@ void XWaylandWM::dnd_release_source_button(Display *dpy)
     // (more XdndPosition traffic keeps arriving afterwards) before eventually giving
     // up via XdndLeave rather than resolving via XdndDrop; a coincident motion+release
     // pair is closer to what a real release looks like than a release alone.
-    Window root_ret, child_ret; int rx, ry, wx, wy; unsigned int mask;
-    if (XQueryPointer(dpy, DefaultRootWindow(dpy), &root_ret, &child_ret,
-                      &rx, &ry, &wx, &wy, &mask))
-        XTestFakeMotionEvent(dpy, DefaultScreen(dpy), rx, ry, CurrentTime);
-    XTestFakeButtonEvent(dpy, 1, False, CurrentTime);
-    XSync(dpy, False);   // make sure it has actually landed before we move on
+    xcb_connection_t *connection = XGetXCBConnection(dpy);
+    xcb_query_pointer_reply_t *pointer = xcb_query_pointer_reply(connection,
+        xcb_query_pointer(connection, root_), nullptr);
+    if (pointer) {
+        xcb_test_fake_input(connection, XCB_MOTION_NOTIFY, 0, XCB_CURRENT_TIME,
+                            root_, pointer->root_x, pointer->root_y, 0);
+        free(pointer);
+    }
+    xcb_test_fake_input(connection, XCB_BUTTON_RELEASE, 1, XCB_CURRENT_TIME, root_, 0, 0, 0);
+    free(xcb_get_input_focus_reply(connection, xcb_get_input_focus(connection), nullptr));
 }
