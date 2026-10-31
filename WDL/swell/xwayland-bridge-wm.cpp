@@ -26,6 +26,8 @@
 #include <cstdio>
 #include <cstdlib>
 #include <unistd.h>
+#include <sys/wait.h>
+#include <errno.h>
 #include <sys/prctl.h>
 #include <signal.h>
 #include <glib.h>
@@ -42,6 +44,7 @@ XWaylandWM::XWaylandWM(Display *dpy) : dpy_(dpy) {
 // owning its own X connection, process, and event loop.
 
 static pid_t s_xwayland_pid = 0;
+static char s_xwayland_display[32];
 
 static int wm_x11_error_handler(Display *dpy, XErrorEvent *err)
 {
@@ -100,24 +103,30 @@ static gboolean wm_event_dispatch(GSource *, GSourceFunc, gpointer)
     return TRUE;
 }
 
-XWaylandWM* XWaylandWM::init_bridge_wm(const char *display_name)
+const char *XWaylandWM::display_name()
+{
+    return s_xwayland_display;
+}
+
+XWaylandWM* XWaylandWM::init_bridge_wm()
 {
     if (s_xwayland_pid > 0) return g_wm;
 
-    s_xwayland_pid = xw_spawn_xwayland(display_name);
+    s_xwayland_pid = xw_spawn_xwayland(s_xwayland_display, sizeof(s_xwayland_display));
     if (s_xwayland_pid < 0) return nullptr;
 
-    setenv("DISPLAY", display_name, 1);
     XInitThreads();
     XSetErrorHandler(wm_x11_error_handler);
 
-    for (int i = 0; i < 30; i++) {
-        g_wm_dpy = XOpenDisplay(display_name);
-        if (g_wm_dpy) break;
-        usleep(100000);
+    g_wm_dpy = XOpenDisplay(s_xwayland_display);
+    if (!g_wm_dpy) {
+        kill(s_xwayland_pid, SIGTERM);
+        while (waitpid(s_xwayland_pid, nullptr, 0) < 0 && errno == EINTR) {}
+        s_xwayland_pid = 0;
+        return nullptr;
     }
-    if (!g_wm_dpy) { DEBUG_PRINT("[WM] Xwayland not ready\n"); return nullptr; }
 
+    setenv("DISPLAY", s_xwayland_display, 1);
     g_wm = new XWaylandWM(g_wm_dpy);
 
     Window support = XCreateSimpleWindow(g_wm_dpy, DefaultRootWindow(g_wm_dpy),
