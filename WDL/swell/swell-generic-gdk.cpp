@@ -1892,7 +1892,14 @@ static gboolean swell_wayland_draw(GtkWidget *widget, cairo_t *cr, gpointer data
   if (window != hwnd->m_oswindow || !gtk_cairo_should_draw_window(cr, window)) return FALSE;
   GdkEventExpose exp = {};
   exp.window = window;
+  cairo_save(cr);
+  cairo_region_t *region = gdk_window_get_visible_region(window);
+  xw_clip_capture_regions(window, region);
+  gdk_cairo_region(cr, region);
+  cairo_region_destroy(region);
+  cairo_clip(cr);
   if (gdk_cairo_get_clip_rectangle(cr, &exp.area)) OnExposeEvent(&exp, cr);
+  cairo_restore(cr);
   return FALSE;
 }
 #endif

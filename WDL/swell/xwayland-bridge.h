@@ -42,5 +42,6 @@ bool xw_bridge_forward_key(HWND hwnd, int keycode, int state, bool is_press);
 bool xw_bridge_forward_key_to_modal(int keycode, int state, bool is_press);
 bool xw_bridge_swell_on_button_event_escape();
 bool xw_bridge_swell_on_gdk_delete_release();
+void xw_clip_capture_regions(GdkWindow *window, cairo_region_t *region);
 extern XWaylandWM *g_wm;
 extern Display *g_wm_dpy;
