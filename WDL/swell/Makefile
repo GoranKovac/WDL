@@ -111,8 +111,8 @@ OBJS = $(SWELL_OBJS)
 #Wayland (SWELL_TARGET_WAYLAND) depends on GTK3 so load it automatically
 ifdef WAYLAND
   SWELL_OBJS += xwayland-bridge.o xwayland-bridge-wm.o xwayland-bridge-display.o xwayland-bridge-gl.o xwayland-bridge-image.o
-  CFLAGS += $(shell $(PKG_CONFIG) --cflags wayland-client xrandr x11-xcb xcb-shm xcb-dri3 xcb-sync xcb-composite xcb-ewmh xcb-icccm xcb-xtest xcb-xfixes xcb-image xcb-renderutil cairo-xcb epoxy libdrm)
-  LINKEXTRA += -lXcomposite -lXtst -lXfixes -lXext $(shell $(PKG_CONFIG) --libs wayland-client xrandr x11-xcb xcb-shm xcb-dri3 xcb-sync xcb-composite xcb-ewmh xcb-icccm xcb-xtest xcb-xfixes xcb-image xcb-renderutil cairo-xcb epoxy libdrm)
+  CFLAGS += $(shell $(PKG_CONFIG) --cflags wayland-client xcb-keysyms xcb-randr xcb-damage xcb-shape xcb-shm xcb-dri3 xcb-sync xcb-composite xcb-ewmh xcb-icccm xcb-xtest xcb-xfixes xcb-image xcb-renderutil cairo-xcb epoxy libdrm)
+  LINKEXTRA += $(shell $(PKG_CONFIG) --libs wayland-client xcb-keysyms xcb-randr xcb-damage xcb-shape xcb-shm xcb-dri3 xcb-sync xcb-composite xcb-ewmh xcb-icccm xcb-xtest xcb-xfixes xcb-image xcb-renderutil cairo-xcb epoxy libdrm)
   override SWELL_GDK_ONLY =
   # spare-window for modal dialogs doesn't resize on an already 
 	# mapped Wayland so disable it
@@ -194,10 +194,10 @@ swell-modstub-generic.o: $(SWELL_HEADERS)
 swell-appstub-generic.o: $(SWELL_HEADERS)
 swell-generic-gdk.o xwayland-bridge.o: $(SWELL_HEADERS)
 swell-generic-gdk.o xwayland-bridge.o: xwayland-bridge.h
-xwayland-bridge.o xwayland-bridge-wm.o: xwayland-bridge-wm.h
+xwayland-bridge.o xwayland-bridge-wm.o: xwayland-bridge-wm.h swell-xcb.h
 xwayland-bridge-wm.o xwayland-bridge-display.o: xwayland-bridge-display.h
 xwayland-bridge.o xwayland-bridge-gl.o: xwayland-bridge-gl.h
-xwayland-bridge.o xwayland-bridge-gl.o xwayland-bridge-image.o: xwayland-bridge-image.h
+xwayland-bridge.o xwayland-bridge-gl.o xwayland-bridge-image.o: xwayland-bridge-image.h swell-xcb.h
 
 libSwell$(DLL_EXT): $(OBJS)
 	$(CXX) -shared -o $@ $(CFLAGS) $(LFLAGS) $^ $(LINKEXTRA)

@@ -45,4 +45,3 @@ bool xw_bridge_swell_on_gdk_delete_release();
 bool xw_bridge_has_pending_draw();
 void xw_clip_capture_regions(GdkWindow *window, cairo_region_t *region);
 extern XWaylandWM *g_wm;
-extern Display *g_wm_dpy;

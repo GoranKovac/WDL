@@ -2204,7 +2204,7 @@ static void OnKeyEvent(GdkEventKey *k)
 
     // No modal, but a plugin popup may still be open. Nothing else dismisses it on the
     // key path, so its grab stays and wedges further input.
-    if (k->type == GDK_KEY_PRESS && g_wm_dpy && xw_bridge_swell_on_button_event_escape())
+    if (k->type == GDK_KEY_PRESS && xw_bridge_swell_on_button_event_escape())
       return;
   }
 #endif
@@ -2638,7 +2638,7 @@ static void OnButtonEvent(GdkEventButton *b)
 
 #ifdef SWELL_TARGET_WAYLAND
   // Popup-dismiss workaround and raise modals to unstick an open plugin popup
-    if (b->type == GDK_BUTTON_PRESS && g_wm_dpy){
+    if (b->type == GDK_BUTTON_PRESS){
         if (xw_bridge_swell_on_button_event_escape()) return;
     }
 #endif
@@ -3021,7 +3021,7 @@ static void swell_gdkEventHandler(GdkEvent *evt, gpointer data)
        // mapped when its parent (the FX window) closes, the compositor raises a
        // protocol error that kills GTK's Wayland connection and hangs REAPER. With
        // the canvas destroyed first, the close can proceed normally.
-       if (g_wm_dpy) xw_bridge_swell_on_gdk_delete_release();
+       xw_bridge_swell_on_gdk_delete_release();
 #endif
        if (hwnd && IsWindowEnabled(hwnd) &&
            !DestroyPopupMenus() && // ignore if a menu is open, instead just close the menu
