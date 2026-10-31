@@ -169,6 +169,32 @@ struct Capture {
 };
 
 static std::map<Window, Capture*> g_captures;
+
+void xw_clip_capture_regions(GdkWindow *window, cairo_region_t *region)
+{
+    for (auto &kv : g_captures) {
+        Capture *c = kv.second;
+        if (kv.first != c->parent_win || !c->widget || !c->pixmap || !c->visual ||
+            !gtk_widget_get_mapped(c->widget) || !gtk_widget_get_has_window(c->widget) ||
+            gtk_widget_get_opacity(c->widget) != 1.0) continue;
+        GtkWidget *top = gtk_widget_get_toplevel(c->widget);
+        if (gtk_widget_get_window(top) != window) continue;
+        XRenderPictFormat *format = XRenderFindVisualFormat(c->dpy, c->visual);
+        if (!format || format->type != PictTypeDirect || format->direct.alphaMask) continue;
+        int x, y;
+        if (!gtk_widget_translate_coordinates(c->widget, top, 0, 0, &x, &y)) continue;
+        const int scale = swell_gdk_widget_scale(c->widget);
+        cairo_rectangle_int_t rect = { 0, 0,
+            min(gtk_widget_get_allocated_width(c->widget), c->pixmap_w / scale),
+            min(gtk_widget_get_allocated_height(c->widget), c->pixmap_h / scale) };
+        cairo_region_t *visible = gdk_window_get_visible_region(gtk_widget_get_window(c->widget));
+        cairo_region_intersect_rectangle(visible, &rect);
+        cairo_region_translate(visible, x, y);
+        cairo_region_subtract(region, visible);
+        cairo_region_destroy(visible);
+    }
+}
+
 static int g_damage_event_base = -1;
 static int g_shape_event_base = -1;
 int g_bridge_damage_error_base = -1;
