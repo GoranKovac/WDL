@@ -16,6 +16,8 @@
 #include <X11/keysym.h>
 #include <X11/Xlib-xcb.h>
 #include <xcb/xcb_renderutil.h>
+#include <xcb/damage.h>
+#include <xcb/shape.h>
 #include <stdint.h>
 #include <unistd.h>
 void xw_size(HWND hwnd);
@@ -1216,7 +1218,7 @@ static bool on_popup_configured(Window w, int cw, int ch)
     return false;
 }
 
-static void handle_damage_notify(XDamageNotifyEvent *de)
+static void handle_damage_notify(xcb_damage_notify_event_t *de)
 {
     DEBUG_PRINT("damage: %dx%d+%d+%d\n",
         de->area.width, de->area.height, de->area.x, de->area.y);
@@ -1264,12 +1266,12 @@ static void handle_damage_notify(XDamageNotifyEvent *de)
     }
 }
 
-static void handle_xdnd_from_plugin(XClientMessageEvent *xce)
+static void handle_xdnd_from_plugin(xcb_client_message_event_t *xce)
 {
-    Display *dpy   = xce->display;
-    const Atom mt  = xce->message_type;
+    Display *dpy   = g_wm_dpy;
+    const Atom mt  = xce->type;
     const Window self = xce->window;
-    const Window src  = (Window)xce->data.l[0];
+    const Window src  = (Window)xce->data.data32[0];
 
     if (src && mt == XInternAtom(dpy, "XdndPosition", False))
     {
@@ -1305,28 +1307,29 @@ static void handle_xdnd_from_plugin(XClientMessageEvent *xce)
     }
 }
 
-static void bridge_handle_event(XEvent *ev)
+static void bridge_handle_event(xcb_generic_event_t *ev)
 {
+    const uint8_t type = ev->response_type & 0x7f;
     Window dnd_catcher = g_wm ? g_wm->dnd_catcher_window() : 0;
     if (dnd_catcher &&
-        ((ev->type == MapNotify   && ev->xmap.window   == dnd_catcher) ||
-         (ev->type == UnmapNotify && ev->xunmap.window == dnd_catcher) ||
-         (ev->type == ClientMessage && ev->xclient.window == dnd_catcher)))
+        ((type == XCB_MAP_NOTIFY   && ((xcb_map_notify_event_t*)ev)->window   == dnd_catcher) ||
+         (type == XCB_UNMAP_NOTIFY && ((xcb_unmap_notify_event_t*)ev)->window == dnd_catcher) ||
+         (type == XCB_CLIENT_MESSAGE && ((xcb_client_message_event_t*)ev)->window == dnd_catcher)))
         return;
 
-    if (g_damage_event_base >= 0 && ev->type == g_damage_event_base + XDamageNotify) {
-        handle_damage_notify((XDamageNotifyEvent *)ev);
+    if (g_damage_event_base >= 0 && type == g_damage_event_base + XCB_DAMAGE_NOTIFY) {
+        handle_damage_notify((xcb_damage_notify_event_t *)ev);
         return;
     }
 
-    if (g_shape_event_base >= 0 && ev->type == g_shape_event_base + ShapeNotify) {
-        XShapeEvent *shape = (XShapeEvent *)ev;
-        if (shape->kind != ShapeBounding) return;
+    if (g_shape_event_base >= 0 && type == g_shape_event_base + XCB_SHAPE_NOTIFY) {
+        xcb_shape_notify_event_t *shape = (xcb_shape_notify_event_t *)ev;
+        if (shape->shape_kind != XCB_SHAPE_SK_BOUNDING) return;
         for (auto &kv : g_captures) {
             Capture *c = kv.second;
             if (kv.first != c->parent_win) continue;
             for (auto &p : c->popups) {
-                if (p.x11_win != shape->window) continue;
+                if (p.x11_win != shape->affected_window) continue;
                 p.shape_dirty = true;
                 if (c->canvas_draw)
                     swell_gdk_queue_draw_pixels(c->canvas_draw, p.x - c->canvas_x,
@@ -1337,26 +1340,27 @@ static void bridge_handle_event(XEvent *ev)
         return;
     }
 
-    if (ev->type == ClientMessage)
+    if (type == XCB_CLIENT_MESSAGE)
     {
-        handle_xdnd_from_plugin(&ev->xclient);
+        handle_xdnd_from_plugin((xcb_client_message_event_t*)ev);
         return;
     }
 
     // Non-damage: popup lifecycle. (c set => plugin window, nothing to do here.)
-    Capture *c = find_capture(ev->xany.window);
+    if (type != XCB_MAP_NOTIFY && type != XCB_UNMAP_NOTIFY && type != XCB_CONFIGURE_NOTIFY) return;
+    Capture *c = find_capture(((xcb_map_notify_event_t*)ev)->window);
     if (c) return;
-    switch (ev->type)
+    switch (type)
     {
-        case MapNotify:
-            on_popup_mapped(ev->xmap.window);
+        case XCB_MAP_NOTIFY:
+            on_popup_mapped(((xcb_map_notify_event_t*)ev)->window);
             break;
-        case UnmapNotify:
-            on_popup_unmapped(ev->xunmap.window);
+        case XCB_UNMAP_NOTIFY:
+            on_popup_unmapped(((xcb_unmap_notify_event_t*)ev)->window);
             break;
-        case ConfigureNotify:
-            on_popup_configured(ev->xconfigure.window,
-                                ev->xconfigure.width, ev->xconfigure.height);
+        case XCB_CONFIGURE_NOTIFY:
+            on_popup_configured(((xcb_configure_notify_event_t*)ev)->window,
+                                ((xcb_configure_notify_event_t*)ev)->width, ((xcb_configure_notify_event_t*)ev)->height);
             break;
         default:
             break;

@@ -9,38 +9,16 @@
 #include <X11/Xutil.h>
 #include <map>
 #include <vector>
-#include <functional>
+#include <xcb/xcb_ewmh.h>
+#include <xcb/xcb_icccm.h>
 
 // ─── Atoms we manage ─────────────────────────────────────────────────────────
-struct WMAtoms {
-    // ICCCM
-    Atom WM_PROTOCOLS;
-    Atom WM_DELETE_WINDOW;
-    Atom WM_TAKE_FOCUS;
-    Atom WM_STATE;
-    Atom WM_CHANGE_STATE;
-    Atom WM_HINTS;
-    Atom WM_NORMAL_HINTS;
-    Atom WM_TRANSIENT_FOR;
-    Atom WM_NAME;
-    Atom WM_CLASS;
-    // EWMH
-    Atom _NET_WM_STATE;
-    Atom _NET_WM_STATE_MODAL;
-    Atom _NET_WM_STATE_ABOVE;
-    Atom _NET_ACTIVE_WINDOW;
-    Atom _NET_WM_WINDOW_TYPE;
-    Atom _NET_WM_WINDOW_TYPE_DIALOG;
-    Atom _NET_WM_WINDOW_TYPE_POPUP_MENU;
-    Atom _NET_WM_WINDOW_TYPE_TOOLTIP;
-    Atom _NET_WM_WINDOW_TYPE_NORMAL;
-    Atom _NET_SUPPORTING_WM_CHECK;
-    Atom _NET_WM_NAME;
-    Atom _NET_SUPPORTED;
-    // Composite
-    Atom _NET_WM_BYPASS_COMPOSITOR;
-    // Xwayland
-    Atom _XWAYLAND_ALLOW_COMMITS;
+struct WMAtoms : xcb_ewmh_connection_t {
+    xcb_atom_t WM_DELETE_WINDOW, WM_TAKE_FOCUS, WM_STATE;
+    xcb_atom_t _XWAYLAND_ALLOW_COMMITS, _REAPERX_TIMESTAMP;
+    xcb_atom_t XdndSelection, XdndAware, XdndEnter, XdndPosition;
+    xcb_atom_t XdndStatus, XdndDrop, XdndFinished, XdndLeave, XdndActionCopy;
+    xcb_atom_t uri_list, dnd_data;
 };
 
 // WM_STATE values (ICCCM §4.1.3.1)
@@ -57,7 +35,8 @@ struct WMWindowState {
 // ─── The minimal WM ──────────────────────────────────────────────────────────
 class XWaylandWM {
 public:
-    explicit XWaylandWM(Display *dpy);
+    explicit XWaylandWM(xcb_connection_t *connection);
+    xcb_connection_t *connection() const { return connection_; }
 
     // One-shot bring-up: spawn Xwayland on a free display, install the X error
     // handler, open the WM connection, construct + announce the WM, and attach a
@@ -72,20 +51,19 @@ public:
     void announce_wm(Window support_win);
 
     // ── Event dispatch ────────────────────────────────────────────────────────
-    // Feed every XEvent from your poll loop into here BEFORE your own handling.
+    // Feed every X event from your poll loop into here BEFORE your own handling.
     // Returns true if the event was fully consumed by the WM layer.
-    bool handle_event(XEvent *ev);
+    bool handle_event(xcb_generic_event_t *ev);
 
     void track_window(Window w);
     void untrack_window(Window w);
 
     void set_active_window(Window window);
-    Time get_server_time();
     // Send WM_TAKE_FOCUS to a window (ICCCM §4.1.7).
-    void send_take_focus(Window w, Time t = CurrentTime);
+    void send_take_focus(Window w, xcb_timestamp_t t);
     // ── ConfigureRequest handling ─────────────────────────────────────────────
     // Honours a client ConfigureRequest and updates our bookkeeping.
-    void honour_configure_request(XConfigureRequestEvent *ev);
+    void honour_configure_request(xcb_configure_request_event_t *ev);
 
     // ── Drag-and-drop OUT of a plugin (XDND catcher) ──────────────────────────
     // Catches XDND drags a Wine/native plugin starts that have no compositor-
@@ -122,7 +100,7 @@ public:
     // Fired for every event AFTER the WM layer has had a look, so the bridge can
     // do its own per-event work (captures, popups, modals, damage). The WM does
     // not consume plugin/popup content events; the bridge owns that.
-    std::function<void(XEvent* /*ev*/)> on_unhandled_event;
+    void (*on_unhandled_event)(xcb_generic_event_t *ev) = nullptr;
 
 private:
     void init_atoms();
@@ -131,22 +109,25 @@ private:
     void read_wm_hints(Window w, WMWindowState &st);
     void disallow_commits(Window w);
 
-    bool on_map_request(XMapRequestEvent *ev);
-    bool on_create_notify(XCreateWindowEvent *ev);
-    bool on_configure_request(XConfigureRequestEvent *ev);
-    bool on_reparent_notify(XReparentEvent *ev);
-    bool on_unmap_notify(XUnmapEvent *ev);
-    bool on_destroy_notify(XDestroyWindowEvent *ev);
+    bool on_map_request(xcb_map_request_event_t *ev);
+    bool on_create_notify(xcb_create_notify_event_t *ev);
+    bool on_configure_request(xcb_configure_request_event_t *ev);
+    bool on_reparent_notify(xcb_reparent_notify_event_t *ev);
+    bool on_unmap_notify(xcb_unmap_notify_event_t *ev);
+    bool on_destroy_notify(xcb_destroy_notify_event_t *ev);
 
     // DND catcher internals (see xwayland-bridge-wm.cpp for the protocol walk).
-    bool dnd_handle_event(XEvent *ev);
+    bool dnd_handle_event(xcb_generic_event_t *ev);
     void dnd_catcher_show(bool on);
     void dnd_send_status(Window src, bool accept);
     void dnd_send_finished(Window src, bool accepted);
     void dnd_reset_payload();
 
-    Display    *dpy_;
-    WMAtoms     atoms_;
+    xcb_connection_t *connection_;
+    xcb_window_t root_;
+    WMAtoms atoms_ = {};
+    xcb_window_t pending_focus_ = XCB_NONE;
+    uint16_t focus_sequence_ = 0;
     std::map<Window, WMWindowState> states_;
     Window      support_win_ = None;
     Window      active_window_ = ~0UL;
@@ -162,12 +143,7 @@ private:
     char     dnd_uri_[8192]      = {};
     bool     dnd_have_uri_       = false;
     bool     dnd_pending_        = false;
-    Atom     a_XdndSelection_ = None, a_XdndAware_ = None, a_XdndEnter_ = None, a_XdndPosition_ = None;
-    Atom     a_XdndStatus_ = None, a_XdndDrop_ = None, a_XdndFinished_ = None, a_XdndLeave_ = None;
-    Atom     a_XdndActionCopy_ = None, a_uri_list_ = None, a_dnd_prop_ = None;
 };
-
-void xwm_send_protocol_message(Display *dpy, Window w, Atom protocol, Time t);
 
 bool is_window_from_owned_plugin(Display *dpy, Window org_win, Window gui_win);
 
