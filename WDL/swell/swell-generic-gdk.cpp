@@ -2977,6 +2977,9 @@ static bool OnDragEventDelegate(GdkEvent *event);
 
 static void swell_gdkEventHandler(GdkEvent *evt, gpointer data)
 {
+#ifdef SWELL_TARGET_WAYLAND
+  if (evt->type == GDK_EXPOSE && xw_bridge_draw(evt->any.window)) return;
+#endif
   GdkEvent *oldEvt = s_cur_evt;
   s_cur_evt = evt;
 
