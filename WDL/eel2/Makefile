@@ -100,7 +100,7 @@ ifndef NO_GFX
       LFLAGS += $(shell pkg-config --libs gdk-2.0) -lX11
     else
       CFLAGS += -DSWELL_TARGET_GDK=3 $(shell pkg-config --cflags gdk-3.0)
-      LFLAGS += $(shell pkg-config --libs gdk-3.0) -lX11
+      LFLAGS += $(shell pkg-config --libs gdk-3.0 gio-2.0) -lX11
     endif
     ifndef NOFREETYPE
       CFLAGS += -DSWELL_FREETYPE $(shell pkg-config --cflags freetype2)

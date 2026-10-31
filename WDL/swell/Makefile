@@ -87,7 +87,7 @@ CFLAGS += -O2 -DNDEBUG
   endif
 endif
 
-LINKEXTRA =  -lpthread -ldl -lX11
+LINKEXTRA =  -lpthread -ldl
 
 
 EXTRA_OBJS = 
@@ -108,17 +108,6 @@ LICE_OBJS = lice.o  lice_arc.o lice_colorspace.o lice_line.o lice_text.o \
 
 OBJS = $(SWELL_OBJS)
 
-#Wayland (SWELL_TARGET_WAYLAND) depends on GTK3 so load it automatically
-ifdef WAYLAND
-  SWELL_OBJS += xwayland-bridge.o xwayland-bridge-wm.o xwayland-bridge-display.o xwayland-bridge-gl.o xwayland-bridge-image.o
-  CFLAGS += $(shell $(PKG_CONFIG) --cflags wayland-client xcb-keysyms xcb-randr xcb-damage xcb-shape xcb-shm xcb-dri3 xcb-sync xcb-composite xcb-ewmh xcb-icccm xcb-xtest xcb-xfixes xcb-image xcb-renderutil cairo-xcb epoxy libdrm)
-  LINKEXTRA += $(shell $(PKG_CONFIG) --libs wayland-client xcb-keysyms xcb-randr xcb-damage xcb-shape xcb-shm xcb-dri3 xcb-sync xcb-composite xcb-ewmh xcb-icccm xcb-xtest xcb-xfixes xcb-image xcb-renderutil cairo-xcb epoxy libdrm)
-  override SWELL_GDK_ONLY =
-  # spare-window for modal dialogs doesn't resize on an already 
-	# mapped Wayland so disable it
-  CFLAGS += -DSWELL_NO_SPARE_MODALDLG
-endif
-
 ifndef NOGDK
   CFLAGS += $(shell $(PKG_CONFIG) --cflags x11-xcb xcb-icccm xcb-xinput)
   LINKEXTRA += $(shell $(PKG_CONFIG) --libs x11-xcb xcb-icccm xcb-xinput)
@@ -131,6 +120,16 @@ ifndef NOGDK
       CFLAGS += -DSWELL_PRELOAD="libgdk-x11-2.0.so.0"
     endif
   else
+    #Wayland (SWELL_TARGET_WAYLAND) depends on GTK3 so load it automatically
+    ifdef WAYLAND
+      SWELL_OBJS += xwayland-bridge.o xwayland-bridge-wm.o xwayland-bridge-display.o xwayland-bridge-gl.o xwayland-bridge-image.o
+      CFLAGS += $(shell $(PKG_CONFIG) --cflags wayland-client xcb-keysyms xcb-randr xcb-damage xcb-shape xcb-shm xcb-dri3 xcb-sync xcb-composite xcb-ewmh xcb-icccm xcb-xtest xcb-xfixes xcb-image xcb-renderutil cairo-xcb epoxy libdrm)
+      LINKEXTRA += $(shell $(PKG_CONFIG) --libs wayland-client xcb-keysyms xcb-randr xcb-damage xcb-shape xcb-shm xcb-dri3 xcb-sync xcb-composite xcb-ewmh xcb-icccm xcb-xtest xcb-xfixes xcb-image xcb-renderutil cairo-xcb epoxy libdrm)
+      override SWELL_GDK_ONLY =
+      # spare-window for modal dialogs doesn't resize on an already
+      # mapped Wayland so disable it
+      CFLAGS += -DSWELL_NO_SPARE_MODALDLG
+    endif
     ifndef SWELL_GDK_ONLY
       CFLAGS += -DSWELL_TARGET_GDK=3 $(shell $(PKG_CONFIG) --cflags gtk+-3.0) -DSWELL_SUPPORT_GTK
     else
@@ -140,7 +139,7 @@ ifndef NOGDK
       ifndef SWELL_GDK_ONLY
         LINKEXTRA += $(shell $(PKG_CONFIG) --libs gtk+-3.0)
       else
-        LINKEXTRA += $(shell $(PKG_CONFIG) --libs gdk-3.0)
+        LINKEXTRA += $(shell $(PKG_CONFIG) --libs gdk-3.0 gio-2.0)
       endif
     else
       LINKEXTRA += -lX11
