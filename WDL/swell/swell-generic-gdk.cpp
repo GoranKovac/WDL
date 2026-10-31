@@ -3483,7 +3483,8 @@ static void swell_wl_sizepin_release(GdkFrameClock *clock, gpointer data)
 // GdkWindow until the frame carrying it has been committed.
 void swell_oswindow_resize_mapped(HWND hwnd, int reposflag, RECT f)
 {
-  if (!(reposflag&2) || !hwnd->m_oswidget || !GTK_IS_WINDOW(hwnd->m_oswidget))
+  if (!(reposflag&2) || !hwnd->m_oswidget || !GTK_IS_WINDOW(hwnd->m_oswidget) ||
+      gtk_window_get_type_hint(GTK_WINDOW(hwnd->m_oswidget)) == GDK_WINDOW_TYPE_HINT_TOOLTIP)
   {
     swell_oswindow_resize(hwnd->m_oswindow,reposflag,f);
     return;
