@@ -7,10 +7,7 @@
 #include <X11/Xlib.h>
 #include <X11/Xatom.h>
 #include <X11/Xutil.h>
-#include <gdk/gdk.h>
-#include <gtk/gtk.h>
 #include <map>
-#include <set>
 #include <vector>
 #include <functional>
 
@@ -53,39 +50,14 @@ struct WMAtoms {
 
 // ─── Per-window WM state ──────────────────────────────────────────────────────
 struct WMWindowState {
-    Window      xid;
-    Window      transient_for;      // WM_TRANSIENT_FOR hint
-    bool        mapped;
-    bool        input_hint;         // from WM_HINTS.input field
-    bool        take_focus;         // supports WM_TAKE_FOCUS protocol
-    bool        delete_window;      // supports WM_DELETE_WINDOW protocol
-    bool        is_modal;
-    bool        is_popup;
-    bool        is_native_plugin;   // non-Wine native X11 plugin
-    int         configure_serial;   // last ConfigureRequest serial honoured
-    // geometry as requested by client
-    int         req_x, req_y, req_w, req_h;
-    // geometry as placed by us
-    int         placed_x, placed_y, placed_w, placed_h;
-};
-
-// ─── Grab state machine ───────────────────────────────────────────────────────
-enum GrabOwner { GRAB_NONE, GRAB_PLUGIN, GRAB_MODAL, GRAB_POPUP };
-
-struct GrabState {
-    GrabOwner   owner       = GRAB_NONE;
-    Window      grab_window = None;     // X11 window that owns the grab
-    GtkWidget  *gtk_widget  = nullptr;  // corresponding GTK widget
-    bool        pointer_grabbed = false;
-    bool        keyboard_grabbed = false;
-    Time        grab_time   = CurrentTime;
+    bool input_hint;         // from WM_HINTS.input field
+    bool take_focus;         // supports WM_TAKE_FOCUS protocol
 };
 
 // ─── The minimal WM ──────────────────────────────────────────────────────────
 class XWaylandWM {
 public:
     explicit XWaylandWM(Display *dpy);
-    ~XWaylandWM();
 
     // One-shot bring-up: spawn Xwayland on the given display, install the X error
     // handler, open the WM connection, construct + announce the WM, and attach a
@@ -103,35 +75,13 @@ public:
     // Returns true if the event was fully consumed by the WM layer.
     bool handle_event(XEvent *ev);
 
-    // ── Window registration ───────────────────────────────────────────────────
-    // Register a plugin container window so we manage its children.
-    void register_container(Window container, bool is_native_plugin = false);
-    void unregister_container(Window container);
-
-    // Register a specific child (called from your MapNotify / ReparentNotify).
-    void track_window(Window w, Window parent, bool is_native_plugin = false);
+    void track_window(Window w);
     void untrack_window(Window w);
 
-    // ── Focus management ──────────────────────────────────────────────────────
-    // Call when a GTK widget gains focus.
-    void on_gtk_focus(GtkWidget *widget, Window x11_win);
-    // Call when a GTK widget loses focus.
-    void on_gtk_unfocus(GtkWidget *widget);
     void set_active_window(Window window);
     Time get_server_time();
     // Send WM_TAKE_FOCUS to a window (ICCCM §4.1.7).
     void send_take_focus(Window w, Time t = CurrentTime);
-    // Send WM_DELETE_WINDOW (ICCCM §4.2.8).
-    void send_delete_window(Window w, Time t = CurrentTime);
-
-    // ── Grab management ───────────────────────────────────────────────────────
-    // Acquire an owner_events grab on behalf of a popup or modal.
-    // owner_events=true means events still go to the correct window — this is
-    // what lets us click outside a popup without freezing.
-    // Called by your button-press handler to check if we should dismiss a popup.
-    // Returns true if the click was outside all tracked popups/modals.
-    bool handle_outside_click(Window clicked_win, int x_root, int y_root, Time t);
-
     // ── ConfigureRequest handling ─────────────────────────────────────────────
     // Honours a client ConfigureRequest and updates our bookkeeping.
     void honour_configure_request(XConfigureRequestEvent *ev);
@@ -168,14 +118,6 @@ public:
     // for this window rather than mistake it for real plugin content.
     Window dnd_catcher_window() const { return dnd_catcher_; }
 
-    // ── Utility ───────────────────────────────────────────────────────────────
-    WMAtoms& atoms() { return atoms_; }
-    const WMWindowState* window_state(Window w) const;
-    bool is_tracked(Window w) const { return states_.count(w) > 0; }
-
-    // Callbacks — wire these up after construction
-    std::function<void(Window /*dismissed*/)> on_popup_dismissed;
-    std::function<void(Window /*w*/, int x, int y, int w2, int h)> on_configure_applied;
     // Fired for every event AFTER the WM layer has had a look, so the bridge can
     // do its own per-event work (captures, popups, modals, damage). The WM does
     // not consume plugin/popup content events; the bridge owns that.
@@ -189,15 +131,11 @@ private:
     void disallow_commits(Window w);
 
     bool on_map_request(XMapRequestEvent *ev);
-    bool on_map_notify(XMapEvent *ev);
     bool on_create_notify(XCreateWindowEvent *ev);
     bool on_configure_request(XConfigureRequestEvent *ev);
     bool on_reparent_notify(XReparentEvent *ev);
     bool on_unmap_notify(XUnmapEvent *ev);
     bool on_destroy_notify(XDestroyWindowEvent *ev);
-    bool on_client_message(XClientMessageEvent *ev);
-    bool on_button_press(XButtonEvent *ev);
-    bool on_property_notify(XPropertyEvent *ev);
 
     // DND catcher internals (see xwayland-bridge-wm.cpp for the protocol walk).
     bool dnd_handle_event(XEvent *ev);
@@ -209,8 +147,6 @@ private:
     Display    *dpy_;
     WMAtoms     atoms_;
     std::map<Window, WMWindowState> states_;
-    std::set<Window> containers_;
-    GrabState   grab_;
     Window      support_win_ = None;
     Window      active_window_ = ~0UL;
 
@@ -230,18 +166,6 @@ private:
     Atom     a_XdndActionCopy_ = None, a_uri_list_ = None, a_dnd_prop_ = None;
 };
 
-// ─── Free helpers used by swell-generic-gdk.cpp ──────────────────────────────
-
-// Subscribe the WM to SubstructureRedirect on a container so we receive
-// MapRequest / ConfigureRequest from native plugin children.
-void xwm_redirect_container(Display *dpy, Window container);
-
-// After XReparentWindow, send the synthetic ReparentNotify + ConfigureNotify
-// that ICCCM-compliant clients expect from their new WM parent.
-void xwm_send_reparent_synthetic(Display *dpy, Window client, Window new_parent,
-                                  int x, int y);
-
-// Send a WM_PROTOCOLS ClientMessage.
 void xwm_send_protocol_message(Display *dpy, Window w, Atom protocol, Time t);
 
 bool is_window_from_owned_plugin(Display *dpy, Window org_win, Window gui_win);

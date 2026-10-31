@@ -193,6 +193,8 @@ swell-miscdlg-generic.o: $(SWELL_HEADERS)
 swell-modstub-generic.o: $(SWELL_HEADERS)
 swell-appstub-generic.o: $(SWELL_HEADERS)
 swell-generic-gdk.o xwayland-bridge.o: $(SWELL_HEADERS)
+swell-generic-gdk.o xwayland-bridge.o: xwayland-bridge.h
+xwayland-bridge.o xwayland-bridge-wm.o: xwayland-bridge-wm.h
 xwayland-bridge-wm.o xwayland-bridge-display.o: xwayland-bridge-display.h
 xwayland-bridge.o xwayland-bridge-gl.o: xwayland-bridge-gl.h
 

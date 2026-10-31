@@ -29,6 +29,7 @@
 #include <sys/prctl.h>
 #include <signal.h>
 #include <glib.h>
+#include <gdk/gdk.h>
 #include <algorithm>
 
 // ─── Construction ─────────────────────────────────────────────────────────────
@@ -275,13 +276,6 @@ void XWaylandWM::announce_wm(Window support_win) {
     }
 }
 
-// ─── Container registration ───────────────────────────────────────────────────
-void XWaylandWM::register_container(Window container, bool is_native) {
-    containers_.insert(container);
-    xwm_redirect_container(dpy_, container);
-    (void)is_native;
-}
-
 void XWaylandWM::set_active_window(Window window) {
     if (active_window_ == window) return;
     active_window_ = window;
@@ -290,46 +284,16 @@ void XWaylandWM::set_active_window(Window window) {
     XFlush(dpy_);
 }
 
-void XWaylandWM::unregister_container(Window container) {
-    containers_.erase(container);
-}
-
 // ─── Window tracking ──────────────────────────────────────────────────────────
-void XWaylandWM::track_window(Window w, Window parent, bool is_native_plugin) {
+void XWaylandWM::track_window(Window w) {
     if (states_.count(w)) return;
 
     WMWindowState st{};
-    st.xid              = w;
-    st.transient_for    = None;
-    st.mapped           = false;
-    st.is_native_plugin = is_native_plugin;
     st.input_hint       = true; // default: wants input
 
     // Read client-set hints
     read_wm_protocols(w, st);
     read_wm_hints(w, st);
-
-    // Read WM_TRANSIENT_FOR
-    Window trans = None;
-    if (XGetTransientForHint(dpy_, w, &trans) && trans != None)
-        st.transient_for = trans;
-
-    // Read _NET_WM_WINDOW_TYPE for popup/modal detection
-    Atom actual; int fmt; unsigned long n, left;
-    unsigned char *data = nullptr;
-    if (XGetWindowProperty(dpy_, w, atoms_._NET_WM_WINDOW_TYPE,
-                           0, 32, False, XA_ATOM,
-                           &actual, &fmt, &n, &left, &data) == Success && data) {
-        Atom *types = (Atom*)data;
-        for (unsigned long i = 0; i < n; ++i) {
-            if (types[i] == atoms_._NET_WM_WINDOW_TYPE_POPUP_MENU ||
-                types[i] == atoms_._NET_WM_WINDOW_TYPE_TOOLTIP)
-                st.is_popup = true;
-            if (types[i] == atoms_._NET_WM_WINDOW_TYPE_DIALOG)
-                st.is_modal = true;
-        }
-        XFree(data);
-    }
 
     // Subscribe to property changes so we can react to hint updates
     XSelectInput(dpy_, w, PropertyChangeMask | StructureNotifyMask);
@@ -339,11 +303,6 @@ void XWaylandWM::track_window(Window w, Window parent, bool is_native_plugin) {
 
 void XWaylandWM::untrack_window(Window w) {
     states_.erase(w);
-}
-
-const WMWindowState* XWaylandWM::window_state(Window w) const {
-    auto it = states_.find(w);
-    return it == states_.end() ? nullptr : &it->second;
 }
 
 // ─── Main event dispatcher ────────────────────────────────────────────────────
@@ -385,14 +344,13 @@ bool XWaylandWM::on_map_request(XMapRequestEvent *ev) {
 
     // If we're not tracking this yet, start now
     if (!states_.count(w))
-        track_window(w, ev->parent, true);
+        track_window(w);
 
     auto &st = states_[w];
 
     // Honour the request: map the window
     XMapWindow(dpy_, w);
     DEBUG_PRINT("[WM] XMapWindow called for 0x%lx\n", ev->window);
-    st.mapped = true;
 
     // Set WM_STATE = Normal (ICCCM §4.1.3.1)
     set_wm_state(w, WM_STATE_NORMAL);
@@ -470,28 +428,12 @@ void XWaylandWM::honour_configure_request(XConfigureRequestEvent *ev) {
         synth.xconfigure.override_redirect = attr.override_redirect;
         XSendEvent(dpy_, w, False, StructureNotifyMask, &synth);
     }
-XFlush(dpy_);
 
     DEBUG_PRINT("[WM] XConfigureWindow done for 0x%lx\n", w);
-    // Update our state
-    if (states_.count(w)) {
-        auto &st = states_[w];
-        if (ev->value_mask & CWX)      { st.req_x = ev->x; st.placed_x = ev->x; }
-        if (ev->value_mask & CWY)      { st.req_y = ev->y; st.placed_y = ev->y; }
-        if (ev->value_mask & CWWidth)  { st.req_w = ev->width;  st.placed_w = ev->width; }
-        if (ev->value_mask & CWHeight) { st.req_h = ev->height; st.placed_h = ev->height; }
-    }
-
-    // Notify our SWELL layer so it can resize the GTK widget / backing pixmap
-    if (on_configure_applied)
-        on_configure_applied(w, ev->x, ev->y, ev->width, ev->height);
-
     XFlush(dpy_);
 }
 
 // ─── ReparentNotify ───────────────────────────────────────────────────────────
-// Sent when a window is reparented into our container. Track it and send a
-// synthetic ConfigureNotify so native plugins learn their geometry and render.
 bool XWaylandWM::on_reparent_notify(XReparentEvent *ev) {
     // A window moved under root became a toplevel without a CreateNotify there,
     // so it needs the commit block too (see disallow_commits).
@@ -499,28 +441,6 @@ bool XWaylandWM::on_reparent_notify(XReparentEvent *ev) {
         disallow_commits(ev->window);
         return false;
     }
-
-    if (!containers_.count(ev->parent))
-        return false;
-
-    if (!states_.count(ev->window))
-        track_window(ev->window, ev->parent, true);
-
-    XWindowAttributes attr{};
-    if (XGetWindowAttributes(dpy_, ev->window, &attr) == 0) return false;
-
-    XEvent synth{};
-    synth.type                         = ConfigureNotify;
-    synth.xconfigure.event             = ev->window;
-    synth.xconfigure.window            = ev->window;
-    synth.xconfigure.x                 = ev->x;
-    synth.xconfigure.y                 = ev->y;
-    synth.xconfigure.width             = attr.width;
-    synth.xconfigure.height            = attr.height;
-    synth.xconfigure.border_width      = attr.border_width;
-    synth.xconfigure.above             = None;
-    synth.xconfigure.override_redirect = attr.override_redirect;
-    XSendEvent(dpy_, ev->window, False, StructureNotifyMask, &synth);
 
     return false; // let the bridge also see this
 }
@@ -530,7 +450,6 @@ bool XWaylandWM::on_unmap_notify(XUnmapEvent *ev) {
     auto it = states_.find(ev->window);
     if (it == states_.end()) return false;
 
-    it->second.mapped = false;
     set_wm_state(ev->window, WM_STATE_WITHDRAWN);
 
     return false; // let bridge also handle
@@ -567,10 +486,6 @@ void XWaylandWM::send_take_focus(Window w, Time t) {
     xwm_send_protocol_message(dpy_, w, atoms_.WM_TAKE_FOCUS, t);
 }
 
-void XWaylandWM::send_delete_window(Window w, Time t) {
-    xwm_send_protocol_message(dpy_, w, atoms_.WM_DELETE_WINDOW, t);
-}
-
 // ─── WM_STATE property helper ─────────────────────────────────────────────────
 // ICCCM §4.1.3.1  WM_STATE = { state, icon_window }
 void XWaylandWM::set_wm_state(Window w, int state) {
@@ -588,8 +503,6 @@ void XWaylandWM::read_wm_protocols(Window w, WMWindowState &st) {
         for (int i = 0; i < n; ++i) {
             if (protocols[i] == atoms_.WM_TAKE_FOCUS)
                 st.take_focus = true;
-            if (protocols[i] == atoms_.WM_DELETE_WINDOW)
-                st.delete_window = true;
         }
         XFree(protocols);
     }
@@ -604,35 +517,6 @@ void XWaylandWM::read_wm_hints(Window w, WMWindowState &st) {
     XFree(hints);
 }
 
-void xwm_redirect_container(Display *dpy, Window container) {
-    XSelectInput(dpy, container,
-                 SubstructureRedirectMask |
-                 SubstructureNotifyMask   |
-                 StructureNotifyMask      |
-                 PropertyChangeMask);
-    XFlush(dpy);
-}
-
-void xwm_send_reparent_synthetic(Display *dpy, Window client,
-                                  Window new_parent, int x, int y) {
-    (void)new_parent;
-    XWindowAttributes attr{};
-    if (!XGetWindowAttributes(dpy, client, &attr)) return;
-
-    XEvent ev{};
-    ev.type                         = ConfigureNotify;
-    ev.xconfigure.event             = client;
-    ev.xconfigure.window            = client;
-    ev.xconfigure.x                 = x;
-    ev.xconfigure.y                 = y;
-    ev.xconfigure.width             = attr.width;
-    ev.xconfigure.height            = attr.height;
-    ev.xconfigure.border_width      = attr.border_width;
-    ev.xconfigure.above             = None;
-    ev.xconfigure.override_redirect = False;
-    XSendEvent(dpy, client, False, StructureNotifyMask, &ev);
-    XFlush(dpy);
-}
 
 void xwm_send_protocol_message(Display *dpy, Window w, Atom protocol, Time t) {
     Atom wm_protocols = XInternAtom(dpy, "WM_PROTOCOLS", False);
@@ -920,11 +804,6 @@ bool XWaylandWM::dnd_handle_event(XEvent *ev)
             dnd_catcher_show(se->owner != None);
         }
         return true;
-    }
-
-    if (ev->type == ClientMessage) {
-        char *nm = XGetAtomName(dpy_, ev->xclient.message_type);
-        if (nm) XFree(nm);
     }
 
     if (ev->type == ClientMessage && ev->xclient.window == dnd_catcher_)
