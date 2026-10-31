@@ -1985,13 +1985,7 @@ static void OnWindowStateEvent(GdkEventWindowState *evt)
 
   if (evt->changed_mask & GDK_WINDOW_STATE_MAXIMIZED)
   {
-    bool maximized;
-#ifdef SWELL_TARGET_WAYLAND
-    if (hwnd->m_oswidget && GTK_IS_WINDOW(hwnd->m_oswidget))
-      maximized = gtk_window_is_maximized(GTK_WINDOW(hwnd->m_oswidget));
-    else
-#endif
-      maximized = (evt->new_window_state & GDK_WINDOW_STATE_MAXIMIZED) != 0;
+    const bool maximized = (evt->new_window_state & GDK_WINDOW_STATE_MAXIMIZED) != 0;
     hwnd->m_is_maximized = maximized;
     SendMessage(hwnd,WM_SIZE,
         maximized ? SIZE_MAXIMIZED : SIZE_RESTORED, 0);
