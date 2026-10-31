@@ -2415,8 +2415,8 @@ static void swell_wayland_drag_leave(GtkWidget *, GdkDragContext *context, guint
 
 static gboolean swell_wayland_drag_failed(GtkWidget *, GdkDragContext *, GtkDragResult result, gpointer)
 {
-  if (!s_wayland_drag_source || !s_wayland_drag_outside_release ||
-      result == GTK_DRAG_RESULT_USER_CANCELLED) return FALSE;
+  if (!s_wayland_drag_source || s_wayland_drag_released || !s_wayland_drag_outside_release ||
+      (result != GTK_DRAG_RESULT_NO_TARGET && result != GTK_DRAG_RESULT_ERROR)) return FALSE;
   swell_wayland_drag_set_destination(NULL);
   s_wayland_drag_released = true;
   swell_wayland_drag_mouse(WM_LBUTTONUP);
