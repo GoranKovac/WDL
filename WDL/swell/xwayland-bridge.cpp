@@ -15,11 +15,7 @@
 #include <X11/keysym.h>
 #include <cairo/cairo-xlib.h>
 #include <X11/Xlib-xcb.h>
-#include <X11/extensions/XShm.h>
-#include <X11/extensions/Xrender.h>
-#include <xcb/shm.h>
-#include <sys/mman.h>
-#include <fcntl.h>
+#include <xcb/xcb_renderutil.h>
 #include <stdint.h>
 #include <unistd.h>
 void xw_size(HWND hwnd);
@@ -27,115 +23,16 @@ void xw_size(HWND hwnd);
 XWaylandWM     *g_wm           = nullptr;
 Display *g_wm_dpy       = nullptr;
 
-class CaptureImage {
-    Display *dpy = nullptr;
-    XImage *image = nullptr;
-    XShmSegmentInfo shm = {};
-    size_t image_size = 0;
-    cairo_surface_t *surface = nullptr;
-    bool attached = false, disabled = false;
-
-    bool create(Display *display, Visual *visual, int w, int h)
-    {
-        dpy = display;
-        XRenderPictFormat *format = XRenderFindVisualFormat(dpy, visual);
-        if (!format || format->type != PictTypeDirect ||
-            (format->depth != 24 && format->depth != 32) ||
-            visual->red_mask != 0xff0000 || visual->green_mask != 0xff00 ||
-            visual->blue_mask != 0xff ||
-            (format->direct.alphaMask &&
-             (format->direct.alphaMask != 0xff || format->direct.alpha != 24))) return false;
-
-        int major, minor;
-        Bool pixmaps;
-        if (!XShmQueryVersion(dpy, &major, &minor, &pixmaps) ||
-            major < 1 || (major == 1 && minor < 2)) return false;
-        xcb_connection_t *connection = XGetXCBConnection(dpy);
-        if (!connection || xcb_connection_has_error(connection) || w <= 0 || h <= 0) return false;
-
-        image = XShmCreateImage(dpy, visual, format->depth, ZPixmap, nullptr, &shm, w, h);
-        const unsigned int endian = 1;
-        if (!image || image->bits_per_pixel != 32 || image->bytes_per_line <= 0 ||
-            image->byte_order != (*(const char*)&endian ? LSBFirst : MSBFirst) ||
-            (size_t)h > SIZE_MAX / (size_t)image->bytes_per_line) return false;
-
-        image_size = (size_t)image->bytes_per_line * h;
-        int fd = memfd_create("swell-plugin", MFD_CLOEXEC | MFD_ALLOW_SEALING);
-        if (fd < 0) return false;
-        if (ftruncate(fd, image_size) < 0 ||
-            fcntl(fd, F_ADD_SEALS, F_SEAL_SHRINK | F_SEAL_GROW | F_SEAL_SEAL) < 0) {
-            close(fd);
-            return false;
-        }
-        void *mapping = mmap(nullptr, image_size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
-        if (mapping == MAP_FAILED) { close(fd); return false; }
-        shm.shmaddr = (char*)mapping;
-        image->data = shm.shmaddr;
-        shm.shmseg = xcb_generate_id(connection);
-        XFlush(dpy);
-        xcb_generic_error_t *error = xcb_request_check(connection,
-            xcb_shm_attach_fd_checked(connection, shm.shmseg, fd, False));
-        attached = !error && !xcb_connection_has_error(connection);
-        free(error);
-        if (!attached) return false;
-
-        surface = cairo_image_surface_create_for_data((unsigned char*)image->data,
-            format->direct.alphaMask ? CAIRO_FORMAT_ARGB32 : CAIRO_FORMAT_RGB24,
-            w, h, image->bytes_per_line);
-        return cairo_surface_status(surface) == CAIRO_STATUS_SUCCESS;
-    }
-
-public:
-    ~CaptureImage() { reset(); }
-
-    void reset()
-    {
-        if (surface) cairo_surface_destroy(surface);
-        surface = nullptr;
-        if (attached) XShmDetach(dpy, &shm);
-        attached = false;
-        if (image) { image->data = nullptr; XDestroyImage(image); }
-        image = nullptr;
-        if (shm.shmaddr) munmap(shm.shmaddr, image_size);
-        shm.shmaddr = nullptr;
-        image_size = 0;
-    }
-
-    cairo_surface_t *read(Display *display, Pixmap pixmap, Visual *visual, int w, int h,
-                          bool refresh)
-    {
-        if (disabled) return nullptr;
-        if (image && (image->width != w || image->height != h)) reset();
-        if (image && !refresh) return cairo_surface_reference(surface);
-        if (!image && !create(display, visual, w, h)) {
-            reset();
-            disabled = true;
-            return nullptr;
-        }
-        cairo_surface_flush(surface);
-        if (!XShmGetImage(dpy, pixmap, image, 0, 0, AllPlanes)) {
-            reset();
-            disabled = true;
-            return nullptr;
-        }
-        cairo_surface_mark_dirty(surface);
-        return cairo_surface_reference(surface);
-    }
-};
-
-
 struct Capture {
+    CapturePixmap pixmap;
     CaptureImage image;
     CaptureGL gl;
+    cairo_device_t *cairo_device = nullptr;
     Display   *dpy         = nullptr;
     Window     parent_win  = 0;
     Window     plugin_win  = 0;
     Window     gui_win     = 0;
-    Pixmap     pixmap      = 0;      // XComposite-named window pixmap; refreshed on resize
-    int        pixmap_w    = 0;
-    int        pixmap_h    = 0;
     bool       pixmap_dirty = true;
-    Visual    *visual      = nullptr; // plugin_win's visual, cached for cairo_xlib_surface_create
     GtkWidget *widget      = nullptr;
     GtkWidget *active_toplevel = nullptr; // toplevel we hooked notify::is-active on; disconnected in cleanup
     HWND       hwnd        = nullptr;
@@ -188,19 +85,18 @@ void xw_clip_capture_regions(GdkWindow *window, cairo_region_t *region)
 {
     for (auto &kv : g_captures) {
         Capture *c = kv.second;
-        if (kv.first != c->parent_win || !c->widget || !c->pixmap || !c->visual ||
+        if (kv.first != c->parent_win || !c->widget || !c->pixmap.pixmap ||
             !gtk_widget_get_mapped(c->widget) || !gtk_widget_get_has_window(c->widget) ||
             gtk_widget_get_opacity(c->widget) != 1.0) continue;
         GtkWidget *top = gtk_widget_get_toplevel(c->widget);
         if (gtk_widget_get_window(top) != window) continue;
-        XRenderPictFormat *format = XRenderFindVisualFormat(c->dpy, c->visual);
-        if (!format || format->type != PictTypeDirect || format->direct.alphaMask) continue;
+        if (c->pixmap.format.type != XCB_RENDER_PICT_TYPE_DIRECT || c->pixmap.format.direct.alpha_mask) continue;
         int x, y;
         if (!gtk_widget_translate_coordinates(c->widget, top, 0, 0, &x, &y)) continue;
         const int scale = swell_gdk_widget_scale(c->widget);
         cairo_rectangle_int_t rect = { 0, 0,
-            min(gtk_widget_get_allocated_width(c->widget), c->pixmap_w / scale),
-            min(gtk_widget_get_allocated_height(c->widget), c->pixmap_h / scale) };
+            min(gtk_widget_get_allocated_width(c->widget), c->pixmap.width / scale),
+            min(gtk_widget_get_allocated_height(c->widget), c->pixmap.height / scale) };
         cairo_region_t *visible = gdk_window_get_visible_region(gtk_widget_get_window(c->widget));
         cairo_region_intersect_rectangle(visible, &rect);
         cairo_region_translate(visible, x, y);
@@ -285,23 +181,9 @@ static bool update_pixmap(Capture *c)
 {
     if (!c || !c->dpy || !c->plugin_win) return false;
 
-    if (!c->visual) {
-        XWindowAttributes wa;
-        if (!XGetWindowAttributes(c->dpy, c->plugin_win, &wa)) return false;
-        c->visual = wa.visual;
-    }
-
-    if (!name_pixmap(c->dpy, c->plugin_win, c->pixmap, c->pixmap_w, c->pixmap_h))
-        return false;
+    if (!c->pixmap.update(XGetXCBConnection(c->dpy), c->plugin_win)) return false;
     c->pixmap_dirty = false;
     return true;
-}
-
-static void destroy_pixmap(Capture *c)
-{
-    if (!c) return;
-    if (c->pixmap && c->dpy) { XFreePixmap(c->dpy, c->pixmap); c->pixmap = 0; }
-    c->pixmap_w = c->pixmap_h = 0;
 }
 
 static void refresh_pixmap(Capture *c)
@@ -317,20 +199,19 @@ static bool on_draw(GtkWidget *widget, cairo_t *cr, gpointer data)
     Capture *c = (Capture*)data;
     const bool refresh = c && c->pixmap_dirty;
     if (c && c->pixmap_dirty) {
-        const int old_w = c->pixmap_w, old_h = c->pixmap_h;
-        if (update_pixmap(c) && (old_w != c->pixmap_w || old_h != c->pixmap_h))
+        const int old_w = c->pixmap.width, old_h = c->pixmap.height;
+        if (update_pixmap(c) && (old_w != c->pixmap.width || old_h != c->pixmap.height))
             gtk_widget_queue_draw(widget);
     }
-    if (!c || !c->pixmap || !c->visual) return FALSE;
+    if (!c || !c->pixmap.pixmap) return FALSE;
 
-    if (c->gl.draw(widget, cr, c->dpy, c->pixmap, c->visual,
-                   c->pixmap_w, c->pixmap_h, refresh)) return TRUE;
+    if (c->gl.draw(widget, cr, c->pixmap, refresh)) return TRUE;
 
-    cairo_surface_t *surf = c->image.read(c->dpy, c->pixmap, c->visual,
-                                        c->pixmap_w, c->pixmap_h, refresh);
-    if (!surf)
-        surf = cairo_xlib_surface_create(c->dpy, c->pixmap, c->visual,
-                                        c->pixmap_w, c->pixmap_h);
+    cairo_surface_t *surf = c->image.read(c->pixmap, refresh);
+    if (!surf) {
+        surf = c->pixmap.surface();
+        if (!c->cairo_device) c->cairo_device = cairo_device_reference(cairo_surface_get_device(surf));
+    }
     if (surf) {
         if (cairo_surface_status(surf) == CAIRO_STATUS_SUCCESS) {
             const int scale = swell_gdk_widget_scale(widget);
@@ -678,7 +559,7 @@ static Capture* setup_capture(Display *dpy, Window parent_win, Window plugin_win
     XRaiseWindow(dpy, parent_win);
     XFlush(dpy);
     DEBUG_PRINT("[XW] setup parent=0x%lx plugin=0x%lx (auto-composite, pixmap=0x%lx)\n",
-                parent_win, plugin_win, (unsigned long)c->pixmap);
+                parent_win, plugin_win, (unsigned long)c->pixmap.pixmap);
     return c;
 }
 
@@ -709,12 +590,16 @@ static void cleanup_capture(Capture *c)
     while (!c->modals.empty()) modal_remove(c, c->modals.back().x11_win);
     if (c->damage && g_wm_dpy) XDamageDestroy(g_wm_dpy, c->damage);
     if (g_wm_dpy) XFlush(g_wm_dpy);
-    destroy_pixmap(c);
+    c->pixmap.reset();
     c->gl.reset();
     c->image.reset();
+    if (c->cairo_device) {
+        cairo_device_finish(c->cairo_device);
+        cairo_device_destroy(c->cairo_device);
+    }
     Display *d = c->dpy;
     c->dpy = nullptr;
-    if (d) XCloseDisplay(d);
+    if (d) { xcb_render_util_disconnect(XGetXCBConnection(d)); XCloseDisplay(d); }
     delete c;
 }
 
@@ -1370,7 +1255,7 @@ static void handle_damage_notify(XDamageNotifyEvent *de)
     Capture *c = find_capture(de->drawable);
     if (c && c->widget && GTK_IS_WIDGET(c->widget)) {
         c->pixmap_dirty = true;
-        if (c->pixmap_w != de->geometry.width || c->pixmap_h != de->geometry.height)
+        if (c->pixmap.width != de->geometry.width || c->pixmap.height != de->geometry.height)
             gtk_widget_queue_draw(c->widget);
         else
             swell_gdk_queue_draw_pixels(c->widget, de->area.x, de->area.y,

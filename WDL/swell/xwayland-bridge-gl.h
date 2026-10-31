@@ -1,11 +1,11 @@
 #pragma once
 
 #include <gtk/gtk.h>
-#include <X11/Xlib.h>
+#include "xwayland-bridge-image.h"
 
 class CaptureGL {
     GdkGLContext *context = nullptr;
-    Display *dpy = nullptr;
+    xcb_connection_t *connection = nullptr;
     unsigned int fence = 0;
     void *pending_read = nullptr;
     unsigned int textures[2] = {}, framebuffers[2] = {};
@@ -13,11 +13,10 @@ class CaptureGL {
     bool disabled = false;
 
     bool make_current();
-    bool read(Display *display, Pixmap pixmap, Visual *visual, GdkWindow *window, int w, int h);
+    bool read(const CapturePixmap &pixmap, GdkWindow *window);
 
 public:
     ~CaptureGL() { reset(); }
     void reset();
-    bool draw(GtkWidget *widget, cairo_t *cr, Display *display, Pixmap pixmap,
-              Visual *visual, int w, int h, bool refresh);
+    bool draw(GtkWidget *widget, cairo_t *cr, const CapturePixmap &pixmap, bool refresh);
 };
