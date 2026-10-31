@@ -2,8 +2,6 @@
 #include <gdk/gdkwayland.h>
 #include <epoxy/gl.h>
 #include <epoxy/egl.h>
-#include <X11/Xlib-xcb.h>
-#include <X11/extensions/Xrender.h>
 #include <xcb/dri3.h>
 #include <xcb/sync.h>
 #include <drm_fourcc.h>
@@ -27,11 +25,9 @@ struct CaptureDmaBuf {
         free(reply);
     }
 
-    bool get(Display *display, Pixmap pixmap, xcb_sync_fence_t &fence)
+    bool get(xcb_connection_t *connection, xcb_pixmap_t pixmap, xcb_sync_fence_t &fence)
     {
-        xcb_connection_t *connection = XGetXCBConnection(display);
         if (!connection || xcb_connection_has_error(connection)) return false;
-        XFlush(display);
         xcb_generic_error_t *error = nullptr;
         if (!fence) {
             const xcb_query_extension_reply_t *extension = xcb_get_extension_data(connection, &xcb_dri3_id);
@@ -105,12 +101,11 @@ bool CaptureGL::make_current()
 void CaptureGL::reset()
 {
     if (fence) {
-        xcb_connection_t *connection = XGetXCBConnection(dpy);
         xcb_sync_destroy_fence(connection, fence);
         xcb_flush(connection);
         fence = 0;
     }
-    dpy = nullptr;
+    connection = nullptr;
     if (context) {
         GdkGLContext *previous = gdk_gl_context_get_current();
         if (previous) g_object_ref(previous);
@@ -130,18 +125,14 @@ void CaptureGL::reset()
     width = height = depth = 0;
 }
 
-bool CaptureGL::read(Display *display, Pixmap pixmap, Visual *visual, GdkWindow *window, int w, int h)
+bool CaptureGL::read(const CapturePixmap &pixmap, GdkWindow *window)
 {
-    XRenderPictFormat *format = XRenderFindVisualFormat(display, visual);
-    if (!format || format->type != PictTypeDirect ||
-        (format->depth != 24 && format->depth != 32) ||
-        visual->red_mask != 0xff0000 || visual->green_mask != 0xff00 || visual->blue_mask != 0xff ||
-        (format->direct.alphaMask && (format->direct.alphaMask != 0xff || format->direct.alpha != 24)))
-        return false;
+    if (pixmap.image_format == CAIRO_FORMAT_INVALID) return false;
+    const int w = pixmap.width, h = pixmap.height;
     CaptureDmaBuf buffer;
-    dpy = display;
-    if (!buffer.get(display, pixmap, fence) || buffer.reply->width != w || buffer.reply->height != h ||
-        buffer.reply->bpp != 32 || buffer.reply->depth != format->depth) return false;
+    connection = pixmap.connection;
+    if (!buffer.get(connection, pixmap.pixmap, fence) || buffer.reply->width != w || buffer.reply->height != h ||
+        buffer.reply->bpp != 32 || buffer.reply->depth != pixmap.format.depth) return false;
 
     if (!context) {
         GError *error = nullptr;
@@ -183,10 +174,10 @@ bool CaptureGL::read(Display *display, Pixmap pixmap, Visual *visual, GdkWindow 
     if (glCheckFramebufferStatus(GL_READ_FRAMEBUFFER) != GL_FRAMEBUFFER_COMPLETE) return false;
 
     glBindTexture(GL_TEXTURE_2D, textures[1]);
-    if (width != w || height != h || depth != format->depth) {
-        glTexImage2D(GL_TEXTURE_2D, 0, format->direct.alphaMask ? GL_RGBA8 : GL_RGB8,
+    if (width != w || height != h || depth != pixmap.format.depth) {
+        glTexImage2D(GL_TEXTURE_2D, 0, pixmap.format.direct.alpha_mask ? GL_RGBA8 : GL_RGB8,
                      w, h, 0, GL_RGBA, GL_UNSIGNED_BYTE, nullptr);
-        width = w; height = h; depth = format->depth;
+        width = w; height = h; depth = pixmap.format.depth;
     }
     glBindFramebuffer(GL_DRAW_FRAMEBUFFER, framebuffers[1]);
     glFramebufferTexture2D(GL_DRAW_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, textures[1], 0);
@@ -198,10 +189,10 @@ bool CaptureGL::read(Display *display, Pixmap pixmap, Visual *visual, GdkWindow 
     return glGetError() == GL_NO_ERROR;
 }
 
-bool CaptureGL::draw(GtkWidget *widget, cairo_t *cr, Display *display, Pixmap pixmap,
-                     Visual *visual, int w, int h, bool refresh)
+bool CaptureGL::draw(GtkWidget *widget, cairo_t *cr, const CapturePixmap &pixmap, bool refresh)
 {
     if (disabled) return false;
+    const int w = pixmap.width, h = pixmap.height;
     GdkWindow *window = gtk_widget_get_window(gtk_widget_get_toplevel(widget));
     if (!window || !GDK_IS_WAYLAND_WINDOW(window)) return false;
     if (context && gdk_gl_context_get_window(context) != window) reset();
@@ -209,7 +200,7 @@ bool CaptureGL::draw(GtkWidget *widget, cairo_t *cr, Display *display, Pixmap pi
     if (previous) g_object_ref(previous);
     bool success = true;
     if (!context || refresh || width != w || height != h)
-        success = read(display, pixmap, visual, window, w, h);
+        success = read(pixmap, window);
     if (success) success = make_current();
     if (success) {
         cairo_save(cr);
