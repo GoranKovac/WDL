@@ -19,6 +19,12 @@ void CapturePixmap::reset()
     image_format = CAIRO_FORMAT_INVALID;
 }
 
+// (Re-)name the composite pixmap of the plugin window. Automatic redirection
+// means the X server keeps drawing the window off-screen; we sample it via
+// CompositeNameWindowPixmap and render with cairo. The named
+// pixmap is only a reference to whatever backs the window at naming time, so
+// it goes stale on every resize and on every Present flip (GLX plugin UIs swap
+// the window pixmap for the client's buffer) -- callers re-name on both.
 bool CapturePixmap::update(xcb_connection_t *conn, xcb_window_t window)
 {
     if (!conn || xcb_connection_has_error(conn)) return false;

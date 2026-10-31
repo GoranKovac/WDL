@@ -4,6 +4,7 @@
 #define DEBUG_PRINT(...) ((void)0)
 #endif
 #include <gdk/gdkwayland.h>
+#include <list>
 #include "xwayland-bridge.h"
 #include "xwayland-bridge-gl.h"
 #include "swell-gdk-scale.h"
@@ -13,7 +14,6 @@
 #include <X11/extensions/Xrandr.h>
 #include <X11/extensions/shape.h>
 #include <X11/keysym.h>
-#include <cairo/cairo-xlib.h>
 #include <X11/Xlib-xcb.h>
 #include <xcb/xcb_renderutil.h>
 #include <stdint.h>
@@ -51,20 +51,27 @@ struct Capture {
 
     struct PopupWin {
         Window x11_win;
-        Pixmap pixmap;
+        CapturePixmap pixmap;
+        CaptureImage image;
         bool pixmap_dirty;
         int x,y,w,h;
         bool visible;
         Damage damage;
-        Visual *visual;
         std::vector<XRectangle> shape;
         bool shape_dirty;
     };
-    std::vector<PopupWin> popups;
+    std::list<PopupWin> popups;
 
     // ── Modals (real dialog windows the plugin opens) ──
-    struct ModalWin { Window x11_win; Pixmap pixmap; GtkWidget *gtk_win; GtkWidget *draw; Damage damage; int w; int h; Visual *visual; };
-    std::vector<ModalWin> modals;
+    struct ModalWin {
+        Window x11_win;
+        CapturePixmap pixmap;
+        CaptureImage image;
+        bool pixmap_dirty;
+        GtkWidget *gtk_win, *draw;
+        Damage damage;
+    };
+    std::list<ModalWin> modals;
 };
 
 static std::map<Window, Capture*> g_captures;
@@ -151,32 +158,6 @@ struct bridgeState {
     GtkWidget *embed_container = nullptr; // resolved via xw_ensure_embed_widget, see xw_bridge_create/xw_size
 };
 
-// (Re-)name the composite pixmap of the plugin window. Automatic redirection
-// means the X server keeps drawing the window off-screen; we sample it via
-// XCompositeNameWindowPixmap and render with cairo. The named
-// pixmap is only a reference to whatever backs the window at naming time, so
-// it goes stale on every resize and on every Present flip (GLX plugin UIs swap
-// the window pixmap for the client's buffer) -- callers re-name on both.
-static bool name_pixmap(Display *dpy, Window window, Pixmap &current, int &width, int &height)
-{
-    Pixmap pixmap = XCompositeNameWindowPixmap(dpy, window);
-    if (!pixmap) return false;
-
-    Window root;
-    int x, y;
-    unsigned int w, h, border, depth;
-    if (!XGetGeometry(dpy, pixmap, &root, &x, &y, &w, &h, &border, &depth)) {
-        XFreePixmap(dpy, pixmap);
-        return false;
-    }
-
-    if (current) XFreePixmap(dpy, current);
-    current = pixmap;
-    width = w;
-    height = h;
-    return true;
-}
-
 static bool update_pixmap(Capture *c)
 {
     if (!c || !c->dpy || !c->plugin_win) return false;
@@ -194,6 +175,16 @@ static void refresh_pixmap(Capture *c)
         gtk_widget_queue_draw(c->widget);
 }
 
+static cairo_surface_t *read_pixels(Capture *c, CapturePixmap &pixmap, CaptureImage &image, bool refresh)
+{
+    cairo_surface_t *surface = image.read(pixmap, refresh);
+    if (!surface) {
+        surface = pixmap.surface();
+        if (!c->cairo_device) c->cairo_device = cairo_device_reference(cairo_surface_get_device(surface));
+    }
+    return surface;
+}
+
 static bool on_draw(GtkWidget *widget, cairo_t *cr, gpointer data)
 {
     Capture *c = (Capture*)data;
@@ -207,11 +198,7 @@ static bool on_draw(GtkWidget *widget, cairo_t *cr, gpointer data)
 
     if (c->gl.draw(widget, cr, c->pixmap, refresh)) return TRUE;
 
-    cairo_surface_t *surf = c->image.read(c->pixmap, refresh);
-    if (!surf) {
-        surf = c->pixmap.surface();
-        if (!c->cairo_device) c->cairo_device = cairo_device_reference(cairo_surface_get_device(surf));
-    }
+    cairo_surface_t *surf = read_pixels(c, c->pixmap, c->image, refresh);
     if (surf) {
         if (cairo_surface_status(surf) == CAIRO_STATUS_SUCCESS) {
             const int scale = swell_gdk_widget_scale(widget);
@@ -620,9 +607,12 @@ static bool canvas_draw_cb(GtkWidget *widget, cairo_t *cr, gpointer data)
     cairo_clip_extents(cr, &clip_x1, &clip_y1, &clip_x2, &clip_y2);
 
     for (auto &p : c->popups) {
+        const bool refresh = p.pixmap_dirty;
         if (p.visible && p.pixmap_dirty) {
             const int old_w = p.w, old_h = p.h;
-            if (name_pixmap(c->dpy, p.x11_win, p.pixmap, p.w, p.h)) {
+            if (p.pixmap.update(XGetXCBConnection(c->dpy), p.x11_win)) {
+                p.w = p.pixmap.width;
+                p.h = p.pixmap.height;
                 p.pixmap_dirty = false;
                 if (old_w != p.w || old_h != p.h) {
                     p.shape_dirty = true;
@@ -630,7 +620,7 @@ static bool canvas_draw_cb(GtkWidget *widget, cairo_t *cr, gpointer data)
                 }
             }
         }
-        if (!p.visible || p.pixmap == None) continue;
+        if (!p.visible || !p.pixmap.pixmap) continue;
 
         int draw_x = p.x - c->canvas_x;
         int draw_y = p.y - c->canvas_y;
@@ -639,8 +629,7 @@ static bool canvas_draw_cb(GtkWidget *widget, cairo_t *cr, gpointer data)
             draw_y + p.h <= clip_y1 || draw_y >= clip_y2)
             continue;
 
-        Visual *visual = p.visual ? p.visual : DefaultVisual(c->dpy, DefaultScreen(c->dpy));
-        cairo_surface_t *surf = cairo_xlib_surface_create(c->dpy, p.pixmap, visual, p.w, p.h);
+        cairo_surface_t *surf = read_pixels(c, p.pixmap, p.image, refresh);
         if (surf) {
             cairo_save(cr);
             cairo_rectangle(cr, draw_x, draw_y, p.w, p.h);
@@ -868,7 +857,7 @@ static void canvas_add_popup(Capture *c, Window x11_win, XWindowAttributes *attr
     Capture::PopupWin *pp = nullptr;
     for (auto &e : c->popups) if (e.x11_win == x11_win) { pp = &e; break; }
 
-    if (pp && pp->pixmap != None &&
+    if (pp && pp->pixmap.pixmap &&
         pp->x == x && pp->y == y &&
         pp->w == attr->width && pp->h == attr->height)
     {
@@ -886,11 +875,7 @@ static void canvas_add_popup(Capture *c, Window x11_win, XWindowAttributes *attr
 
     XCompositeRedirectWindow(c->dpy, x11_win, CompositeRedirectAutomatic);
     XFlush(c->dpy);
-    Pixmap pixmap = XCompositeNameWindowPixmap(c->dpy, x11_win);
-
-    if (pp) {
-        if (pp->pixmap != None && pp->pixmap != pixmap) XFreePixmap(c->dpy, pp->pixmap);
-    } else {
+    if (!pp) {
         c->popups.emplace_back();
         pp = &c->popups.back();
         if (g_wm_dpy && g_damage_event_base >= 0)
@@ -899,13 +884,7 @@ static void canvas_add_popup(Capture *c, Window x11_win, XWindowAttributes *attr
             XShapeSelectInput(g_wm_dpy, x11_win, ShapeNotifyMask);
     }
     pp->x11_win = x11_win;
-    pp->pixmap  = pixmap;
     pp->pixmap_dirty = true;
-    {
-        XWindowAttributes wa_local;
-        pp->visual = XGetWindowAttributes(c->dpy, x11_win, &wa_local)
-                   ? wa_local.visual : DefaultVisual(c->dpy, DefaultScreen(c->dpy));
-    }
     pp->x = x;
     pp->y = y;
     DEBUG_PRINT("[POPOFF] win=0x%lx attr=(%d,%d) gtk=(%d,%d) -> pp=(%d,%d)\n",
@@ -932,7 +911,6 @@ static void canvas_remove_popup(Capture *c, Window x11_win)
     for (auto it = c->popups.begin(); it != c->popups.end(); ) {
         if (it->x11_win == x11_win) {
             if (it->damage && g_wm_dpy) { XDamageDestroy(g_wm_dpy, it->damage); it->damage = 0; }
-            if (it->pixmap != None) { XFreePixmap(c->dpy, it->pixmap); it->pixmap = None; }
             it = c->popups.erase(it);
         } else ++it;
     }
@@ -955,17 +933,16 @@ static bool modal_draw_cb(GtkWidget *widget, cairo_t *cr, gpointer data)
 {
     ModalRender *m = (ModalRender*)data;
     if (!m || !m->cap || !m->cap->dpy) return false;
-    Display *dpy = m->cap->dpy;
-    Pixmap pm = 0;
-    Visual *visual = nullptr;
-    int gw = 0, gh = 0;
+    Capture::ModalWin *modal = nullptr;
     for (auto &md : m->cap->modals)
-        if (md.x11_win == m->x11_win) { pm = md.pixmap; visual = md.visual; gw = md.w; gh = md.h; break; }
-    if (!pm) return false;
+        if (md.x11_win == m->x11_win) { modal = &md; break; }
+    if (!modal) return false;
+    const bool refresh = modal->pixmap_dirty;
+    if (refresh && modal->pixmap.update(XGetXCBConnection(m->cap->dpy), m->x11_win))
+        modal->pixmap_dirty = false;
+    if (!modal->pixmap.pixmap) return false;
 
-    if (!visual) visual = DefaultVisual(dpy, DefaultScreen(dpy));
-
-    cairo_surface_t *surf = cairo_xlib_surface_create(dpy, pm, visual, gw, gh);
+    cairo_surface_t *surf = read_pixels(m->cap, modal->pixmap, modal->image, refresh);
     if (surf) {
         const int scale = swell_gdk_widget_scale(widget);
         cairo_save(cr);
@@ -1048,7 +1025,6 @@ static void create_modal(Capture *state, Window win, XWindowAttributes *attr)
     Display *dpy = state->dpy;
     XCompositeRedirectWindow(dpy, win, CompositeRedirectAutomatic);
     XFlush(dpy);
-    Pixmap pm = XCompositeNameWindowPixmap(dpy, win);
 
     GtkWidget *gtk_win = gtk_window_new(GTK_WINDOW_TOPLEVEL);
     gtk_window_set_decorated(GTK_WINDOW(gtk_win), TRUE);
@@ -1086,15 +1062,10 @@ static void create_modal(Capture *state, Window win, XWindowAttributes *attr)
     if (g_wm_dpy && g_damage_event_base >= 0)
         dmg = XDamageCreate(g_wm_dpy, win, XDamageReportBoundingBox);
 
-    Capture::ModalWin md;
-    md.x11_win = win; md.pixmap = pm; md.gtk_win = gtk_win; md.draw = draw; md.damage = dmg;
-    md.w = attr->width; md.h = attr->height;
-    {
-        XWindowAttributes wa_local;
-        md.visual = XGetWindowAttributes(dpy, win, &wa_local)
-                  ? wa_local.visual : DefaultVisual(dpy, DefaultScreen(dpy));
-    }
-    state->modals.push_back(md);
+    state->modals.emplace_back();
+    Capture::ModalWin &md = state->modals.back();
+    md.x11_win = win; md.gtk_win = gtk_win; md.draw = draw; md.damage = dmg;
+    md.pixmap_dirty = true;
 }
 
 static void modal_remove(Capture *c, Window win)
@@ -1102,11 +1073,9 @@ static void modal_remove(Capture *c, Window win)
     for (auto it = c->modals.begin(); it != c->modals.end(); ++it)
         if (it->x11_win == win) {
             Damage     dmg = it->damage;
-            Pixmap     pm  = it->pixmap;
             GtkWidget *w   = it->gtk_win;
             c->modals.erase(it);
             if (dmg && g_wm_dpy)       XDamageDestroy(g_wm_dpy, dmg);
-            if (pm)                    XFreePixmap(c->dpy, pm);
             if (w && GTK_IS_WIDGET(w)) gtk_widget_destroy(w);
             break;
         }
@@ -1283,22 +1252,7 @@ static void handle_damage_notify(XDamageNotifyEvent *de)
         for (auto &md : cc->modals) {
             if (md.x11_win == de->drawable) {
                 if (md.draw && GTK_IS_WIDGET(md.draw)) {
-                    // Refresh the modal's OWN pixmap if the modal window was
-                    // resized (composite pixmap becomes invalid on every
-                    // resize). Then just tell GTK to redraw the damaged area
-                    // -- with Automatic redirection the pixmap stays live on
-                    // its own; no explicit capture step needed.
-                    XWindowAttributes wa;
-                    if (XGetWindowAttributes(cc->dpy, md.x11_win, &wa)
-                        && wa.width > 0 && wa.height > 0) {
-                        if (md.w != wa.width || md.h != wa.height || md.pixmap == 0) {
-                            if (md.pixmap) XFreePixmap(cc->dpy, md.pixmap);
-                            XFlush(cc->dpy);
-                            md.pixmap = XCompositeNameWindowPixmap(cc->dpy, md.x11_win);
-                            md.w = wa.width;
-                            md.h = wa.height;
-                        }
-                    }
+                    md.pixmap_dirty = true;
                     swell_gdk_queue_draw_pixels(md.draw, de->area.x, de->area.y,
                                                de->area.width, de->area.height);
                 }
@@ -1457,15 +1411,7 @@ bool xw_bridge_swell_on_gdk_delete_release()
             // destroyed, which wedges the plugin and hangs REAPER. Modals are fine
             // because they take no pointer grab.
             dismiss_popups(c);
-            for (auto &p : c->popups)
-                if (p.pixmap != None && c->dpy) XFreePixmap(c->dpy, p.pixmap);
-            c->popups.clear();
-            c->root_popup = None;
-            if (c->popup_canvas && GTK_IS_WIDGET(c->popup_canvas)) {
-                gtk_widget_destroy(c->popup_canvas);
-                c->popup_canvas = nullptr;
-                c->canvas_draw  = nullptr;
-            }
+            while (!c->popups.empty()) canvas_remove_popup(c, c->popups.back().x11_win);
         }
         if (!c->modals.empty() && c->dpy) {
             // Modals must be dismissed too. Previously this branch only *checked* for
