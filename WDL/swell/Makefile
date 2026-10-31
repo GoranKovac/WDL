@@ -120,12 +120,14 @@ ifdef WAYLAND
 endif
 
 ifndef NOGDK
+  CFLAGS += $(shell $(PKG_CONFIG) --cflags x11-xcb xcb-icccm xcb-xinput)
+  LINKEXTRA += $(shell $(PKG_CONFIG) --libs x11-xcb xcb-icccm xcb-xinput)
   ifdef GDK2
     CFLAGS += -DSWELL_TARGET_GDK=2 $(shell $(PKG_CONFIG) --cflags gdk-2.0)
     ifndef PRELOAD_GDK
       LINKEXTRA += $(shell $(PKG_CONFIG) --libs gdk-2.0)
     else
-      LINKEXTRA += -lX11 -lXi
+      LINKEXTRA += -lX11
       CFLAGS += -DSWELL_PRELOAD="libgdk-x11-2.0.so.0"
     endif
   else
@@ -141,7 +143,7 @@ ifndef NOGDK
         LINKEXTRA += $(shell $(PKG_CONFIG) --libs gdk-3.0)
       endif
     else
-      LINKEXTRA += -lX11 -lXi
+      LINKEXTRA += -lX11
       ifdef WAYLAND
         CFLAGS += -DSWELL_PRELOAD="libgtk-3.so.0"
       else
@@ -193,6 +195,7 @@ swell-miscdlg-generic.o: $(SWELL_HEADERS)
 swell-modstub-generic.o: $(SWELL_HEADERS)
 swell-appstub-generic.o: $(SWELL_HEADERS)
 swell-generic-gdk.o xwayland-bridge.o: $(SWELL_HEADERS)
+swell-generic-gdk.o: swell-xcb.h
 swell-generic-gdk.o xwayland-bridge.o: xwayland-bridge.h
 xwayland-bridge.o xwayland-bridge-wm.o: xwayland-bridge-wm.h swell-xcb.h
 xwayland-bridge-wm.o xwayland-bridge-display.o: xwayland-bridge-display.h

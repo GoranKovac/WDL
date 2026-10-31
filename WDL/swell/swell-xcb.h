@@ -10,14 +10,14 @@ static inline xcb_screen_t *swell_xcb_screen(xcb_connection_t *connection)
 
 static inline void swell_xcb_sync(xcb_connection_t *connection)
 {
-    free(xcb_get_input_focus_reply(connection, xcb_get_input_focus(connection), nullptr));
+    free(xcb_get_input_focus_reply(connection, xcb_get_input_focus(connection), NULL));
 }
 
 static inline bool swell_xcb_translate(xcb_connection_t *connection, xcb_window_t source,
     xcb_window_t destination, int x, int y, int *out_x, int *out_y)
 {
     xcb_translate_coordinates_reply_t *reply = xcb_translate_coordinates_reply(connection,
-        xcb_translate_coordinates(connection, source, destination, x, y), nullptr);
+        xcb_translate_coordinates(connection, source, destination, x, y), NULL);
     if (!reply) return false;
     *out_x = reply->dst_x;
     *out_y = reply->dst_y;
