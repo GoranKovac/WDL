@@ -18,8 +18,7 @@
 
 #include "xwayland-bridge-wm.h"
 #include "xwayland-bridge-display.h"
-#include "xwayland-bridge.h"          // g_wm, g_wm_dpy
-#include <X11/Xlib-xcb.h>
+#include "swell-xcb.h"
 #include <xcb/xtest.h>
 #include <xcb/xfixes.h>
 #include <xcb/composite.h>
@@ -47,29 +46,7 @@ XWaylandWM::XWaylandWM(xcb_connection_t *connection) : connection_(connection),
 
 static pid_t s_xwayland_pid = 0;
 static char s_xwayland_display[32];
-
-static int wm_x11_error_handler(Display *dpy, XErrorEvent *err)
-{
-    // BadDamage: modal teardown can XDamageDestroy a damage the server already
-    // auto-freed when the dialog window was destroyed. Ignore like other teardown
-    // races. g_bridge_damage_error_base is set once the bridge queries XDamage.
-    extern int g_bridge_damage_error_base;
-    if (g_bridge_damage_error_base >= 0 &&
-        err->error_code == g_bridge_damage_error_base) return 0;
-
-    if (err->error_code == BadWindow   ||
-        err->error_code == BadDrawable ||
-        err->error_code == BadPixmap   ||
-        err->error_code == BadMatch    ||
-        err->error_code == BadAccess) return 0;
-#ifdef _DEBUG
-    char buf[256];
-    XGetErrorText(dpy, err->error_code, buf, sizeof(buf));
-    DEBUG_PRINT("X11 Error: %s (request %d, resource 0x%lx)\n",
-                buf, err->request_code, err->resourceid);
-#endif
-    return 0;
-}
+XWaylandWM *g_wm = nullptr;
 
 struct WMEventSource {
     GSource source;
@@ -125,11 +102,9 @@ XWaylandWM* XWaylandWM::init_bridge_wm()
     s_xwayland_pid = xw_spawn_xwayland(s_xwayland_display, sizeof(s_xwayland_display));
     if (s_xwayland_pid < 0) return nullptr;
 
-    XInitThreads();
-    XSetErrorHandler(wm_x11_error_handler);
-
-    g_wm_dpy = XOpenDisplay(s_xwayland_display);
-    if (!g_wm_dpy) {
+    xcb_connection_t *connection = xcb_connect(s_xwayland_display, nullptr);
+    if (xcb_connection_has_error(connection)) {
+        xcb_disconnect(connection);
         kill(s_xwayland_pid, SIGTERM);
         while (waitpid(s_xwayland_pid, nullptr, 0) < 0 && errno == EINTR) {}
         s_xwayland_pid = 0;
@@ -137,12 +112,14 @@ XWaylandWM* XWaylandWM::init_bridge_wm()
     }
 
     setenv("DISPLAY", s_xwayland_display, 1);
-    XSetEventQueueOwner(g_wm_dpy, XCBOwnsEventQueue);
-    g_wm = new XWaylandWM(XGetXCBConnection(g_wm_dpy));
+    free(xcb_composite_query_version_reply(connection,
+        xcb_composite_query_version(connection, 0, 4), nullptr));
+    g_wm = new XWaylandWM(connection);
 
-    Window support = XCreateSimpleWindow(g_wm_dpy, DefaultRootWindow(g_wm_dpy),
-                                         -2, -2, 1, 1, 0, 0, 0);
-    XMapWindow(g_wm_dpy, support);
+    xcb_window_t support = xcb_generate_id(connection);
+    xcb_create_window(connection, XCB_COPY_FROM_PARENT, support, g_wm->root_,
+        -2, -2, 1, 1, 0, XCB_WINDOW_CLASS_INPUT_OUTPUT, XCB_COPY_FROM_PARENT, 0, nullptr);
+    xcb_map_window(connection, support);
     g_wm->announce_wm(support);
     // Created before we held SubstructureRedirect, so no CreateNotify for it.
     g_wm->disallow_commits(support);
@@ -150,7 +127,7 @@ XWaylandWM* XWaylandWM::init_bridge_wm()
     static GSourceFuncs funcs = { wm_event_prepare, wm_event_check, wm_event_dispatch, nullptr, nullptr, nullptr };
     GSource *source = g_source_new(&funcs, sizeof(WMEventSource));
     WMEventSource *wm_source = (WMEventSource*)source;
-    wm_source->poll.fd = ConnectionNumber(g_wm_dpy);
+    wm_source->poll.fd = xcb_get_file_descriptor(connection);
     wm_source->poll.events = G_IO_IN | G_IO_HUP | G_IO_ERR;
     g_source_add_poll(source, &wm_source->poll);
     g_source_set_priority(source, GDK_PRIORITY_REDRAW + 1);
@@ -161,7 +138,7 @@ XWaylandWM* XWaylandWM::init_bridge_wm()
     return g_wm;
 }
 
-// ─── Atom initialisation ──────────────────────────────────────────────────────
+// ─── xcb_atom_t initialisation ──────────────────────────────────────────────────────
 
 void XWaylandWM::init_atoms() {
     xcb_intern_atom_cookie_t *cookies = xcb_ewmh_init_atoms(connection_, &atoms_);
@@ -181,7 +158,8 @@ void XWaylandWM::init_atoms() {
         { "XdndLeave", &atoms_.XdndLeave },
         { "XdndActionCopy", &atoms_.XdndActionCopy },
         { "text/uri-list", &atoms_.uri_list },
-        { "XWB_DND_DATA", &atoms_.dnd_data }
+        { "XWB_DND_DATA", &atoms_.dnd_data },
+        { "_MOTIF_WM_HINTS", &atoms_.motif_hints }
     };
     xcb_intern_atom_cookie_t requests[sizeof(extra) / sizeof(extra[0])];
     for (size_t i = 0; i < sizeof(extra) / sizeof(extra[0]); ++i)
@@ -203,7 +181,7 @@ void XWaylandWM::init_atoms() {
 // read content back from the composite pixmap, so nothing is lost. Only the WM
 // client (the one holding SubstructureRedirect on root) may set this property,
 // and it must be CARDINAL/32 with one item or Xwayland ignores it.
-void XWaylandWM::disallow_commits(Window w) {
+void XWaylandWM::disallow_commits(xcb_window_t w) {
     const uint32_t zero = 0;
     xcb_change_property(connection_, XCB_PROP_MODE_REPLACE, w, atoms_._XWAYLAND_ALLOW_COMMITS,
                         XCB_ATOM_CARDINAL, 32, 1, &zero);
@@ -211,7 +189,7 @@ void XWaylandWM::disallow_commits(Window w) {
 
 // ─── WM announcement (needed by native plugins that check for a WM) ───────────
 
-void XWaylandWM::announce_wm(Window support_win) {
+void XWaylandWM::announce_wm(xcb_window_t support_win) {
     support_win_ = support_win;
     set_active_window(XCB_NONE);
     xcb_ewmh_set_supporting_wm_check(&atoms_, root_, support_win);
@@ -253,15 +231,15 @@ void XWaylandWM::announce_wm(Window support_win) {
     xcb_flush(connection_);
 }
 
-void XWaylandWM::set_active_window(Window window) {
+void XWaylandWM::set_active_window(xcb_window_t window) {
     if (active_window_ == window) return;
     active_window_ = window;
     xcb_ewmh_set_active_window(&atoms_, 0, window);
     xcb_flush(connection_);
 }
 
-// ─── Window tracking ──────────────────────────────────────────────────────────
-void XWaylandWM::track_window(Window w) {
+// ─── xcb_window_t tracking ──────────────────────────────────────────────────────────
+void XWaylandWM::track_window(xcb_window_t w) {
     if (states_.count(w)) return;
 
     WMWindowState st{};
@@ -278,7 +256,7 @@ void XWaylandWM::track_window(Window w) {
     states_[w] = st;
 }
 
-void XWaylandWM::untrack_window(Window w) {
+void XWaylandWM::untrack_window(xcb_window_t w) {
     states_.erase(w);
     if (pending_focus_ == w) pending_focus_ = XCB_NONE;
 }
@@ -348,7 +326,7 @@ bool XWaylandWM::on_map_request(xcb_map_request_event_t *ev) {
 
 // ─── ConfigureRequest ─────────────────────────────────────────────────────────
 // Native plugins send ConfigureRequest to move/resize themselves.
-// We MUST respond with XConfigureWindow or they stall waiting.
+// We MUST respond with ConfigureWindow or they stall waiting.
 
 bool XWaylandWM::on_configure_request(xcb_configure_request_event_t *ev) {
     honour_configure_request(ev);
@@ -417,7 +395,7 @@ bool XWaylandWM::on_destroy_notify(xcb_destroy_notify_event_t *ev) {
 }
 
 // ─── WM_TAKE_FOCUS / WM_DELETE_WINDOW ────────────────────────────────────────
-void XWaylandWM::send_take_focus(Window w, xcb_timestamp_t t) {
+void XWaylandWM::send_take_focus(xcb_window_t w, xcb_timestamp_t t) {
     xcb_client_message_event_t event = {};
     event.response_type = XCB_CLIENT_MESSAGE;
     event.window = w;
@@ -430,13 +408,13 @@ void XWaylandWM::send_take_focus(Window w, xcb_timestamp_t t) {
 
 // ─── WM_STATE property helper ─────────────────────────────────────────────────
 // ICCCM §4.1.3.1  WM_STATE = { state, icon_window }
-void XWaylandWM::set_wm_state(Window w, int state) {
+void XWaylandWM::set_wm_state(xcb_window_t w, int state) {
     const uint32_t data[] = { (uint32_t)state, XCB_NONE };
     xcb_change_property(connection_, XCB_PROP_MODE_REPLACE, w, atoms_.WM_STATE, atoms_.WM_STATE, 32, 2, data);
 }
 
 // ─── Read WM_PROTOCOLS ────────────────────────────────────────────────────────
-void XWaylandWM::read_wm_protocols(Window w, WMWindowState &st) {
+void XWaylandWM::read_wm_protocols(xcb_window_t w, WMWindowState &st) {
     st.take_focus = false;
     xcb_icccm_get_wm_protocols_reply_t protocols;
     if (!xcb_icccm_get_wm_protocols_reply(connection_,
@@ -447,7 +425,7 @@ void XWaylandWM::read_wm_protocols(Window w, WMWindowState &st) {
 }
 
 // ─── Read WM_HINTS ────────────────────────────────────────────────────────────
-void XWaylandWM::read_wm_hints(Window w, WMWindowState &st) {
+void XWaylandWM::read_wm_hints(xcb_window_t w, WMWindowState &st) {
     xcb_icccm_wm_hints_t hints;
     st.input_hint = true;
     if (xcb_icccm_get_wm_hints_reply(connection_, xcb_icccm_get_wm_hints(connection_, w), &hints, nullptr) &&
@@ -457,147 +435,53 @@ void XWaylandWM::read_wm_hints(Window w, WMWindowState &st) {
 
 
 
-bool is_window_from_owned_plugin(Display *dpy, Window org_win, Window gui_win) {
-    // Check if this window has the same PID as our plugin
-    Atom atom_pid = XInternAtom(dpy, "_NET_WM_PID", False);
-    Atom actual_type;
-    int actual_format;
-    unsigned long nitems, bytes_after;
-    unsigned char *prop = NULL;
-
-    pid_t window_pid = 0;
-    if (XGetWindowProperty(dpy, org_win, atom_pid, 0, 1, False, XA_CARDINAL,
-                           &actual_type, &actual_format, &nitems, &bytes_after, &prop) == Success) {
-        if (prop && nitems > 0) {
-            window_pid = *((pid_t*)prop);
-            XFree(prop);
-        }
-    }
-
-    // Get our plugin's PID (from main_plugin_gui)
-    pid_t our_pid = 0;
-    if (XGetWindowProperty(dpy, gui_win, atom_pid, 0, 1, False, XA_CARDINAL,
-                           &actual_type, &actual_format, &nitems, &bytes_after, &prop) == Success) {
-        if (prop && nitems > 0) {
-            our_pid = *((pid_t*)prop);
-            XFree(prop);
-        }
-    }
-
-    if (window_pid == 0 || our_pid == 0 || window_pid != our_pid) {
-        return FALSE;
-    }
-
-    return TRUE;
+bool XWaylandWM::owns_window(xcb_window_t window, xcb_window_t gui)
+{
+    uint32_t window_pid = 0, gui_pid = 0;
+    xcb_get_property_cookie_t a = xcb_ewmh_get_wm_pid(&atoms_, window);
+    xcb_get_property_cookie_t b = xcb_ewmh_get_wm_pid(&atoms_, gui);
+    xcb_ewmh_get_wm_pid_reply(&atoms_, a, &window_pid, nullptr);
+    xcb_ewmh_get_wm_pid_reply(&atoms_, b, &gui_pid, nullptr);
+    return window_pid && window_pid == gui_pid;
 }
 
-// Motif hints tell us whether a window wants decorations. yabridge popups and
-// modals both arrive as NORMAL type with the yabridge class; the difference is
-// that a popup disables decorations (MWM_HINTS_DECORATIONS set, decorations==0)
-// while a real modal dialog keeps them. This is the signal that separates them.
-struct MotifWmHints {
-    unsigned long flags;
-    unsigned long functions;
-    unsigned long decorations;
-    long          input_mode;
-    unsigned long status;
-};
-#define MWM_HINTS_DECORATIONS (1L << 1)
-
-static bool hasMotifHints(Display *dpy, Window win, MotifWmHints &out) {
-    Atom a = XInternAtom(dpy, "_MOTIF_WM_HINTS", True);
-    if (a == None) return false;
-
-    Atom actual_type; int actual_format;
-    unsigned long nitems, bytes_after;
-    unsigned char *prop = nullptr;
-    if (XGetWindowProperty(dpy, win, a, 0, 5, False, a,
-                           &actual_type, &actual_format,
-                           &nitems, &bytes_after, &prop) != Success)
-        return false;
-    if (!prop || actual_format != 32 || nitems < 5) { if (prop) XFree(prop); return false; }
-
-    const long *l = reinterpret_cast<long*>(prop);
-    out.flags = l[0]; out.functions = l[1]; out.decorations = l[2];
-    out.input_mode = l[3]; out.status = l[4];
-    XFree(prop);
-    return true;
-}
-
-bool classify_popup(Display *dpy, Window win, XWindowAttributes *attr) {
-    if (!dpy || !win) return false;
-
-    Atom atom_window_type        = XInternAtom(dpy, "_NET_WM_WINDOW_TYPE", False);
-    Atom atom_type_normal        = XInternAtom(dpy, "_NET_WM_WINDOW_TYPE_NORMAL", False);
-    Atom atom_type_dialog        = XInternAtom(dpy, "_NET_WM_WINDOW_TYPE_DIALOG", False);
-    Atom atom_type_popup_menu    = XInternAtom(dpy, "_NET_WM_WINDOW_TYPE_POPUP_MENU", False);
-    Atom atom_type_menu          = XInternAtom(dpy, "_NET_WM_WINDOW_TYPE_MENU", False);
-    Atom atom_type_dropdown_menu = XInternAtom(dpy, "_NET_WM_WINDOW_TYPE_DROPDOWN_MENU", False);
-    Atom atom_type_tooltip       = XInternAtom(dpy, "_NET_WM_WINDOW_TYPE_TOOLTIP", False);
-    Atom atom_type_dnd           = XInternAtom(dpy, "_NET_WM_WINDOW_TYPE_DND", False);
-    Atom atom_type_utility       = XInternAtom(dpy, "_NET_WM_WINDOW_TYPE_UTILITY", False);
-
-    bool is_popup = false;
-    Window transient_for = None;
-    XGetTransientForHint(dpy, win, &transient_for);
-
-    std::vector<Atom> window_types;
-    Atom actual_type;
-    int actual_format;
-    unsigned long nitems = 0, bytes_after = 0;
-    unsigned char* prop = nullptr;
-
-    if (XGetWindowProperty(dpy, win, atom_window_type, 0, 10,
-                           False, XA_ATOM, &actual_type, &actual_format,
-                           &nitems, &bytes_after, &prop) == Success) {
-        if (prop) {
-            if (actual_format == 32 && nitems > 0) {
-                Atom* atoms = (Atom*)prop;  // Simple C cast is fine
-                window_types.assign(atoms, atoms + nitems);
-            }
-            XFree(prop);
+XWaylandWM::WindowType XWaylandWM::window_type(xcb_window_t window, bool override_redirect)
+{
+    xcb_ewmh_get_atoms_reply_t types;
+    xcb_atom_t type = XCB_NONE;
+    if (xcb_ewmh_get_wm_window_type_reply(&atoms_, xcb_ewmh_get_wm_window_type(&atoms_, window), &types, nullptr)) {
+        for (uint32_t i = 0; i < types.atoms_len; ++i) {
+            const xcb_atom_t candidate = types.atoms[i];
+            if (candidate == atoms_._NET_WM_WINDOW_TYPE_DND) { type = candidate; break; }
+            if (!type && (candidate == atoms_._NET_WM_WINDOW_TYPE_NORMAL ||
+                candidate == atoms_._NET_WM_WINDOW_TYPE_DIALOG || candidate == atoms_._NET_WM_WINDOW_TYPE_UTILITY ||
+                candidate == atoms_._NET_WM_WINDOW_TYPE_POPUP_MENU || candidate == atoms_._NET_WM_WINDOW_TYPE_MENU ||
+                candidate == atoms_._NET_WM_WINDOW_TYPE_DROPDOWN_MENU || candidate == atoms_._NET_WM_WINDOW_TYPE_TOOLTIP))
+                type = candidate;
         }
+        xcb_ewmh_get_atoms_reply_wipe(&types);
     }
-
-    if (window_types.empty()) {
-        if (transient_for != None) {
-            window_types.push_back(atom_type_dialog);
-        } else {
-            window_types.push_back(atom_type_normal);
-        }
+    if (type == atoms_._NET_WM_WINDOW_TYPE_DND) return DRAG_ICON;
+    if (override_redirect) return POPUP;
+    if (type == atoms_._NET_WM_WINDOW_TYPE_POPUP_MENU || type == atoms_._NET_WM_WINDOW_TYPE_MENU ||
+        type == atoms_._NET_WM_WINDOW_TYPE_DROPDOWN_MENU || type == atoms_._NET_WM_WINDOW_TYPE_TOOLTIP) return POPUP;
+    if (!type) {
+        xcb_window_t transient = XCB_NONE;
+        xcb_icccm_get_wm_transient_for_reply(connection_,
+            xcb_icccm_get_wm_transient_for(connection_, window), &transient, nullptr);
+        type = transient ? atoms_._NET_WM_WINDOW_TYPE_DIALOG : atoms_._NET_WM_WINDOW_TYPE_NORMAL;
     }
+    if (type != atoms_._NET_WM_WINDOW_TYPE_NORMAL) return NORMAL;
 
-    bool override_redirect = attr->override_redirect;
-
-    // Decoration state: a decoration-less window is a popup, a decorated one is
-    // a real (modal) window
-    bool motif_popup = false;
-    MotifWmHints mh;
-    if (hasMotifHints(dpy, win, mh))
-        motif_popup = (mh.flags & MWM_HINTS_DECORATIONS) && mh.decorations == 0;
-
-    for (Atom ty : window_types) {
-        if (ty == atom_type_normal) {
-            is_popup = override_redirect || motif_popup;
-        }
-        else if (ty == atom_type_dialog || ty == atom_type_utility) {
-            is_popup = override_redirect;
-        }
-        else if (
-            ty == atom_type_popup_menu ||
-            ty == atom_type_menu ||
-            ty == atom_type_dropdown_menu ||
-            ty == atom_type_tooltip ||
-            ty == atom_type_dnd
-        ) {
-            is_popup = true;
-        }
-        else {
-            continue;   // unknown → try next
-        }
-        break;
+    xcb_get_property_reply_t *motif = xcb_get_property_reply(connection_,
+        xcb_get_property(connection_, false, window, atoms_.motif_hints, atoms_.motif_hints, 0, 5), nullptr);
+    bool undecorated = false;
+    if (motif && motif->format == 32 && motif->value_len >= 3) {
+        const uint32_t *values = (const uint32_t*)xcb_get_property_value(motif);
+        undecorated = (values[0] & (1U << 1)) && !values[2];
     }
-    return is_popup;
+    free(motif);
+    return undecorated ? POPUP : NORMAL;
 }
 
 // ─── Drag-and-drop OUT of a plugin (yabridge -> REAPER) ──────────────────────
@@ -615,7 +499,7 @@ bool classify_popup(Display *dpy, Window win, XWindowAttributes *attr) {
 // the drop to the native side. XFixes tells us when a drag starts, because yabridge
 // takes ownership of the XdndSelection selection at that moment.
 //
-// Everything below is plain Xlib/XFixes protocol handling -- no GTK, GDK, or SWELL --
+// Everything below is plain XCB/XFixes protocol handling -- no GTK, GDK, or SWELL --
 // so it lives here rather than in the bridge. Turning the fetched payload into an
 // actual native drag (GTK/SWELL, or anything else) is the caller's job; see
 // dnd_take_pending_path() and dnd_release_source_button() in the header.
@@ -660,7 +544,7 @@ void XWaylandWM::dnd_catcher_show(bool on)
     xcb_flush(connection_);
 }
 
-void XWaylandWM::dnd_send_status(Window src, bool accepted)
+void XWaylandWM::dnd_send_status(xcb_window_t src, bool accepted)
 {
     xcb_client_message_event_t event = {};
     event.response_type = XCB_CLIENT_MESSAGE;
@@ -674,7 +558,7 @@ void XWaylandWM::dnd_send_status(Window src, bool accepted)
     xcb_flush(connection_);
 }
 
-void XWaylandWM::dnd_send_finished(Window src, bool accepted)
+void XWaylandWM::dnd_send_finished(xcb_window_t src, bool accepted)
 {
     xcb_client_message_event_t event = {};
     event.response_type = XCB_CLIENT_MESSAGE;
@@ -710,16 +594,16 @@ bool XWaylandWM::dnd_handle_event(xcb_generic_event_t *ev)
     {
         xcb_xfixes_selection_notify_event_t *se = (xcb_xfixes_selection_notify_event_t*)ev;
         if (se->selection == atoms_.XdndSelection) {
-            if (se->owner != None) dnd_reset_payload();
-            dnd_catcher_show(se->owner != None);
+            if (se->owner != XCB_NONE) dnd_reset_payload();
+            dnd_catcher_show(se->owner != XCB_NONE);
         }
         return true;
     }
 
     if ((ev->response_type & 0x7f) == XCB_CLIENT_MESSAGE && ((xcb_client_message_event_t*)ev)->window == dnd_catcher_)
     {
-        const Atom   mt  = ((xcb_client_message_event_t*)ev)->type;
-        const Window src = (Window)((xcb_client_message_event_t*)ev)->data.data32[0];
+        const xcb_atom_t   mt  = ((xcb_client_message_event_t*)ev)->type;
+        const xcb_window_t src = (xcb_window_t)((xcb_client_message_event_t*)ev)->data.data32[0];
 
         if (mt == atoms_.XdndEnter) {
             dnd_source_ = src;
@@ -751,7 +635,7 @@ bool XWaylandWM::dnd_handle_event(xcb_generic_event_t *ev)
         }
         if (mt == atoms_.XdndDrop) {
             if (!dnd_have_uri_) {   // fallback: ask now, late but better than never
-                const Time when = (Time)((xcb_client_message_event_t*)ev)->data.data32[2];
+                const xcb_timestamp_t when = (xcb_timestamp_t)((xcb_client_message_event_t*)ev)->data.data32[2];
                 xcb_convert_selection(connection_, dnd_catcher_, atoms_.XdndSelection, atoms_.uri_list,
                                       atoms_.dnd_data, when);
                 xcb_flush(connection_);
@@ -790,57 +674,34 @@ bool XWaylandWM::dnd_handle_event(xcb_generic_event_t *ev)
 
 // "file:///a/b%20c.mid\r\n" -> "/a/b c.mid". Toolkit drag sources typically re-encode
 // this when building their own text/uri-list, so callers want a plain path back.
-static void dnd_uri_to_path(const char *uri, char *out, size_t outsz)
-{
-    out[0] = 0;
-    if (!uri) return;
-    if (!strncmp(uri, "file://", 7)) uri += 7;
-    // Hand-rolled hex decode: kept dependency-free rather than pulling in
-    // <ctype.h>/<stdlib.h> for a WM layer that otherwise only needs Xlib.
-    auto hexval = [](char ch) -> int {
-        if (ch >= '0' && ch <= '9') return ch - '0';
-        if (ch >= 'a' && ch <= 'f') return ch - 'a' + 10;
-        if (ch >= 'A' && ch <= 'F') return ch - 'A' + 10;
-        return -1;
-    };
-    size_t o = 0;
-    while (*uri && *uri != '\r' && *uri != '\n' && o + 1 < outsz) {
-        int h1, h2;
-        if (uri[0] == '%' && uri[1] && uri[2] &&
-            (h1 = hexval(uri[1])) >= 0 && (h2 = hexval(uri[2])) >= 0) {
-            out[o++] = (char)((h1 << 4) | h2);
-            uri += 3;
-        } else {
-            out[o++] = *uri++;
-        }
-    }
-    out[o] = 0;
-}
-
 bool XWaylandWM::dnd_take_pending_path(char *out, size_t outsz)
 {
     if (out && outsz) out[0] = 0;
     if (!dnd_pending_) return false;
     dnd_pending_ = false;
-    if (out) dnd_uri_to_path(dnd_uri_, out, outsz);
-    return true;
+    if (!out || !outsz) return false;
+    gchar **uris = g_uri_list_extract_uris(dnd_uri_);
+    gchar *path = uris && uris[0] ? g_filename_from_uri(uris[0], nullptr, nullptr) : nullptr;
+    if (path && strlen(path) < outsz) g_strlcpy(out, path, outsz);
+    g_free(path);
+    g_strfreev(uris);
+    return out[0] != 0;
 }
 
-void XWaylandWM::dnd_release_source_button(Display *dpy)
+void XWaylandWM::dnd_release_source_button(xcb_connection_t *connection)
 {
     // SWELL's (or any toolkit's) native drag source takes the pointer capture, so the
-    // button release went to it and never reached :10 -- yabridge's drag loop waits
+    // button release went to it and never reached Xwayland -- yabridge's drag loop waits
     // for exactly that release, so without this it keeps its pointer grab forever and
     // the NEXT drag wedges the plugin.
-    if (!dpy) return;
+    if (!connection) return;
     // The bridge's own motion forwarding stops once the toolkit's native drag grabs
-    // input, so :10's virtual pointer has been sitting frozen since before the drag
+    // input, so Xwayland's virtual pointer has been sitting frozen since before the drag
     // started. Nudge it with a motion at its own current position first -- observed
     // behaviour is yabridge's drag loop not noticing a release for a long stretch
     // (more XdndPosition traffic keeps arriving afterwards) before eventually giving
     // up via XdndLeave rather than resolving via XdndDrop; a coincident motion+release
     // pair is closer to what a real release looks like than a release alone.
-    xcb_connection_t *connection = XGetXCBConnection(dpy);
     xcb_query_pointer_reply_t *pointer = xcb_query_pointer_reply(connection,
         xcb_query_pointer(connection, root_), nullptr);
     if (pointer) {
