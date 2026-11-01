@@ -1760,6 +1760,11 @@ static void swell_wayland_paint_manual_titlebar(HWND hwnd, GdkWindow *window, ca
   const char *title = hwnd->m_title.Get();
   if (title && title[0])
   {
+    cairo_save(cr);
+    cairo_rectangle(cr, 8 + bw, bw,
+      wdl_max(0, full_w - bw*2 - 16 - SWELL_WAYLAND_TITLEBAR_CLOSEBTN_W * (has_minmax ? 3 : 1)),
+      g_swell_wayland_title_h);
+    cairo_clip(cr);
     cairo_set_source_rgb(cr, 0.85, 0.85, 0.85);
     cairo_select_font_face(cr, "sans-serif", CAIRO_FONT_SLANT_NORMAL, CAIRO_FONT_WEIGHT_NORMAL);
     cairo_set_font_size(cr, 13.0);
@@ -1767,6 +1772,7 @@ static void swell_wayland_paint_manual_titlebar(HWND hwnd, GdkWindow *window, ca
     cairo_text_extents(cr, title, &ext);
     cairo_move_to(cr, 8 + bw, bw + (g_swell_wayland_title_h + ext.height) / 2.0);
     cairo_show_text(cr, title);
+    cairo_restore(cr);
   }
 
   const double cy = bw + g_swell_wayland_title_h / 2.0;
