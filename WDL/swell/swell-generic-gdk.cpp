@@ -1961,6 +1961,8 @@ static void OnConfigureEvent(GdkEventConfigure *cfg)
   HWND hwnd = swell_oswindow_to_hwnd(cfg->window);
   if (!hwnd) return;
 #ifdef SWELL_TARGET_WAYLAND
+  if (GDK_IS_WAYLAND_WINDOW(cfg->window) &&
+      (cfg->width != gdk_window_get_width(cfg->window) || cfg->height != gdk_window_get_height(cfg->window))) return;
   const int scale = swell_gdk_window_scale(cfg->window);
   GdkEventConfigure pixel_event = *cfg;
   pixel_event.x *= scale;
@@ -3262,15 +3264,6 @@ void SWELL_RunEvents()
       }
 #endif
       if (!dispatched) break;
-      GdkEvent *evt;
-      while (gdk_events_pending() && (evt = gdk_event_get()))
-      {
-        swell_gdkEventHandler(evt,(gpointer)1);
-        gdk_event_free(evt);
-#ifdef SWELL_TARGET_WAYLAND
-        if (g_get_monotonic_time() >= deadline) break;
-#endif
-      }
 #ifdef SWELL_TARGET_WAYLAND
       if (g_get_monotonic_time() >= deadline) break;
 #endif
@@ -3826,28 +3819,7 @@ static HANDLE req_clipboard(GdkAtom type)
     DWORD startt = GetTickCount();
     for (;;)
     {
-      while (!s_clipboard_getstate && g_main_context_iteration(ctx,FALSE))
-      {
-        GdkEvent *evt;
-        while (!s_clipboard_getstate && gdk_events_pending() && (evt = gdk_event_get()))
-        {
-          switch (evt->type)
-          {
-            case GDK_SELECTION_NOTIFY:
-            case GDK_SELECTION_REQUEST:
-            case GDK_EXPOSE:
-            case GDK_CONFIGURE:
-            case GDK_WINDOW_STATE:
-            case GDK_GRAB_BROKEN:
-              swell_gdkEventHandler(evt,(gpointer)1);
-            break;
-            default:
-              // not ideal to drop events, but hm
-            break;
-          }
-          gdk_event_free(evt);
-        }
-      }
+      while (!s_clipboard_getstate && GetTickCount()-startt < 500 && g_main_context_iteration(ctx,FALSE)) {}
 
       if (s_clipboard_getstate) 
       {
@@ -4631,6 +4603,7 @@ bool swell_x11_drag_event(GdkEvent *evt)
   // GDK_DROP_START
 
   HWND hwnd = swell_oswindow_to_hwnd(((GdkEventAny*)evt)->window);
+  if (!hwnd) return false;
   GdkEventDND *e = (GdkEventDND *)evt;
 
   switch (evt->type)
