@@ -410,11 +410,14 @@ static bool on_motion(GtkWidget *, GdkEventMotion *e, gpointer data)
         if (path[0]) {
             DEBUG_PRINT("[DNDX] starting native drag: %s\n", path);
             Capture *cc = (Capture*)data;
+            const xcb_window_t parent = cc ? cc->parent_win : XCB_NONE;
             const char *lst[1] = { path };
             SWELL_InitiateDragDropOfFileList(cc ? cc->hwnd : NULL, NULL, lst, 1, NULL);
             DEBUG_PRINT("[DNDX] native drag finished\n");
 
-            if (cc && cc->connection) g_wm->dnd_release_source_button(cc->connection);
+            const auto it = g_captures.find(parent);
+            if (!cc || it == g_captures.end() || it->second != cc) return true;
+            if (cc->connection) g_wm->dnd_release_source_button(cc->connection);
         }
     }
 
