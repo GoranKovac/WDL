@@ -87,7 +87,7 @@ CFLAGS += -O2 -DNDEBUG
   endif
 endif
 
-LINKEXTRA =  -lpthread -ldl -lX11
+LINKEXTRA =  -lpthread -ldl
 
 
 EXTRA_OBJS = 
@@ -108,27 +108,29 @@ LICE_OBJS = lice.o  lice_arc.o lice_colorspace.o lice_line.o lice_text.o \
 
 OBJS = $(SWELL_OBJS)
 
-#Wayland (SWELL_TARGET_WAYLAND) depends on GTK3 so load it automatically
-ifdef WAYLAND
-  SWELL_OBJS += xwayland-bridge.o xwayland-bridge-wm.o xwayland-bridge-display.o
-  CFLAGS += $(shell $(PKG_CONFIG) --cflags wayland-client xrandr x11-xcb xcb-shm)
-  LINKEXTRA += -lXcomposite -lXtst -lXfixes -lXext -lXrender $(shell $(PKG_CONFIG) --libs wayland-client xrandr x11-xcb xcb-shm)
-  override SWELL_GDK_ONLY =
-  # spare-window for modal dialogs doesn't resize on an already 
-	# mapped Wayland so disable it
-  CFLAGS += -DSWELL_NO_SPARE_MODALDLG
-endif
-
 ifndef NOGDK
+  SWELL_OBJS += swell-generic-x11.o
+  CFLAGS += $(shell $(PKG_CONFIG) --cflags x11-xcb xcb-icccm xcb-xinput)
+  LINKEXTRA += $(shell $(PKG_CONFIG) --libs x11-xcb xcb-icccm xcb-xinput)
   ifdef GDK2
     CFLAGS += -DSWELL_TARGET_GDK=2 $(shell $(PKG_CONFIG) --cflags gdk-2.0)
     ifndef PRELOAD_GDK
       LINKEXTRA += $(shell $(PKG_CONFIG) --libs gdk-2.0)
     else
-      LINKEXTRA += -lX11 -lXi
+      LINKEXTRA += -lX11
       CFLAGS += -DSWELL_PRELOAD="libgdk-x11-2.0.so.0"
     endif
   else
+    #Wayland (SWELL_TARGET_WAYLAND) depends on GTK3 so load it automatically
+    ifdef WAYLAND
+      SWELL_OBJS += swell-generic-wayland.o xwayland-bridge.o xwayland-bridge-wm.o xwayland-bridge-display.o xwayland-bridge-gl.o xwayland-bridge-image.o
+      CFLAGS += $(shell $(PKG_CONFIG) --cflags wayland-client wayland-egl xcb-keysyms xcb-randr xcb-damage xcb-shape xcb-shm xcb-dri3 xcb-sync xcb-composite xcb-ewmh xcb-icccm xcb-xtest xcb-xfixes xcb-image xcb-renderutil cairo-xcb epoxy libdrm)
+      LINKEXTRA += $(shell $(PKG_CONFIG) --libs wayland-client wayland-egl xcb-keysyms xcb-randr xcb-damage xcb-shape xcb-shm xcb-dri3 xcb-sync xcb-composite xcb-ewmh xcb-icccm xcb-xtest xcb-xfixes xcb-image xcb-renderutil cairo-xcb epoxy libdrm)
+      override SWELL_GDK_ONLY =
+      # spare-window for modal dialogs doesn't resize on an already
+      # mapped Wayland so disable it
+      CFLAGS += -DSWELL_NO_SPARE_MODALDLG
+    endif
     ifndef SWELL_GDK_ONLY
       CFLAGS += -DSWELL_TARGET_GDK=3 $(shell $(PKG_CONFIG) --cflags gtk+-3.0) -DSWELL_SUPPORT_GTK
     else
@@ -138,10 +140,10 @@ ifndef NOGDK
       ifndef SWELL_GDK_ONLY
         LINKEXTRA += $(shell $(PKG_CONFIG) --libs gtk+-3.0)
       else
-        LINKEXTRA += $(shell $(PKG_CONFIG) --libs gdk-3.0)
+        LINKEXTRA += $(shell $(PKG_CONFIG) --libs gdk-3.0 gio-2.0)
       endif
     else
-      LINKEXTRA += -lX11 -lXi
+      LINKEXTRA += -lX11
       ifdef WAYLAND
         CFLAGS += -DSWELL_PRELOAD="libgtk-3.so.0"
       else
@@ -192,8 +194,15 @@ swell-kb-generic.o: $(SWELL_HEADERS)
 swell-miscdlg-generic.o: $(SWELL_HEADERS)
 swell-modstub-generic.o: $(SWELL_HEADERS)
 swell-appstub-generic.o: $(SWELL_HEADERS)
-swell-generic-gdk.o xwayland-bridge.o: $(SWELL_HEADERS)
+swell-generic-gdk.o xwayland-bridge.o swell-generic-x11.o swell-generic-wayland.o: $(SWELL_HEADERS)
+swell-generic-gdk.o swell-generic-x11.o: swell-x11.h swell-xcb.h
+swell-generic-gdk.o swell-generic-x11.o swell-generic-wayland.o: swell-gdk.h
+swell-generic-gdk.o swell-generic-wayland.o xwayland-bridge.o: swell-wayland.h
+swell-generic-gdk.o xwayland-bridge.o swell-generic-wayland.o: xwayland-bridge.h
+xwayland-bridge.o xwayland-bridge-wm.o: xwayland-bridge-wm.h swell-xcb.h
 xwayland-bridge-wm.o xwayland-bridge-display.o: xwayland-bridge-display.h
+xwayland-bridge.o xwayland-bridge-gl.o: xwayland-bridge-gl.h
+xwayland-bridge.o xwayland-bridge-gl.o xwayland-bridge-image.o: xwayland-bridge-image.h swell-xcb.h
 
 libSwell$(DLL_EXT): $(OBJS)
 	$(CXX) -shared -o $@ $(CFLAGS) $(LFLAGS) $^ $(LINKEXTRA)

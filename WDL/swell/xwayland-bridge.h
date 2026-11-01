@@ -1,33 +1,10 @@
 #pragma once
 
-#include <X11/Xlib.h>
-#include <X11/Xatom.h>
-#include <X11/extensions/Xcomposite.h>
-#include <X11/extensions/XTest.h>
-#include <cairo-xlib.h>
-
-#include <glib.h>
-
-#include <map>
-#include <vector>
-#include <algorithm>
-#include <sys/wait.h>
-#include <signal.h>
-
-#include <gtk/gtk.h>
 #include <gdk/gdk.h>
-#include <GL/glx.h>
-
-#include <sys/prctl.h>
-#include <X11/extensions/Xdamage.h>
-#include "xwayland-bridge-wm.h"
 #include "swell.h"
-#include "swell-internal.h"
-
-extern int g_swell_wayland_title_h;
-extern int SWELL_WAYLAND_BORDER_WIDTH;
 
 void init_private_xwayland();
+void xw_bridge_detach_children(HWND hwnd);
 HWND xw_bridge_create(
     HWND viewpar,
     void **wref,
@@ -41,8 +18,7 @@ bool xw_bridge_forward_key(HWND hwnd, int keycode, int state, bool is_press);
 // host->plugin call blocks REAPER's UI thread in recv() and hangs it outright.
 bool xw_bridge_forward_key_to_modal(int keycode, int state, bool is_press);
 bool xw_bridge_swell_on_button_event_escape();
-bool xw_bridge_swell_on_gdk_delete_release();
+bool xw_bridge_swell_on_gdk_delete_release(HWND hwnd);
 bool xw_bridge_has_pending_draw();
+bool xw_bridge_draw(GdkWindow *window);
 void xw_clip_capture_regions(GdkWindow *window, cairo_region_t *region);
-extern XWaylandWM *g_wm;
-extern Display *g_wm_dpy;

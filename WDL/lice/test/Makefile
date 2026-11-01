@@ -11,13 +11,15 @@ CFLAGS += -D_LICE_NO_SYSBITMAPS_
 SWELL_OBJS =
 else
   CFLAGS += -DSWELL_LICE_GDI
+  CFLAGS += $(shell pkg-config --cflags x11-xcb xcb-icccm xcb-xinput)
+  LFLAGS += $(shell pkg-config --libs x11-xcb xcb-icccm xcb-xinput)
 
   ifdef GDK2
     CFLAGS += -DSWELL_TARGET_GDK=2 $(shell pkg-config --cflags gdk-2.0)
-    LFLAGS += $(shell pkg-config --libs gdk-2.0) -lX11 -lXi
+    LFLAGS += $(shell pkg-config --libs gdk-2.0) -lX11
   else
     CFLAGS += -DSWELL_TARGET_GDK=3 $(shell pkg-config --cflags gdk-3.0)
-    LFLAGS += $(shell pkg-config --libs gdk-3.0) -lX11 -lXi
+    LFLAGS += $(shell pkg-config --libs gdk-3.0 gio-2.0) -lX11
   endif
   ifndef NOFREETYPE
     CFLAGS += -DSWELL_FREETYPE $(shell pkg-config --cflags freetype2)
@@ -26,10 +28,10 @@ else
 
   SWELL_OBJS = swell-wnd-generic.o swell-gdi-lice.o swell.o swell-misc-generic.o \
                swell-dlg-generic.o swell-menu-generic.o swell-kb-generic.o \
-               swell-gdi-generic.o swell-ini.o swell-generic-gdk.o \
+               swell-gdi-generic.o swell-ini.o swell-generic-gdk.o swell-generic-x11.o \
                swell-appstub-generic.o swell-miscdlg-generic.o
 
-  LFLAGS += -ldl
+  LFLAGS += -ldl -lGL
 
   vpath %.cpp $(WDL_PATH)/swell
 endif

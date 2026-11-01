@@ -406,20 +406,18 @@ LRESULT SendMessage(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
 
     SWELL_MessageQueue_Clear(hwnd);
     // send WM_DESTROY to all children
-    HWND tmp=hwnd->m_children;
-    while (tmp)
+    for (int owned = 0; owned < 2; ++owned)
     {
-      HWND old = tmp;
-      tmp=tmp->m_next;
-      SendMessage(old,WM_DESTROY,0,0);
-    }
-    {
-      tmp=hwnd->m_owned_list;
-      while (tmp)
+      WDL_PtrList<HWND__> windows;
+      for (HWND h = owned ? hwnd->m_owned_list : hwnd->m_children; h;
+           h = owned ? h->m_owned_next : h->m_next)
+        if (windows.Add(h)) h->Retain();
+      for (int i = 0; i < windows.GetSize(); ++i)
       {
-        HWND old = tmp;
-        tmp=tmp->m_owned_next;
-        if (!IsModalDialogBox(old)) SendMessage(old,WM_DESTROY,0,0);
+        HWND h = windows.Get(i);
+        if (owned ? h->m_owner == hwnd && !IsModalDialogBox(h) : h->m_parent == hwnd)
+          SendMessage(h,WM_DESTROY,0,0);
+        h->Release();
       }
     }
     if (SWELL_focused_oswindow && SWELL_focused_oswindow == hwnd->m_oswindow)
@@ -705,6 +703,7 @@ void GetClientRect(HWND hwnd, RECT *r)
 void SetWindowPos(HWND hwnd, HWND zorder, int x, int y, int cx, int cy, int flags)
 {
   if (WDL_NOT_NORMALLY(!hwnd)) return;
+  hwnd->Retain();
  // todo: handle SWP_SHOWWINDOW
   RECT f = hwnd->m_position;
   int reposflag = 0;
@@ -789,10 +788,12 @@ void SetWindowPos(HWND hwnd, HWND zorder, int x, int y, int cx, int cy, int flag
     else
     {
       if (reposflag&2) SendMessage(hwnd,WM_SIZE,SIZE_RESTORED,0);
-      InvalidateRect(hwnd->m_parent ? hwnd->m_parent : hwnd,NULL,FALSE);
+      if (!hwnd->m_hashaddestroy)
+        InvalidateRect(hwnd->m_parent ? hwnd->m_parent : hwnd,NULL,FALSE);
     }
   }
-  swell_oswindow_postresize(hwnd,f);
+  if (!hwnd->m_hashaddestroy) swell_oswindow_postresize(hwnd,f);
+  hwnd->Release();
 }
 
 
@@ -7239,7 +7240,13 @@ BOOL InvalidateRect(HWND hwnd, const RECT *r, int eraseBk)
     NCCALCSIZE_PARAMS tr;
     memset(&tr,0,sizeof(tr));
     tr.rgrc[0] = ncrect;
-    if (h->m_wndproc) h->m_wndproc(h,WM_NCCALCSIZE,0,(LPARAM)&tr);
+    hwnd->Retain();
+    h->Retain();
+    SendMessage(h,WM_NCCALCSIZE,0,(LPARAM)&tr);
+    const bool destroyed = h->m_hashaddestroy || hwnd->m_hashaddestroy;
+    h->Release();
+    hwnd->Release();
+    if (destroyed) return FALSE;
 
     WinOffsetRect(&rect,tr.rgrc[0].left, tr.rgrc[0].top);
 
@@ -8777,13 +8784,16 @@ void SWELL_DrawFocusRect(HWND hwndPar, RECT *rct, void **handle)
 
 void SWELL_BroadcastMessage(UINT uMsg, WPARAM wParam, LPARAM lParam)
 {
-  HWND h = SWELL_topwindows;
-  while (h) 
-  { 
+  WDL_PtrList<HWND__> windows;
+  for (HWND h = SWELL_topwindows; h; h = h->m_next)
+    if (windows.Add(h)) h->Retain();
+  for (int i = 0; i < windows.GetSize(); ++i)
+  {
+    HWND h = windows.Get(i);
     SendMessage(h,uMsg,wParam,lParam);
-    if (uMsg == WM_DISPLAYCHANGE)
+    if (uMsg == WM_DISPLAYCHANGE && !h->m_hashaddestroy)
       InvalidateRect(h,NULL,FALSE);
-    h = h->m_next;
+    h->Release();
   }
 }
 

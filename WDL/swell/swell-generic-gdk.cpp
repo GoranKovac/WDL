@@ -24,8 +24,7 @@
 #ifndef SWELL_PROVIDED_BY_APP
 #ifdef SWELL_TARGET_WAYLAND
 #include <gdk/gdkwayland.h>
-#include <gio/gdesktopappinfo.h>
-#include <wayland-client.h>
+#include "swell-wayland.h"
 #include "xwayland-bridge.h"
 #endif
 #include "swell.h"
@@ -45,6 +44,10 @@ extern "C" {
 #ifdef SWELL_TARGET_GDK
 
 #include "swell-internal.h"
+#include <limits.h>
+#include <gdk/gdkx.h>
+#include "swell-x11.h"
+#include "swell-gdk.h"
 #ifdef SWELL_TARGET_WAYLAND
 #include "swell-gdk-scale.h"
 #endif
@@ -57,14 +60,8 @@ extern "C" {
   #define SWELL_TARGET_GDK_CURSORHACK
 #endif
 
-#include <X11/extensions/XInput2.h>
 
-#ifdef SWELL_TARGET_WAYLAND
-#endif
-#include <X11/Xatom.h>
 
-#include <GL/gl.h>
-#include <GL/glx.h>
 
 #ifdef SWELL_SUPPORT_GTK
 void swell_im_update_candidates_location();
@@ -74,79 +71,12 @@ extern GtkIMContext *swell_ime_context;
 
 static void (*_gdk_drag_drop_done)(GdkDragContext *, gboolean); // may not always be available
 
-static guint32 _gdk_x11_window_get_desktop(GdkWindow *window)
-{
-  Atom type;
-  gint format;
-  gulong nitems=0, bytes_after; 
-  guchar *data = NULL;
-
-  if (!window || !gdk_x11_screen_supports_net_wm_hint(gdk_window_get_screen(window), 
-                                           gdk_atom_intern_static_string("_NET_WM_DESKTOP"))) 
-    return 0;
-
-  if (XGetWindowProperty(GDK_WINDOW_XDISPLAY(window), GDK_WINDOW_XID(window),
-      gdk_x11_get_xatom_by_name_for_display(gdk_window_get_display(window), "_NET_WM_DESKTOP"),
-                        0, G_MAXLONG, false, XA_CARDINAL, &type, &format, &nitems, &bytes_after, &data) != Success) return 0;
-
-  if (type != XA_CARDINAL || nitems<1)
-  {
-    if (data) XFree(data);
-    return 0;
-  }
-  nitems = *(gulong *)data;
-  XFree(data);
-  return (guint32) nitems;
-}
-
-#ifdef SWELL_TARGET_WAYLAND
-HWND g_wayland_hovered_hwnd = NULL;
-
-gboolean swell_wayland_handle_hover_enter(GtkWidget *widget, GdkEventCrossing *event, gpointer user_data)
-{
-  HWND hwnd = (HWND)user_data;
-  if (!hwnd) return FALSE;
-
-  if (event->type == GDK_ENTER_NOTIFY) 
-  {
-    g_wayland_hovered_hwnd = hwnd;
-  } 
-  else if (event->type == GDK_LEAVE_NOTIFY) 
-  {
-    if (g_wayland_hovered_hwnd == hwnd) 
-      g_wayland_hovered_hwnd = NULL;
-  }
-  return FALSE;
-}
-#endif
-static void _gdk_x11_window_move_to_desktop(GdkWindow *window, guint32 desktop)
-{
-  XClientMessageEvent xclient;
-
-  if (!window || !gdk_x11_screen_supports_net_wm_hint(gdk_window_get_screen(window), 
-                                           gdk_atom_intern_static_string("_NET_WM_DESKTOP"))) 
-    return;
-
-  memset (&xclient, 0, sizeof (xclient));
-  xclient.type = ClientMessage;
-  xclient.send_event = true;
-  xclient.window = GDK_WINDOW_XID(window);
-  xclient.message_type = gdk_x11_get_xatom_by_name_for_display(gdk_window_get_display(window), "_NET_WM_DESKTOP");
-  xclient.format = 32;
-  xclient.data.l[0] = desktop;
-  xclient.data.l[1] = 1;
-
-  XSendEvent(GDK_WINDOW_XDISPLAY(window), gdk_x11_get_default_root_xwindow(), false,
-            SubstructureRedirectMask | SubstructureNotifyMask, (XEvent *)&xclient);
-}
-
 // for m_oswindow_private
 #define PRIVATE_NEEDSHOW 1 
 #define PRIVATE_SIZEPIN 2 // Wayland: min==max size pin pending, see swell_oswindow_resize_mapped
 
 #ifdef SWELL_TARGET_WAYLAND
 static void swell_wl_sizepin_release(GdkFrameClock *clock, gpointer data);
-static gboolean swell_wayland_draw(GtkWidget *widget, cairo_t *cr, gpointer data);
 #endif
 
 #ifndef SWELL_WINDOWSKEY_GDK_MASK
@@ -159,7 +89,6 @@ static GList *s_program_icon_list;
 
 static SWELL_OSWINDOW swell_dragsrc_osw;
 #ifdef SWELL_TARGET_WAYLAND
-static SWELL_OSWIDGET swell_dragsrc_widget;
 static HWND s_wayland_drag_source, s_wayland_drag_destination;
 static GtkWidget *s_wayland_drag_widget;
 static POINT s_wayland_drag_position;
@@ -186,95 +115,9 @@ static int gdk_options;
 #define OPTION_IS_WAYLAND 0x20000000
 #define OPTIONS_READ 0x40000000
 
-#ifdef SWELL_TARGET_WAYLAND
-int g_swell_wayland_title_h; // 0 = compositor has real SSD, use it normally
-#define SWELL_WAYLAND_TITLEBAR_CLOSEBTN_W 36
-int SWELL_WAYLAND_BORDER_WIDTH = 2;
-
-bool swell_is_wayland()
-{
-  return GDK_IS_WAYLAND_DISPLAY(gdk_display_get_default());
-}
-
-static void swell_wayland_init_application_id()
-{
-  if (!g_swell_appname || !GDK_IS_WAYLAND_DISPLAY(gdk_display_get_default())) return;
-
-  GList *apps = g_app_info_get_all();
-  for (GList *p = apps; p; p = p->next)
-  {
-    if (!G_IS_DESKTOP_APP_INFO(p->data)) continue;
-    const char *wmclass = g_desktop_app_info_get_startup_wm_class(G_DESKTOP_APP_INFO(p->data));
-    const char *id = g_app_info_get_id(G_APP_INFO(p->data));
-    if (wmclass && !strcmp(wmclass, g_swell_appname) && id && g_str_has_suffix(id, ".desktop"))
-    {
-      char *app_id = g_strndup(id, strlen(id) - strlen(".desktop"));
-      g_set_prgname(app_id);
-      g_free(app_id);
-      break;
-    }
-  }
-  for (GList *p = apps; p; p = p->next) g_object_unref(p->data);
-  g_list_free(apps);
-}
-
-static void swell_wayland_init_titlebar_height()
-{
-  GdkDisplay *disp = gdk_display_get_default();
-  bool lacks_ssd;
-  if (disp && GDK_IS_WAYLAND_DISPLAY(disp))
-  {
-    GtkWidget *probe = gtk_window_new(GTK_WINDOW_TOPLEVEL);
-    gtk_widget_show(probe);
-    struct wl_display *wl_disp = gdk_wayland_display_get_wl_display(disp);
-    for (int i = 0; i < 5 && wl_disp; i++)
-      wl_display_roundtrip(wl_disp);
-    GtkStyleContext *ctx = gtk_widget_get_style_context(probe);
-    lacks_ssd = gtk_style_context_has_class(ctx, "csd");
-    gtk_widget_destroy(probe);
-  }
-  else
-    lacks_ssd = false; // not a Wayland display at all (e.g. X11) -- SSD question doesn't apply, behave as before
-  g_swell_wayland_title_h = lacks_ssd ? 28 : 0;
-}
-
-static void swell_wayland_suppress_csd_shadow_once()
-{
-  static bool done = false;
-  if (done || !g_swell_wayland_title_h) return;
-  done = true;
-
-  GtkCssProvider *provider = gtk_css_provider_new();
-  const char *css =
-    "decoration, decoration:backdrop {"
-    "  box-shadow: none;"
-    "  border: none;"
-    "  border-radius: 0;"
-    "  margin: 0;"
-    "  padding: 0;"
-    "}";
-  gtk_css_provider_load_from_data(provider, css, -1, NULL);
-  gtk_style_context_add_provider_for_screen(gdk_screen_get_default(),
-                                             GTK_STYLE_PROVIDER(provider),
-                                             GTK_STYLE_PROVIDER_PRIORITY_APPLICATION);
-  g_object_unref(provider);
-}
-
-static bool swell_wayland_needs_manual_titlebar(HWND hwnd)
-{
-  return hwnd && g_swell_wayland_title_h && (hwnd->m_style & WS_CAPTION);
-}
-#endif
-
 static HWND s_ddrop_hwnd;
 static POINT s_ddrop_pt;
 
-static HWND s_ddrop_forward_last_hwnd; // last top level window, which receives events from the drag source
-static Window s_ddrop_forward_last_target; // plug-in window we're sending XdndEnter etc to
-static Window s_ddrop_forward_last_container; // bridged container window, we receive notifications back from s_ddrop_forward_last_target
-static Window s_ddrop_forward_last_source; // external source of drag/drop, gets sent XdndStatus/XdndFinished, from s_ddrop_forward_last_hwnd->m_oswindow
-static DWORD s_ddrop_forward_last_source_time; // last time source was known to be valid, treat as invalid after some small interval (10s?)
-static bool s_ddrop_forward_last_has_dropped;
 
 static SWELL_CursorResourceIndex *SWELL_curmodule_cursorresource_head;
 
@@ -305,6 +148,7 @@ struct clip_fmt {
 static WDL_TypedBuf<clip_fmt> s_clip_fmts; // mapping of UINT clipboard types, offset by 1 (s_clip_fmts.Get()[0] is CF_TEXT=1, etc)
 
 static HWND s_clip_hwnd;
+static GdkWindow *s_clipboard_window;
 
 // clipboard data added by SetClipboardData():
 static WDL_TypedBuf<GdkAtom> s_clipboard_setstate; // stored as separate lists so we can easily pass to properties
@@ -313,37 +157,6 @@ static WDL_TypedBuf<HANDLE> s_clipboard_setstate_data;
 static bool s_clipboard_written; // has clipboard data been written-to since opening
 
 static void swell_gdkEventHandler(GdkEvent *event, gpointer data);
-
-#ifdef SWELL_TARGET_WAYLAND
-static void OnConfigureEvent(GdkEventConfigure *cfg);
-
-static void swell_wayland_scale_changed(GtkWidget *widget, GParamSpec *, gpointer data)
-{
-  HWND hwnd = (HWND)data;
-  if (!hwnd->m_oswindow || !gtk_widget_get_mapped(widget)) return;
-  GdkEventConfigure cfg = {};
-  cfg.window = hwnd->m_oswindow;
-  gdk_window_get_geometry(cfg.window, &cfg.x, &cfg.y, &cfg.width, &cfg.height);
-  OnConfigureEvent(&cfg);
-  InvalidateRect(hwnd, NULL, FALSE);
-}
-
-// Wayland allows only one popup per parent. Tooltip and a
-// menu cannot both be showed at the same time. 
-// Track the single active tooltip
-// so we can hide it when a menu opens, and suppress tooltips while a menu is up.
-static HWND s_wayland_active_tooltip;
-// Last real toplevel the pointer was over, recorded in OnMotionEvent. Tooltips have
-// no parent/owner, so this is what tells us which window a tooltip belongs to.
-// Stored as the OS window (re-resolved on use) so a destroyed window can't dangle.
-SWELL_OSWINDOW s_last_hover_oswindow;
-bool PopupMenuIsActive();
-
-static SWELL_OSWINDOW s_armed_drag_oswindow;
-static guint s_armed_drag_button;
-static gint s_armed_drag_root_x, s_armed_drag_root_y;
-static guint32 s_armed_drag_time;
-#endif
 
 static int s_last_desktop;
 static UINT_PTR s_deactivate_timer;
@@ -409,7 +222,11 @@ static void on_deactivate()
 {
   swell_app_is_inactive=true;
   HWND lf = swell_oswindow_to_hwnd(SWELL_focused_oswindow);
-  s_last_desktop = lf && lf->m_oswindow ? _gdk_x11_window_get_desktop(lf->m_oswindow)+1 : 0;
+  s_last_desktop = 0;
+#ifdef SWELL_TARGET_WAYLAND
+  if (!GDK_IS_WAYLAND_DISPLAY(gdk_display_get_default()))
+#endif
+    if (lf && lf->m_oswindow) s_last_desktop = swell_x11_get_desktop(lf->m_oswindow)+1;
 
   HWND h = SWELL_topwindows; 
   while (h)
@@ -431,10 +248,6 @@ static void on_deactivate()
 void swell_oswindow_destroy(HWND hwnd)
 {
 #ifdef SWELL_TARGET_WAYLAND
-  // Release the GTK grab a modal window took when shown. gdk_window_destroy()
-  // below never hides the GtkWindow, so the grab would leak and GTK would keep
-  // routing button events to the dead dialog (e.g. the XWayland plugin bridge
-  // stops getting clicks after the project-open dialog).
   if (hwnd && hwnd->m_oswidget && GTK_IS_WINDOW(hwnd->m_oswidget))
   {
     g_signal_handlers_disconnect_by_data(hwnd->m_oswidget, hwnd);
@@ -464,15 +277,26 @@ void swell_oswindow_destroy(HWND hwnd)
     }
 #endif
 #ifdef SWELL_TARGET_WAYLAND
-    if (s_wayland_active_tooltip == hwnd) s_wayland_active_tooltip = NULL;
-    if (s_armed_drag_oswindow == hwnd->m_oswindow) s_armed_drag_oswindow = NULL;
-    if (s_last_hover_oswindow && s_last_hover_oswindow == hwnd->m_oswindow)
-      s_last_hover_oswindow = NULL;
-    if (g_wayland_hovered_hwnd == hwnd) g_wayland_hovered_hwnd = NULL;
+    swell_wayland_forget_window(hwnd);
 #endif
     if (g_swell_touchptr && g_swell_touchptr_wnd == hwnd->m_oswindow)
       g_swell_touchptr = NULL;
-    gdk_window_destroy(hwnd->m_oswindow);
+#ifdef SWELL_TARGET_WAYLAND
+    if (hwnd->m_oswidget && GTK_IS_WINDOW(hwnd->m_oswidget))
+    {
+      xw_bridge_detach_children(hwnd);
+      if (hwnd->m_oswidget == s_wayland_drag_widget)
+      {
+        g_signal_connect(hwnd->m_oswidget, "drag-end", G_CALLBACK(+[](GtkWidget *widget, GdkDragContext *, gpointer) {
+          gtk_widget_destroy(widget);
+        }), NULL);
+        gtk_widget_hide(hwnd->m_oswidget);
+      }
+      else gtk_widget_destroy(hwnd->m_oswidget);
+    }
+    else
+#endif
+      gdk_window_destroy(hwnd->m_oswindow);
     hwnd->m_oswindow=NULL;
 #ifdef SWELL_TARGET_WAYLAND
     hwnd->m_oswidget=NULL;
@@ -502,7 +326,6 @@ void swell_oswindow_update_text(HWND hwnd)
   }
 }
 
-static Window get_x11_first_child(Display *disp, Window xid);
 
 void swell_oswindow_focus(HWND hwnd)
 {
@@ -519,22 +342,7 @@ void swell_oswindow_focus(HWND hwnd)
     bool force = false;
     if (SWELL_focused_oswindow == hwnd->m_oswindow && !(gdk_options & OPTION_IS_WAYLAND))
     {
-      // verify we already have focus
-      GdkDisplay *display = gdk_window_get_display(hwnd->m_oswindow);
-      Display *dpy = gdk_x11_display_get_xdisplay(display);
-      Window cf = 0;
-      int cfm = 0;
-      XGetInputFocus(dpy,&cf,&cfm);
-      if (!cf || (cf != GDK_WINDOW_XID(hwnd->m_oswindow) &&
-                  cf != get_x11_first_child(dpy,GDK_WINDOW_XID(hwnd->m_oswindow))))
-      {
-#ifdef _DEBUG
-        printf("swell-generic-gdk: our window (%d) was marked as focused, however another window (%d) was reported focused via XGetInputFocus(), correcting.\n",
-            (int)GDK_WINDOW_XID(hwnd->m_oswindow), (int)cf);
-#endif
-        // some other window actually has focus, we missed a notification, apparently, correct this
-        force = true;
-      }
+      force = !swell_x11_has_focus(hwnd->m_oswindow);
     }
 
     gdk_window_raise(hwnd->m_oswindow);
@@ -551,16 +359,31 @@ void swell_oswindow_focus(HWND hwnd)
         if (!(gdk_options & OPTION_IS_WAYLAND) &&
             gdk_x11_screen_supports_net_wm_hint(gdk_window_get_screen(hwnd->m_oswindow), gdk_atom_intern_static_string("_NET_ACTIVE_WINDOW")))
         {
-          GdkDisplay *display = gdk_window_get_display(hwnd->m_oswindow);
-          Display *dpy = gdk_x11_display_get_xdisplay(display);
-          gdk_x11_display_error_trap_push (display);
-          XSetInputFocus(dpy,GDK_WINDOW_XID(hwnd->m_oswindow),RevertToNone,CurrentTime);
-          gdk_x11_display_error_trap_pop_ignored (display);
+          swell_x11_force_focus(hwnd->m_oswindow);
         }
       }
       update_menubar_activations();
     }
   }
+}
+
+void swell_gdk_close(HWND hwnd)
+{
+  if (!hwnd) return;
+  hwnd->Retain();
+#ifdef SWELL_TARGET_WAYLAND
+  // Destroy the plugin popup's overlay canvas (an xdg_popup on Wayland) and
+  // release the plugin's :10 grab BEFORE closing. If the xdg_popup is still
+  // mapped when its parent (the FX window) closes, the compositor raises a
+  // protocol error that kills GTK's Wayland connection and hangs REAPER. With
+  // the canvas destroyed first, the close can proceed normally.
+  xw_bridge_swell_on_gdk_delete_release(hwnd);
+#endif
+  if (IsWindowEnabled(hwnd) &&
+      !DestroyPopupMenus() && // ignore if a menu is open, instead just close the menu
+      !SendMessage(hwnd,WM_CLOSE,0,0))
+    SendMessage(hwnd,WM_COMMAND,IDCANCEL,0);
+  hwnd->Release();
 }
 
 void swell_recalcMinMaxInfo(HWND hwnd)
@@ -577,7 +400,11 @@ void swell_recalcMinMaxInfo(HWND hwnd)
     mmi.ptMaxSize.x = mmi.ptMaxTrackSize.x = 16384;
     mmi.ptMinTrackSize.y = 20;
     mmi.ptMaxSize.y = mmi.ptMaxTrackSize.y = 16384;
+    hwnd->Retain();
     SendMessage(hwnd,WM_GETMINMAXINFO,0,(LPARAM)&mmi);
+    const bool destroyed = hwnd->m_hashaddestroy != 0;
+    hwnd->Release();
+    if (destroyed) return;
   }
   else
   {
@@ -607,8 +434,7 @@ void swell_recalcMinMaxInfo(HWND hwnd)
   }
   if (hwnd->m_oswidget)
   {
-    gtk_window_set_geometry_hints(GTK_WINDOW(hwnd->m_oswidget), NULL, &h,
-        (GdkWindowHints)(GDK_HINT_MIN_SIZE | GDK_HINT_MAX_SIZE));
+    swell_wayland_set_geometry_hints(hwnd, &h);
     return;
   }
 #endif
@@ -798,14 +624,17 @@ class LICE_CairoBitmap : public LICE_IBitmap
       if (h<0) h=0;
       if (w == m_width && h == m_height) return false;
 
+      const int span = w ? cairo_format_stride_for_width(CAIRO_FORMAT_RGB24,w)/4 : 0;
+      const WDL_INT64 size = (WDL_INT64)h * span * 4 + LICE_MEMBITMAP_ALIGNAMT;
+      if (span < w || size > INT_MAX) return false;
+
       if (m_surf) cairo_surface_destroy(m_surf);
       m_surf = NULL;
 
-      m_span = w ? cairo_format_stride_for_width(CAIRO_FORMAT_RGB24,w)/4 : 0;
-      const int sz = h * m_span * 4 + LICE_MEMBITMAP_ALIGNAMT;
+      const int sz = (int)size;
       if (!m_fb || m_allocsize < sz || sz < m_allocsize/4)
       {
-        const int newalloc = m_allocsize<sz ? (sz*3)/2 : sz;
+        const int newalloc = m_allocsize<sz ? sz + wdl_min(sz/2, INT_MAX-sz) : sz;
         void *p = realloc(m_fb,newalloc);
         if (!p) return false;
 
@@ -813,6 +642,7 @@ class LICE_CairoBitmap : public LICE_IBitmap
         m_allocsize = newalloc;
       }
 
+      m_span = span;
       m_width=w && h ? w :0;
       m_height=w && h ? h : 0;
       return true;
@@ -861,9 +691,8 @@ static void init_options()
     if (wayland_display && *wayland_display) gdk_options |= OPTION_IS_WAYLAND;
 
 #ifdef SWELL_TARGET_WAYLAND
-    swell_wayland_init_application_id();
-    swell_wayland_init_titlebar_height();
-    swell_wayland_suppress_csd_shadow_once();
+    if (GDK_IS_WAYLAND_DISPLAY(gdk_display_get_default())) gdk_options |= OPTION_IS_WAYLAND;
+    swell_wayland_init();
 #endif
 
     if (swell_gdk_option("gdk_owned_windows_keep_above", "auto (default is 1)",1))
@@ -889,7 +718,11 @@ static void init_options()
       default: break;
     }
 
-    const char *wmname = gdk_x11_screen_get_window_manager_name(gdk_screen_get_default());
+    const char *wmname = NULL;
+#ifdef SWELL_TARGET_WAYLAND
+    if (!GDK_IS_WAYLAND_DISPLAY(gdk_display_get_default()))
+#endif
+      wmname = gdk_x11_screen_get_window_manager_name(gdk_screen_get_default());
     switch (swell_gdk_option("gdk_fullscreen_for_owner_windows", "auto (default is 1 on kwin, otherwise 0)",-1))
     {
       case -1:
@@ -1045,179 +878,8 @@ void swell_oswindow_manage(HWND hwnd, bool wantfocus)
         GtkWidget *gtk_win = NULL;
         if (GDK_IS_WAYLAND_DISPLAY(gdk_display_get_default()))
         {
-          bool is_popup_menu = (hwnd->m_classname && strcmp(hwnd->m_classname, "__SWELL_MENU") == 0);
-          bool is_tooltip = (!hwnd->m_parent && !hwnd->m_owner && (hwnd->m_style & WS_CHILD) && (!hwnd->m_title.Get() || !hwnd->m_title.Get()[0]));
-
-          // Imgui fix
-          bool is_interactive_popup = (hwnd->m_style & WS_CHILD) && hwnd->m_owner;
-          if (is_interactive_popup) is_popup_menu = true;
-
-          const bool is_drag_preview = is_tooltip && GetCapture() != NULL;
-
-          bool is_splash = (!hwnd->m_parent && !hwnd->m_owner &&
-                          !(hwnd->m_style & WS_CAPTION) && !(hwnd->m_style & WS_CHILD) &&
-                          (!hwnd->m_title.Get() || !hwnd->m_title.Get()[0]));
-
-          gtk_win = gtk_window_new((is_popup_menu || is_tooltip) ? GTK_WINDOW_POPUP : GTK_WINDOW_TOPLEVEL);
-
-          gtk_window_set_decorated(GTK_WINDOW(gtk_win), (hwnd->m_style & WS_CAPTION) != 0);
-          const int scale = swell_gdk_window_scale(transient_for);
-
-          gtk_widget_set_app_paintable(gtk_win, TRUE);
-          g_signal_connect(gtk_win, "draw", G_CALLBACK(swell_wayland_draw), hwnd);
-          gtk_widget_add_events(gtk_win, GDK_ALL_EVENTS_MASK|GDK_EXPOSURE_MASK);
-
-          if (!is_popup_menu && !is_tooltip)
-          {
-            gtk_window_set_title(GTK_WINDOW(gtk_win), hwnd->m_title.Get());
-          }
-
-          gtk_window_set_default_size(GTK_WINDOW(gtk_win),
-                                       swell_gdk_ceil(r.right - r.left, scale) + (swell_wayland_needs_manual_titlebar(hwnd) ? SWELL_WAYLAND_BORDER_WIDTH*2 : 0),
-                                       swell_gdk_ceil(r.bottom - r.top, scale) + (swell_wayland_needs_manual_titlebar(hwnd) ? g_swell_wayland_title_h + SWELL_WAYLAND_BORDER_WIDTH*2 : 0));
-          hwnd->m_oswidget = gtk_win;
-          g_signal_connect(gtk_win, "notify::scale-factor", G_CALLBACK(swell_wayland_scale_changed), hwnd);
-
-#ifdef SWELL_TARGET_WAYLAND
-          if (g_swell_wayland_title_h)
-          {
-            gtk_window_set_titlebar(GTK_WINDOW(gtk_win), gtk_label_new(NULL));
-          }
-#endif
-          // GTK sizes a toplevel to its content's natural size and asks
-          // the compositor for that — ignoring gtk_window_set_default_size when the
-          // content is larger. That makes dialogs open full-height. A max-size hint
-          // is the only thing GTK won't override, so clamp max to the requested size.
-          if (!is_popup_menu && !is_tooltip && !is_splash)
-          {
-            // GTK ignores set_default_size when content natural size differs, and a
-            // max-only hint just caps (doesn't force). To make the restored size
-            // actually apply on Wayland, pin min=max=restored size — GTK cannot
-            // override an exact min==max constraint. This is released on the FIRST
-            // configure event (see OnConfigureEvent), i.e. once the window has been
-            // mapped at this exact size, after which it is freely resizable.
-            int rw = swell_gdk_ceil(r.right - r.left, scale), rh = swell_gdk_ceil(r.bottom - r.top, scale);
-            if (rw < 1) rw = 1;
-            if (rh < 1) rh = 1;
-#ifdef SWELL_TARGET_WAYLAND
-            if (swell_wayland_needs_manual_titlebar(hwnd))
-            {
-              rw += SWELL_WAYLAND_BORDER_WIDTH*2;
-              rh += g_swell_wayland_title_h + SWELL_WAYLAND_BORDER_WIDTH*2;
-            }
-#endif
-            GdkGeometry gh;
-            gh.min_width = gh.max_width = rw;
-            gh.min_height = gh.max_height = rh;
-            gtk_window_set_geometry_hints(GTK_WINDOW(gtk_win), NULL, &gh,
-              (GdkWindowHints)(GDK_HINT_MIN_SIZE | GDK_HINT_MAX_SIZE));
-          }
-
-          // Tooltip and a menu can't both be showed at same time,
-          // opening a menu closes any active tooltip,
-          // while a menu is open tooltips cant spawn.
-          if (is_popup_menu && s_wayland_active_tooltip)
-          {
-            if (s_wayland_active_tooltip->m_oswindow)
-              gdk_window_hide(s_wayland_active_tooltip->m_oswindow);
-            s_wayland_active_tooltip = NULL;
-          }
-          if (is_tooltip && !is_drag_preview && PopupMenuIsActive())
-          {
-            // don't show a tooltip while a menu is up
-            gtk_widget_destroy(gtk_win);
-            hwnd->m_oswidget = NULL;
-            return;
-          }
-
-          HWND popup_parent_hwnd = NULL;
-          if (is_popup_menu || is_tooltip)
-          {
-            if (is_tooltip && !is_drag_preview) s_wayland_active_tooltip = hwnd;
-            gtk_window_set_type_hint(GTK_WINDOW(gtk_win), is_tooltip ? GDK_WINDOW_TYPE_HINT_TOOLTIP : GDK_WINDOW_TYPE_HINT_POPUP_MENU);
-
-            HWND parent_hwnd = NULL;
-
-            if (is_popup_menu)
-            {
-              parent_hwnd = hwnd->m_owner;
-              if (transient_for)
-              {
-                while (parent_hwnd && parent_hwnd->m_oswindow != transient_for)
-                  parent_hwnd = parent_hwnd->m_parent ? parent_hwnd->m_parent : parent_hwnd->m_owner;
-              }
-            }
-            else
-            {
-              // Anchor to the window that was hovered, not the focused one.
-              if (s_last_hover_oswindow)
-              {
-                HWND hov = swell_oswindow_to_hwnd(s_last_hover_oswindow);
-                if (hov && hov != hwnd && hov->m_oswidget && !(hov->m_style & WS_CHILD))
-                  parent_hwnd = hov;
-              }
-
-              if (!parent_hwnd)
-              {
-                if (is_drag_preview)
-                {
-                  // The preview must always be visible, and its parent is only a
-                  // coordinate base (it is placed by gdk_window_move, not by an anchor
-                  // rect), so an imperfect parent is harmless here.
-                  parent_hwnd = GetFocus();
-                  while (parent_hwnd && !parent_hwnd->m_oswidget)
-                    parent_hwnd = parent_hwnd->m_parent;
-                }
-                else
-                {
-                  // Fail closed: without a known hovered window we cannot place the
-                  // tooltip correctly, and showing it in the wrong window is worse than
-                  // not showing it at all.
-                  s_wayland_active_tooltip = NULL;
-                  gtk_widget_destroy(gtk_win);
-                  hwnd->m_oswidget = NULL;
-                  return;
-                }
-              }
-            }
-
-            if (parent_hwnd && parent_hwnd->m_oswidget)
-              gtk_window_set_transient_for(GTK_WINDOW(gtk_win), GTK_WINDOW(parent_hwnd->m_oswidget));
-            popup_parent_hwnd = parent_hwnd;
-          }
-
-          g_signal_connect(G_OBJECT(gtk_win), "enter-notify-event", G_CALLBACK(swell_wayland_handle_hover_enter), hwnd);
-          g_signal_connect(G_OBJECT(gtk_win), "leave-notify-event", G_CALLBACK(swell_wayland_handle_hover_enter), hwnd);
-          gtk_widget_realize(gtk_win);
-
-          // gtk_window_move is not constrained to the screen,
-          // so popups render outside of the bottom/right edge. Use gdk_window_move_to_rect
-          // so the compositor slides the popup on-screen.
-          // https://bugzilla.mozilla.org/show_bug.cgi?id=1423598
-          if ((is_popup_menu || (is_tooltip && !is_drag_preview)) && popup_parent_hwnd)
-          {
-            GdkWindow *pw = gtk_widget_get_window(gtk_win);
-            GdkWindow *parent_gw = gtk_widget_get_window(popup_parent_hwnd->m_oswidget);
-            if (pw && parent_gw)
-            {
-              const int psx = popup_parent_hwnd->m_position.left;
-              const int psy = popup_parent_hwnd->m_position.top;
-              const int parent_scale = swell_gdk_window_scale(parent_gw);
-              GdkRectangle anchor = { swell_gdk_floor(r.left - psx, parent_scale), swell_gdk_floor(r.top - psy, parent_scale), 1, 1 };
-              if (swell_wayland_needs_manual_titlebar(popup_parent_hwnd))
-              {
-                anchor.x += SWELL_WAYLAND_BORDER_WIDTH;
-                anchor.y += g_swell_wayland_title_h + SWELL_WAYLAND_BORDER_WIDTH;
-              }
-              gdk_window_move_to_rect(pw, &anchor,
-                  GDK_GRAVITY_NORTH_WEST, GDK_GRAVITY_NORTH_WEST,
-                  (GdkAnchorHints)(GDK_ANCHOR_SLIDE_X | GDK_ANCHOR_SLIDE_Y),
-                  0, 0);
-            }
-          }
-          hwnd->m_oswindow = gtk_widget_get_window(gtk_win);
-          if (GDK_IS_WAYLAND_WINDOW(hwnd->m_oswindow) && !(hwnd->m_style & WS_CAPTION))
-            gdk_wayland_window_announce_csd(hwnd->m_oswindow);
+          if (!swell_wayland_create_window(hwnd, transient_for)) return;
+          gtk_win = hwnd->m_oswidget;
         }
         else
 #endif
@@ -1291,6 +953,9 @@ void swell_oswindow_manage(HWND hwnd, bool wantfocus)
           }
 
           if (s_force_window_time)
+#ifdef SWELL_TARGET_WAYLAND
+            if (!gtk_win)
+#endif
             gdk_x11_window_set_user_time(hwnd->m_oswindow,s_force_window_time);
 
           if (!wantfocus || swell_app_is_inactive)
@@ -1355,7 +1020,7 @@ void swell_oswindow_manage(HWND hwnd, bool wantfocus)
           }
 
           if (s_last_desktop>0)
-            _gdk_x11_window_move_to_desktop(hwnd->m_oswindow,s_last_desktop-1);
+            swell_x11_move_to_desktop(hwnd->m_oswindow,s_last_desktop-1);
 
           if (!hwnd->m_oswindow_fullscreen)
           {
@@ -1402,8 +1067,6 @@ void swell_oswindow_updatetoscreen(HWND hwnd, RECT *rect)
       {
         rrr.x += SWELL_WAYLAND_BORDER_WIDTH;
         rrr.y += g_swell_wayland_title_h + SWELL_WAYLAND_BORDER_WIDTH;
-        rrr.width += SWELL_WAYLAND_BORDER_WIDTH;
-        rrr.height += g_swell_wayland_title_h + SWELL_WAYLAND_BORDER_WIDTH;
       }
       if (hwnd->m_oswidget)
         gtk_widget_queue_draw_area(GTK_WIDGET(hwnd->m_oswidget), rrr.x, rrr.y, rrr.width, rrr.height);
@@ -1540,6 +1203,9 @@ static bool atom_from_clipboard_type(int type, GdkAtom *atom)
 
 static UINT clipboard_type_from_atom(GdkAtom atom)
 {
+#ifdef SWELL_TARGET_WAYLAND
+  if (gtk_targets_include_text(&atom, 1)) return CF_TEXT;
+#endif
   for (int x = 0; x < s_clip_fmts.GetSize(); x++)
     if (s_clip_fmts.Get()[x].atom == atom) return x+1;
   return 0;
@@ -1554,8 +1220,41 @@ static HANDLE *find_clipboard_setstate(GdkAtom a)
 }
 
 
+static void encode_uri(WDL_FastString *s, const char *rd);
+
+static void format_clipboard_data(GdkAtom format, HANDLE handle, WDL_FastString &str)
+{
+  const char *data = (const char*)handle;
+  const int len = GlobalSize(handle);
+  if (format == utf8atom())
+  {
+    for (int i = 0; i < len && data[i]; ++i)
+    {
+      if (data[i] == '\r' && i + 1 < len && data[i+1] == '\n') continue;
+      str.Append(data + i, 1);
+    }
+  }
+  else if (format == urilistatom())
+  {
+    if (len <= (int)sizeof(DROPFILES)) return;
+    const DROPFILES *hdr = (const DROPFILES*)data;
+    if (hdr->fWide || hdr->pFiles >= (DWORD)len) return; // todo deal with UTF-16
+    for (const char *file = data + hdr->pFiles; file < data + len && *file; )
+    {
+      const char *end = (const char*)memchr(file, 0, data + len - file);
+      if (!end) break;
+      str.Append("file://");
+      encode_uri(&str, file);
+      str.Append("\r\n");
+      file = end + 1;
+    }
+  }
+  else str.SetRaw(data, len);
+}
+
 static void OnSelectionRequestEvent(GdkEventSelection *b)
 {
+  if (b->window != swell_dragsrc_osw && b->window != s_clipboard_window) return;
   //printf("got sel req %s\n",gdk_atom_name(b->target));
   GdkAtom prop=GDK_NONE;
 
@@ -1601,59 +1300,8 @@ static void OnSelectionRequestEvent(GdkEventSelection *b)
       if (state)
       {
         prop = b->property;
-        int len = GlobalSize(*state);
-        guchar *ptr = (guchar*)*state;
-
         WDL_FastString str;
-        if (sf == utf8atom())
-        {
-          const char *rd = (const char *)*state;
-          while (*rd)
-          {
-            if (!strncmp(rd,"\r\n",2))
-            {
-              str.Append("\n");
-              rd+=2;
-            }
-            else
-              str.Append(rd++,1);
-          }
-          ptr = (guchar *)str.Get();
-          len = str.GetLength();
-        }
-        else if (sf == urilistatom())
-        {
-          if (len > (int)sizeof(DROPFILES))
-          {
-            DROPFILES *hdr = (DROPFILES *)ptr;
-            if (WDL_NORMALLY(hdr->pFiles < (DWORD)len) &&
-                WDL_NORMALLY(!hdr->fWide) // todo deal with UTF-16
-            )
-            {
-              const char *rd = (const char *)ptr;
-              DWORD rdo = hdr->pFiles;
-              while (rdo < (DWORD)len && rd[rdo])
-              {
-                const char *fn = rd + rdo;
-                rdo += strlen(rd+rdo)+1;
-                str.Append("file://");
-                while (*fn)
-                {
-                  if (isalnum_safe(*fn) || *fn == '.' || *fn == '_' || *fn == '-' || *fn == '/' || *fn == '#')
-                    str.Append(fn,1);
-                  else
-                    str.AppendFormatted(8,"%%%02x",*(unsigned char *)fn);
-                  fn++;
-                }
-                str.Append("\r\n");
-              }
-            }
-          }
-
-          ptr = (guchar *)str.Get();
-          len = str.GetLength();
-        }
-
+        format_clipboard_data(sf, *state, str);
 #if SWELL_TARGET_GDK == 2
         GdkWindow *pw = gdk_window_lookup(b->requestor);
         if (!pw) pw = gdk_window_foreign_new(b->requestor);
@@ -1661,153 +1309,32 @@ static void OnSelectionRequestEvent(GdkEventSelection *b)
         GdkWindow *pw = b->requestor;
 #endif
         if (pw)
-          gdk_property_change(pw,prop,b->target,8, GDK_PROP_MODE_REPLACE,ptr,len);
+          gdk_property_change(pw,prop,b->target,8, GDK_PROP_MODE_REPLACE,(const guchar*)str.Get(),str.GetLength());
       }
     }
   }
   gdk_selection_send_notify(b->requestor,b->selection,b->target,prop,GDK_CURRENT_TIME);
 }
 
-#ifdef SWELL_TARGET_WAYLAND
-static bool swell_wayland_is_maximized(HWND hwnd)
-{
-  if (hwnd && hwnd->m_oswidget && GTK_IS_WINDOW(hwnd->m_oswidget))
-    return gtk_window_is_maximized(GTK_WINDOW(hwnd->m_oswidget));
-  return hwnd && hwnd->m_is_maximized;
-}
-
-static void swell_wayland_paint_manual_titlebar(HWND hwnd, GdkWindow *window, cairo_t *cr)
-{
-  const int scale = swell_gdk_window_scale(window);
-  const int w = swell_gdk_ceil(hwnd->m_position.right - hwnd->m_position.left, scale);
-  if (w <= 0) return;
-  const int bw = SWELL_WAYLAND_BORDER_WIDTH;
-  const int full_w = w + bw*2; // actual OS window width, including left+right border
-  const int logical_h = swell_gdk_ceil(hwnd->m_position.bottom - hwnd->m_position.top, scale);
-  const int full_h = g_swell_wayland_title_h + logical_h + bw*2; // top border + titlebar + content + bottom border
-  const bool is_focused = (hwnd->m_oswindow == SWELL_focused_oswindow);
-
-  cairo_save(cr);
-  cairo_set_antialias(cr, CAIRO_ANTIALIAS_NONE);
-
-  if (is_focused)
-    cairo_set_source_rgb(cr, 60/255.0, 198/255.0, 251/255.0); // #3CC6FB
-  else
-    cairo_set_source_rgb(cr, 0.16, 0.16, 0.16);
-  cairo_rectangle(cr, 0, 0, full_w, bw); // top
-  cairo_fill(cr);
-  cairo_rectangle(cr, 0, 0, bw, full_h); // left
-  cairo_fill(cr);
-  cairo_rectangle(cr, full_w - bw, 0, bw, full_h); // right
-  cairo_fill(cr);
-  cairo_rectangle(cr, 0, full_h - bw, full_w, bw); // bottom
-  cairo_fill(cr);
-
-  cairo_set_source_rgb(cr, 0.16, 0.16, 0.16);
-  cairo_rectangle(cr, bw, bw, full_w - bw*2, g_swell_wayland_title_h);
-  cairo_fill(cr);
-
-  const bool has_minmax = (hwnd->m_style & WS_THICKFRAME) != 0;
-  const char *title = hwnd->m_title.Get();
-  if (title && title[0])
-  {
-    cairo_set_source_rgb(cr, 0.85, 0.85, 0.85);
-    cairo_select_font_face(cr, "sans-serif", CAIRO_FONT_SLANT_NORMAL, CAIRO_FONT_WEIGHT_NORMAL);
-    cairo_set_font_size(cr, 13.0);
-    cairo_text_extents_t ext;
-    cairo_text_extents(cr, title, &ext);
-    cairo_move_to(cr, 8 + bw, bw + (g_swell_wayland_title_h + ext.height) / 2.0);
-    cairo_show_text(cr, title);
-  }
-
-  const double cy = bw + g_swell_wayland_title_h / 2.0;
-  cairo_set_source_rgb(cr, 0.85, 0.85, 0.85);
-  cairo_set_line_width(cr, 1.5);
-
-  {
-    const double cx = full_w - bw - SWELL_WAYLAND_TITLEBAR_CLOSEBTN_W / 2.0;
-    const double half = 5.0;
-    cairo_move_to(cr, cx-half, cy-half); cairo_line_to(cr, cx+half, cy+half);
-    cairo_move_to(cr, cx-half, cy+half); cairo_line_to(cr, cx+half, cy-half);
-    cairo_stroke(cr);
-  }
-
-  if (has_minmax)
-  {
-    const double cx = full_w - bw - SWELL_WAYLAND_TITLEBAR_CLOSEBTN_W * 1.5;
-    const double half = 5.0;
-    if (swell_wayland_is_maximized(hwnd))
-    {
-      cairo_rectangle(cr, cx-half+3, cy-half, half*2-3, half*2-3);
-      cairo_stroke(cr);
-      cairo_rectangle(cr, cx-half, cy-half+3, half*2-3, half*2-3);
-      cairo_stroke(cr);
-    }
-    else
-    {
-      cairo_rectangle(cr, cx-half, cy-half, half*2, half*2);
-      cairo_stroke(cr);
-    }
-
-    const double cx2 = full_w - bw - SWELL_WAYLAND_TITLEBAR_CLOSEBTN_W * 2.5;
-    cairo_move_to(cr, cx2-half, cy+half); cairo_line_to(cr, cx2+half, cy+half);
-    cairo_stroke(cr);
-  }
-
-  cairo_restore(cr);
-}
-
-static int swell_wayland_titlebar_hittest(HWND hwnd, int x, int y)
-{
-  const int bw = SWELL_WAYLAND_BORDER_WIDTH;
-  if (y < bw || y >= bw + g_swell_wayland_title_h) return 0;
-  const int full_w = swell_gdk_ceil(hwnd->m_position.right - hwnd->m_position.left, swell_gdk_window_scale(hwnd->m_oswindow)) + bw*2;
-  if (x >= full_w - bw - SWELL_WAYLAND_TITLEBAR_CLOSEBTN_W) return 1;
-  if (hwnd->m_style & WS_THICKFRAME)
-  {
-    if (x >= full_w - bw - SWELL_WAYLAND_TITLEBAR_CLOSEBTN_W*2) return 3;
-    if (x >= full_w - bw - SWELL_WAYLAND_TITLEBAR_CLOSEBTN_W*3) return 4;
-  }
-  return 2;
-}
-
-#define SWELL_WAYLAND_RESIZE_MARGIN 6
-
-static GdkWindowEdge swell_wayland_resize_edge_hittest(HWND hwnd, int x, int y, bool *found)
-{
-  *found = false;
-  const int scale = swell_gdk_window_scale(hwnd->m_oswindow);
-  int w = swell_gdk_ceil(hwnd->m_position.right - hwnd->m_position.left, scale);
-  int h = swell_gdk_ceil(hwnd->m_position.bottom - hwnd->m_position.top, scale);
-  if (swell_wayland_needs_manual_titlebar(hwnd))
-  {
-    w += SWELL_WAYLAND_BORDER_WIDTH*2;
-    h += g_swell_wayland_title_h + SWELL_WAYLAND_BORDER_WIDTH*2;
-  }
-  const int m = SWELL_WAYLAND_RESIZE_MARGIN;
-
-  const bool left = x < m, right = x >= w-m;
-  const bool top = y < m, bottom = y >= h-m;
-
-  if (!left && !right && !top && !bottom) return GDK_WINDOW_EDGE_SOUTH_EAST; // unused, *found stays false
-  *found = true;
-  if (top && left) return GDK_WINDOW_EDGE_NORTH_WEST;
-  if (top && right) return GDK_WINDOW_EDGE_NORTH_EAST;
-  if (bottom && left) return GDK_WINDOW_EDGE_SOUTH_WEST;
-  if (bottom && right) return GDK_WINDOW_EDGE_SOUTH_EAST;
-  if (top) return GDK_WINDOW_EDGE_NORTH;
-  if (bottom) return GDK_WINDOW_EDGE_SOUTH;
-  if (left) return GDK_WINDOW_EDGE_WEST;
-  return GDK_WINDOW_EDGE_EAST;
-}
-#endif
-
-static void OnExposeEvent(GdkEventExpose *exp, cairo_t *draw_ctx = NULL)
+void swell_gdk_expose(GdkEventExpose *exp, cairo_t *draw_ctx, bool background)
 {
   HWND hwnd = swell_oswindow_to_hwnd(exp->window);
   if (!hwnd) return;
 
 #ifdef SWELL_TARGET_WAYLAND
+  const bool use_background = hwnd->m_oswidget && gtk_widget_get_opacity(hwnd->m_oswidget) == 1.0;
+  if (draw_ctx && use_background && s_cur_evt && s_cur_evt->type == GDK_EXPOSE &&
+      s_cur_evt->any.window == exp->window && gdk_cairo_get_drawing_context(draw_ctx))
+  {
+    if (swell_wayland_needs_manual_titlebar(hwnd))
+      swell_wayland_paint_manual_titlebar(hwnd, exp->window, draw_ctx);
+    return;
+  }
+  if (background)
+  {
+    gdk_window_set_background_pattern(exp->window, NULL);
+    if (!use_background) return;
+  }
   const int scale = swell_gdk_window_scale(exp->window);
   GdkEventExpose pixel_event = *exp;
   pixel_event.area.x *= scale;
@@ -1833,8 +1360,8 @@ static void OnExposeEvent(GdkEventExpose *exp, cairo_t *draw_ctx = NULL)
 
   r.left = exp->area.x - bw; 
   r.top = exp->area.y - (title_h + bw); 
-  r.bottom=r.top+exp->area.height + (title_h + bw); 
-  r.right=r.left+exp->area.width + bw;
+  r.bottom=r.top+exp->area.height;
+  r.right=r.left+exp->area.width;
   if (r.left < cr.left) r.left = cr.left;
   if (r.right > cr.right) r.right = cr.right;
   if (r.top < cr.top) r.top = cr.top;
@@ -1847,33 +1374,56 @@ static void OnExposeEvent(GdkEventExpose *exp, cairo_t *draw_ctx = NULL)
 
   LICE_SubBitmap tmpbm(hwnd->m_backingstore,r.left,r.top,r.right-r.left,r.bottom-r.top);
 
-  GdkRectangle rrr={exp->area.x, exp->area.y, (int)exp->area.width + bw, (int)exp->area.height + title_h + bw*2};
+  GdkRectangle rrr=exp->area;
 #ifdef SWELL_TARGET_WAYLAND
   rrr = swell_gdk_logical_rect(rrr, scale);
 #endif
-  if (!draw_ctx) gdk_window_begin_paint_rect(exp->window, &rrr);
+  if (!draw_ctx && !background) gdk_window_begin_paint_rect(exp->window, &rrr);
 
   if (tmpbm.getWidth()>0 && tmpbm.getHeight()>0) 
   {
     void SWELL_internalLICEpaint(HWND hwnd, LICE_IBitmap *bmout, int bmout_xpos, int bmout_ypos, bool forceref);
+    hwnd->Retain();
     SWELL_internalLICEpaint(hwnd, &tmpbm, r.left, r.top, forceref);
+    const bool destroyed = hwnd->m_hashaddestroy != 0;
+    hwnd->Release();
+    if (destroyed)
+    {
+      if (!draw_ctx && !background) gdk_window_end_paint(exp->window);
+      return;
+    }
 
-    cairo_t *crc = draw_ctx ? draw_ctx : gdk_cairo_create(exp->window);
-    cairo_save(crc);
-#ifdef SWELL_TARGET_WAYLAND
-    cairo_scale(crc, 1.0 / scale, 1.0 / scale);
-#endif
     LICE_IBitmap *bm = hwnd->m_backingstore;
     cairo_surface_t *temp_surface = (cairo_surface_t*)bm->Extended(0xca140,NULL);
-    if (temp_surface) cairo_set_source_surface(crc, temp_surface, bw, title_h + bw);
-    cairo_paint(crc);
-    cairo_restore(crc);
-    if (!draw_ctx) cairo_destroy(crc);
+#ifdef SWELL_TARGET_WAYLAND
+    if (background && temp_surface)
+    {
+      cairo_surface_mark_dirty(temp_surface);
+      cairo_pattern_t *pattern = cairo_pattern_create_for_surface(temp_surface);
+      cairo_matrix_t matrix;
+      cairo_matrix_init(&matrix, scale, 0, 0, scale, -bw, -(title_h + bw));
+      cairo_pattern_set_matrix(pattern, &matrix);
+      gdk_window_set_background_pattern(exp->window, pattern);
+      cairo_pattern_destroy(pattern);
+    }
+    else
+#endif
+    {
+      cairo_t *crc = draw_ctx ? draw_ctx : gdk_cairo_create(exp->window);
+      cairo_save(crc);
+#ifdef SWELL_TARGET_WAYLAND
+      cairo_scale(crc, 1.0 / scale, 1.0 / scale);
+#endif
+      if (temp_surface) cairo_set_source_surface(crc, temp_surface, bw, title_h + bw);
+      cairo_paint(crc);
+      cairo_restore(crc);
+      if (!draw_ctx) cairo_destroy(crc);
+    }
     if (temp_surface) bm->Extended(0xca140,temp_surface); // release
   }
 
 #ifdef SWELL_TARGET_WAYLAND
-    if (swell_wayland_needs_manual_titlebar(hwnd))
+    if (!background && swell_wayland_needs_manual_titlebar(hwnd))
     {
       cairo_t *crc = draw_ctx ? draw_ctx : gdk_cairo_create(exp->window);
       swell_wayland_paint_manual_titlebar(hwnd, exp->window, crc);
@@ -1881,35 +1431,17 @@ static void OnExposeEvent(GdkEventExpose *exp, cairo_t *draw_ctx = NULL)
     }
 #endif
 
-    if (!draw_ctx) gdk_window_end_paint(exp->window);
+    if (!draw_ctx && !background) gdk_window_end_paint(exp->window);
 #endif
 }
 
-#ifdef SWELL_TARGET_WAYLAND
-static gboolean swell_wayland_draw(GtkWidget *widget, cairo_t *cr, gpointer data)
-{
-  HWND hwnd = (HWND)data;
-  GdkWindow *window = gtk_widget_get_window(widget);
-  if (window != hwnd->m_oswindow || !gtk_cairo_should_draw_window(cr, window)) return FALSE;
-  GdkEventExpose exp = {};
-  exp.window = window;
-  cairo_save(cr);
-  cairo_region_t *region = gdk_window_get_visible_region(window);
-  xw_clip_capture_regions(window, region);
-  gdk_cairo_region(cr, region);
-  cairo_region_destroy(region);
-  cairo_clip(cr);
-  if (gdk_cairo_get_clip_rectangle(cr, &exp.area)) OnExposeEvent(&exp, cr);
-  cairo_restore(cr);
-  return FALSE;
-}
-#endif
-
-static void OnConfigureEvent(GdkEventConfigure *cfg)
+void swell_gdk_configure(GdkEventConfigure *cfg)
 {
   HWND hwnd = swell_oswindow_to_hwnd(cfg->window);
   if (!hwnd) return;
 #ifdef SWELL_TARGET_WAYLAND
+  if (GDK_IS_WAYLAND_WINDOW(cfg->window) &&
+      (cfg->width != gdk_window_get_width(cfg->window) || cfg->height != gdk_window_get_height(cfg->window))) return;
   const int scale = swell_gdk_window_scale(cfg->window);
   GdkEventConfigure pixel_event = *cfg;
   pixel_event.x *= scale;
@@ -1944,10 +1476,12 @@ static void OnConfigureEvent(GdkEventConfigure *cfg)
   hwnd->m_position.top = cfg_y;
   hwnd->m_position.right = cfg_x + cfg_width;
   hwnd->m_position.bottom = cfg_y + cfg_height;
+  hwnd->Retain();
   if (flag&1) SendMessage(hwnd,WM_MOVE,0,0);
   if (flag&2) SendMessage(hwnd,WM_SIZE,hwnd->m_is_maximized ? SIZE_MAXIMIZED : SIZE_RESTORED,0);
   if (!hwnd->m_hashaddestroy && hwnd->m_oswindow && (hwnd->m_style & WS_THICKFRAME))
     swell_recalcMinMaxInfo(hwnd);
+  hwnd->Release();
 }
 
 static void OnWindowStateEvent(GdkEventWindowState *evt)
@@ -1957,20 +1491,17 @@ static void OnWindowStateEvent(GdkEventWindowState *evt)
 
   if (evt->changed_mask & GDK_WINDOW_STATE_MAXIMIZED)
   {
-    bool maximized;
-#ifdef SWELL_TARGET_WAYLAND
-    if (hwnd->m_oswidget && GTK_IS_WINDOW(hwnd->m_oswidget))
-      maximized = gtk_window_is_maximized(GTK_WINDOW(hwnd->m_oswidget));
-    else
-#endif
-      maximized = (evt->new_window_state & GDK_WINDOW_STATE_MAXIMIZED) != 0;
+    const bool maximized = (evt->new_window_state & GDK_WINDOW_STATE_MAXIMIZED) != 0;
     hwnd->m_is_maximized = maximized;
     SendMessage(hwnd,WM_SIZE,
         maximized ? SIZE_MAXIMIZED : SIZE_RESTORED, 0);
   }
 }
 
-#define IS_DEAD_KEY(x) ((x) >= DEF_GKY(dead_grave) && (x) <= DEF_GKY(dead_greek))
+#ifndef GDK_KEY_dead_greek
+#define GDK_KEY_dead_greek XK_dead_greek
+#endif
+#define IS_DEAD_KEY(x) ((x) >= DEF_GKY(dead_grave) && (x) <= GDK_KEY_dead_greek)
 
 #include "gtkimcontextsimpleseqs.h"
 
@@ -2193,7 +1724,7 @@ static void OnKeyEvent(GdkEventKey *k)
 
     // No modal, but a plugin popup may still be open. Nothing else dismisses it on the
     // key path, so its grab stays and wedges further input.
-    if (k->type == GDK_KEY_PRESS && g_wm_dpy && xw_bridge_swell_on_button_event_escape())
+    if (k->type == GDK_KEY_PRESS && xw_bridge_swell_on_button_event_escape())
       return;
   }
 #endif
@@ -2441,7 +1972,7 @@ static void swell_wayland_drag_end(GtkWidget *widget, GdkDragContext *, gpointer
 void swell_wayland_begin_drag(HWND source)
 {
   HWND capture = GetCapture();
-  if (s_wayland_drag_source || !capture || capture == source || !s_cur_evt ||
+  if (s_wayland_drag_source || swell_dragsrc_hwnd || !capture || capture == source || !s_cur_evt ||
       s_cur_evt->type != GDK_MOTION_NOTIFY ||
       !(s_cur_evt->motion.state & GDK_BUTTON1_MASK) ||
       !GDK_IS_WAYLAND_DISPLAY(gdk_display_get_default())) return;
@@ -2492,65 +2023,7 @@ static void OnMotionEvent(GdkEventMotion *m)
   if (swell_wayland_check_docker_drag(m)) return;
   GdkEventMotion pixel_event = *m;
   m = &pixel_event;
-  if (s_armed_drag_oswindow)
-  {
-    const int dx = (int)m->x_root - s_armed_drag_root_x;
-    const int dy = (int)m->y_root - s_armed_drag_root_y;
-    if (dx*dx + dy*dy >= 1*1) // ~1px threshold before committing to an actual drag
-    {
-      gdk_window_begin_move_drag(s_armed_drag_oswindow, s_armed_drag_button,
-                                  s_armed_drag_root_x, s_armed_drag_root_y, s_armed_drag_time);
-      s_armed_drag_oswindow = NULL;
-    }
-  }
-  // Remember which real toplevel the pointer is over. m->window is the OS window the
-  // motion occurred on, so this is authoritative without needing global coordinates
-  // (which Wayland does not provide). Skip popups: tooltips and menus are both
-  // WS_CHILD, and letting the pointer entering a tooltip overwrite this would
-  // re-anchor the next tooltip to the previous one.
-  {
-    HWND top = swell_oswindow_to_hwnd(m->window);
-    if (top && top->m_oswidget && !(top->m_style & WS_CHILD))
-      s_last_hover_oswindow = m->window;
-
-    static HWND s_last_edge_cursor_hwnd;
-    static bool s_last_edge_cursor_set;
-    if (top && (top->m_style & WS_THICKFRAME) && swell_wayland_needs_manual_titlebar(top) && top->m_oswindow)
-    {
-      bool found = false;
-      GdkWindowEdge edge = swell_wayland_resize_edge_hittest(top, (int)m->x, (int)m->y, &found);
-      if (found)
-      {
-        GdkCursorType ct;
-        switch (edge)
-        {
-          case GDK_WINDOW_EDGE_NORTH_WEST: ct = GDK_TOP_LEFT_CORNER; break;
-          case GDK_WINDOW_EDGE_NORTH: ct = GDK_TOP_SIDE; break;
-          case GDK_WINDOW_EDGE_NORTH_EAST: ct = GDK_TOP_RIGHT_CORNER; break;
-          case GDK_WINDOW_EDGE_WEST: ct = GDK_LEFT_SIDE; break;
-          case GDK_WINDOW_EDGE_EAST: ct = GDK_RIGHT_SIDE; break;
-          case GDK_WINDOW_EDGE_SOUTH_WEST: ct = GDK_BOTTOM_LEFT_CORNER; break;
-          case GDK_WINDOW_EDGE_SOUTH: ct = GDK_BOTTOM_SIDE; break;
-          default: ct = GDK_BOTTOM_RIGHT_CORNER; break;
-        }
-        GdkCursor *cursor = gdk_cursor_new_for_display(gdk_window_get_display(top->m_oswindow), ct);
-        gdk_window_set_cursor(top->m_oswindow, cursor);
-        g_object_unref(cursor);
-        s_last_edge_cursor_hwnd = top;
-        s_last_edge_cursor_set = true;
-      }
-      else if (s_last_edge_cursor_set && s_last_edge_cursor_hwnd == top)
-      {
-        gdk_window_set_cursor(top->m_oswindow, NULL);
-        s_last_edge_cursor_set = false;
-      }
-    }
-    else if (s_last_edge_cursor_set && top == s_last_edge_cursor_hwnd)
-    {
-      if (top->m_oswindow) gdk_window_set_cursor(top->m_oswindow, NULL);
-      s_last_edge_cursor_set = false;
-    }
-  }
+  swell_wayland_motion_event(m);
   getMouseCoords(m->window, m->x, m->y, m->x_root, m->y_root);
 #endif
   swell_lastMessagePos = MAKELONG(((int)m->x_root&0xffff),((int)m->y_root&0xffff));
@@ -2584,6 +2057,7 @@ static void OnScrollEvent(GdkEventScroll *b)
     POINT p2={(int)b->x_root, (int)b->y_root};
     // p2 is screen coordinates for WM_MOUSEWHEEL
 
+#if SWELL_TARGET_GDK >= 3
     if (b->direction == GDK_SCROLL_SMOOTH)
     {
       const double dy = b->delta_y * 120.0, dx = b->delta_x * 120.0;
@@ -2595,6 +2069,7 @@ static void OnScrollEvent(GdkEventScroll *b)
       if (hwnd) hwnd->Release();
     }
     else
+#endif
     {
     int msg=(b->direction == GDK_SCROLL_UP || b->direction == GDK_SCROLL_DOWN) ? WM_MOUSEWHEEL :
             (b->direction == GDK_SCROLL_LEFT || b->direction == GDK_SCROLL_RIGHT) ? WM_MOUSEHWHEEL : 0;
@@ -2625,65 +2100,12 @@ static void OnButtonEvent(GdkEventButton *b)
 
 #ifdef SWELL_TARGET_WAYLAND
   // Popup-dismiss workaround and raise modals to unstick an open plugin popup
-    if (b->type == GDK_BUTTON_PRESS && g_wm_dpy){
+    if (b->type == GDK_BUTTON_PRESS){
         if (xw_bridge_swell_on_button_event_escape()) return;
     }
 #endif
 #ifdef SWELL_TARGET_WAYLAND
-  if (b->type == GDK_BUTTON_RELEASE)
-    s_armed_drag_oswindow = NULL;
-
-  if (swell_wayland_needs_manual_titlebar(hwnd) && b->button == 1 &&
-      (b->type == GDK_BUTTON_PRESS || b->type == GDK_2BUTTON_PRESS))
-  {
-    if (b->type == GDK_BUTTON_PRESS && (hwnd->m_style & WS_THICKFRAME) && hwnd->m_oswindow)
-    {
-      bool found = false;
-      GdkWindowEdge edge = swell_wayland_resize_edge_hittest(hwnd, (int)b->x, (int)b->y, &found);
-      if (found)
-      {
-        gdk_window_begin_resize_drag(hwnd->m_oswindow, edge, b->button, (gint)b->x_root, (gint)b->y_root, b->time);
-        return;
-      }
-    }
-
-    const int hit = swell_wayland_titlebar_hittest(hwnd, (int)b->x, (int)b->y);
-    if (b->type == GDK_2BUTTON_PRESS)
-    {
-      s_armed_drag_oswindow = NULL;
-      if (hit == 2 && (hwnd->m_style & WS_THICKFRAME))
-        swell_oswindow_maximize(hwnd, !swell_wayland_is_maximized(hwnd));
-      if (hit) return;
-    }
-    if (hit == 1)
-    {
-      if (IsWindowEnabled(hwnd) && !DestroyPopupMenus() && !SendMessage(hwnd,WM_CLOSE,0,0))
-        SendMessage(hwnd,WM_COMMAND,IDCANCEL,0);
-      return;
-    }
-    else if (hit == 3)
-    {
-      swell_oswindow_maximize(hwnd, !swell_wayland_is_maximized(hwnd));
-      return;
-    }
-    else if (hit == 4)
-    {
-      if (hwnd->m_oswindow) gdk_window_iconify(hwnd->m_oswindow);
-      return;
-    }
-    else if (hit == 2)
-    {
-      if (hwnd->m_oswindow)
-      {
-        s_armed_drag_oswindow = hwnd->m_oswindow;
-        s_armed_drag_button = b->button;
-        s_armed_drag_root_x = (gint)b->x_root;
-        s_armed_drag_root_y = (gint)b->y_root;
-        s_armed_drag_time = b->time;
-      }
-      return;
-    }
-  }
+  if (swell_wayland_button_event(hwnd, b)) return;
   getMouseCoords(b->window, b->x, b->y, b->x_root, b->y_root);
 #endif
   swell_lastMessagePos = MAKELONG(((int)b->x_root&0xffff),((int)b->y_root&0xffff));
@@ -2764,7 +2186,8 @@ static void OnButtonEvent(GdkEventButton *b)
 
 static HANDLE urilistToDropFiles(const POINT *pt, const guchar *gptr, gint sz)
 {
-  HANDLE gobj=GlobalAlloc(0,sz+sizeof(DROPFILES));
+  if (sz < 0 || sz > INT_MAX - (int)sizeof(DROPFILES) - 2) return NULL;
+  HANDLE gobj=GlobalAlloc(0,sz+sizeof(DROPFILES)+2);
   if (!gobj) return NULL;
 
   DROPFILES *df=(DROPFILES*)gobj;
@@ -2782,14 +2205,14 @@ static HANDLE urilistToDropFiles(const POINT *pt, const guchar *gptr, gint sz)
     while (rd < rd_end && *rd && isspace_safe(*rd)) rd++;
     if (rd >= rd_end) break;
 
-    if (rd+7 < rd_end && !strnicmp((const char *)rd,"file://",7))
+    if (rd_end-rd > 7 && !strnicmp((const char *)rd,"file://",7))
     {
       rd += 7;
       int c=0;
       while (rd < rd_end && *rd && !isspace_safe(*rd))
       {
         int v1,v2;
-        if (*rd == '%' && rd+2 < rd_end && (v1=hex_parse(rd[1]))>=0 && (v2=hex_parse(rd[2]))>=0)
+        if (*rd == '%' && rd_end-rd > 2 && (v1=hex_parse(rd[1]))>=0 && (v2=hex_parse(rd[2]))>=0)
         {
           *pout++ = (v1<<4) | v2;
           rd+=3;
@@ -2945,13 +2368,67 @@ static void deactivateTimer(HWND hwnd, UINT uMsg, UINT_PTR tm, DWORD dwt)
 extern SWELL_OSWINDOW swell_ignore_focus_oswindow;
 extern DWORD swell_ignore_focus_oswindow_until;
 
-static bool OnDragEventDelegate(GdkEvent *event);
+void swell_gdk_drag_enter(int xpos, int ypos)
+{
+  if (!SWELL_DDrop_onDragEnter) return;
+
+  const char *fn = swell_dragsrc_fn ? swell_dragsrc_fn : "/tmp/<<<<<unknown>>>>>>>";
+  HGLOBAL h=GlobalAlloc(0,sizeof(DROPFILES) + strlen(fn) + 2);
+  if (WDL_NORMALLY(h))
+  {
+    DROPFILES *hdr = (DROPFILES *)GlobalLock(h);
+    if (WDL_NORMALLY(hdr))
+    {
+      memset(hdr,0,sizeof(*hdr));
+      hdr->pFiles = sizeof(DROPFILES);
+      hdr->pt.x = xpos;
+      hdr->pt.y = ypos;
+      char *ep = ((char *)hdr) + sizeof(*hdr);
+      memcpy(ep, fn, strlen(fn)+1);
+      ep[strlen(fn)+1] = 0;
+      GlobalUnlock(h);
+    }
+    POINT pt = {xpos, ypos};
+    SWELL_DDrop_onDragEnter(h,pt);
+    GlobalFree(h);
+  }
+}
+
+void swell_gdk_receive_drop(HWND hwnd, GdkEventDND *e)
+{
+  GdkDragContext *ctx = e->context;
+  if (ctx)
+  {
+    s_ddrop_hwnd = hwnd;
+    s_ddrop_pt.x = (int)e->x_root;
+    s_ddrop_pt.y = (int)e->y_root;
+
+    GdkAtom srca = gdk_drag_get_selection(ctx);
+    gdk_selection_convert(e->window,srca,urilistatom(),e->time);
+    gdk_drop_finish(ctx,TRUE,e->time);
+  }
+}
+
+static bool OnDragEventDelegate(GdkEvent *event)
+{
+#ifdef SWELL_TARGET_WAYLAND
+  if (GDK_IS_WAYLAND_DISPLAY(gdk_display_get_default())) return false;
+#endif
+  return swell_x11_drag_event(event);
+}
+
 
 
 static void swell_gdkEventHandler(GdkEvent *evt, gpointer data)
 {
+#ifdef SWELL_TARGET_WAYLAND
+  if (evt->type == GDK_EXPOSE && xw_bridge_draw(evt->any.window)) return;
+#endif
   GdkEvent *oldEvt = s_cur_evt;
   s_cur_evt = evt;
+#ifdef SWELL_SUPPORT_GTK
+  const bool swell_delete = evt->type == GDK_DELETE && swell_oswindow_to_hwnd(evt->any.window);
+#endif
 
   switch (evt->type)
   {
@@ -2959,7 +2436,7 @@ static void swell_gdkEventHandler(GdkEvent *evt, gpointer data)
         {
           bool do_menus = false;
           GdkEventFocus *fc = (GdkEventFocus *)evt;
-          if (s_deactivate_timer) 
+          if (s_deactivate_timer)
           {
             KillTimer(NULL,s_deactivate_timer);
             s_deactivate_timer=0;
@@ -2969,7 +2446,7 @@ static void swell_gdkEventHandler(GdkEvent *evt, gpointer data)
           {
             s_last_focus_change_time = GetTickCount();
             swell_on_toplevel_raise(fc->window);
-            if (swell_ignore_focus_oswindow != fc->window || 
+            if (swell_ignore_focus_oswindow != fc->window ||
                 (GetTickCount()-swell_ignore_focus_oswindow_until) < 0x10000000)
             {
 #ifdef SWELL_TARGET_WAYLAND
@@ -3002,28 +2479,21 @@ static void swell_gdkEventHandler(GdkEvent *evt, gpointer data)
     case GDK_DELETE:
      {
        HWND hwnd = swell_oswindow_to_hwnd(((GdkEventAny*)evt)->window);
-#ifdef SWELL_TARGET_WAYLAND
-       // Destroy the plugin popup's overlay canvas (an xdg_popup on Wayland) and
-       // release the plugin's :10 grab BEFORE closing. If the xdg_popup is still
-       // mapped when its parent (the FX window) closes, the compositor raises a
-       // protocol error that kills GTK's Wayland connection and hangs REAPER. With
-       // the canvas destroyed first, the close can proceed normally.
-       if (g_wm_dpy) xw_bridge_swell_on_gdk_delete_release();
-#endif
-       if (hwnd && IsWindowEnabled(hwnd) &&
-           !DestroyPopupMenus() && // ignore if a menu is open, instead just close the menu
-           !SendMessage(hwnd,WM_CLOSE,0,0))
-        SendMessage(hwnd,WM_COMMAND,IDCANCEL,0);
+       swell_gdk_close(hwnd);
      }
     break;
     case GDK_EXPOSE: // paint! GdkEventExpose...
 #ifdef SWELL_TARGET_WAYLAND
-      if (GDK_IS_WAYLAND_WINDOW(evt->any.window)) break;
+      if (GDK_IS_WAYLAND_WINDOW(evt->any.window))
+      {
+        swell_gdk_expose((GdkEventExpose *)evt, NULL, true);
+        break;
+      }
 #endif
-      OnExposeEvent((GdkEventExpose *)evt);
+      swell_gdk_expose((GdkEventExpose *)evt);
     break;
     case GDK_CONFIGURE: // size/move, GdkEventConfigure
-      OnConfigureEvent((GdkEventConfigure*)evt);
+      swell_gdk_configure((GdkEventConfigure*)evt);
     break;
     case GDK_WINDOW_STATE: /// GdkEventWindowState for min/max
       OnWindowStateEvent((GdkEventWindowState*)evt);
@@ -3158,20 +2628,22 @@ static void swell_gdkEventHandler(GdkEvent *evt, gpointer data)
     break;
   }
 #ifdef SWELL_SUPPORT_GTK
-  // Do NOT hand GDK_DELETE to GTK's default handler: SWELL already processed it
+  // Do NOT hand SWELL's GDK_DELETE to GTK's default handler: SWELL already processed it
   // above (the WM_CLOSE path). GTK's default delete handler runs g_object_run_dispose
   // on the window (hide/withdraw/destroy), which tears the window down itself —
   // "window closes but process keeps running". On X11 the modal grab happened to
   // stop GTK from routing the delete here; on Wayland (no grab) it reached this and
   // disposed the window. Skipping it is correct on both.
-  if (evt->type != GDK_DELETE && swell_gtk_main_do_event)
+  if (!swell_delete && swell_gtk_main_do_event)
     swell_gtk_main_do_event(evt);
+#endif
+#ifdef SWELL_TARGET_WAYLAND
+  if (evt->type == GDK_EXPOSE && GDK_IS_WAYLAND_WINDOW(evt->any.window) &&
+      !gdk_window_is_destroyed(evt->any.window) && swell_oswindow_to_hwnd(evt->any.window))
+    gdk_window_set_background_pattern(evt->any.window, NULL);
 #endif
   s_cur_evt = oldEvt;
 }
-
-static void run_drag_finish_abort();
-static bool validate_top_hwnd(HWND hwnd);
 
 void SWELL_RunEvents()
 {
@@ -3193,22 +2665,13 @@ void SWELL_RunEvents()
       if (!dispatched && xw_bridge_has_pending_draw() && g_get_monotonic_time() < deadline)
       {
         if (!wait_source)
-          wait_source = g_timeout_add_full(G_PRIORITY_HIGH,
+          wait_source = g_timeout_add_full(GDK_PRIORITY_EVENTS,
             max(1, (int)((deadline - g_get_monotonic_time() + 999) / 1000)),
             [](gpointer) -> gboolean { return G_SOURCE_CONTINUE; }, NULL, NULL);
         dispatched = g_main_context_iteration(ctx,TRUE);
       }
 #endif
       if (!dispatched) break;
-      GdkEvent *evt;
-      while (gdk_events_pending() && (evt = gdk_event_get()))
-      {
-        swell_gdkEventHandler(evt,(gpointer)1);
-        gdk_event_free(evt);
-#ifdef SWELL_TARGET_WAYLAND
-        if (g_get_monotonic_time() >= deadline) break;
-#endif
-      }
 #ifdef SWELL_TARGET_WAYLAND
       if (g_get_monotonic_time() >= deadline) break;
 #endif
@@ -3218,23 +2681,7 @@ void SWELL_RunEvents()
     gdk_display_flush(gdk_display_get_default());
 #endif
 
-    DWORD dt;
-    if (s_ddrop_forward_last_has_dropped &&
-        s_ddrop_forward_last_source &&
-        (dt = GetTickCount() - s_ddrop_forward_last_source_time) > 3000 && // after 3s, timeout
-        dt < 10000 &&
-        validate_top_hwnd(s_ddrop_forward_last_hwnd) &&
-        s_ddrop_forward_last_hwnd->m_oswindow)
-    {
-#ifdef _DEBUG
-      printf("swell-generic-gdk: sending XdndFinished after timeout from stale drag\n");
-#endif
-      run_drag_finish_abort();
-      s_ddrop_forward_last_hwnd = NULL;
-      s_ddrop_forward_last_container = s_ddrop_forward_last_source = 0;
-      s_ddrop_forward_last_target = 0;
-      s_ddrop_forward_last_has_dropped = false;
-    }
+    swell_x11_drag_check_timeout();
   }
 }
 
@@ -3547,8 +2994,7 @@ void swell_oswindow_resize_mapped(HWND hwnd, int reposflag, RECT f)
   memset(&gh,0,sizeof(gh));
   gh.min_width = gh.max_width = w;
   gh.min_height = gh.max_height = h;
-  gtk_window_set_geometry_hints(GTK_WINDOW(hwnd->m_oswidget), NULL, &gh,
-    (GdkWindowHints)(GDK_HINT_MIN_SIZE | GDK_HINT_MAX_SIZE));
+  swell_wayland_set_geometry_hints(hwnd, &gh);
   // GTK only sends hints that differ from the last ones it sent, which may not
   // be what the compositor has now -- send them on the GdkWindow too.
   gdk_window_set_geometry_hints(hwnd->m_oswindow, &gh,
@@ -3591,8 +3037,7 @@ void swell_oswindow_postresize(HWND hwnd, RECT f)
     }
     if (hwnd->m_oswidget)
     {
-      gtk_window_set_geometry_hints(GTK_WINDOW(hwnd->m_oswidget), NULL, &h,
-          (GdkWindowHints)(GDK_HINT_MIN_SIZE | GDK_HINT_MAX_SIZE));
+      swell_wayland_set_geometry_hints(hwnd, &h);
       return;
     }
 #endif
@@ -3638,6 +3083,8 @@ void swell_oswindow_invalidate(HWND hwnd, const RECT *r)
 #ifdef SWELL_TARGET_WAYLAND
 static GtkClipboard *gtk_clipboard;
 static bool clipboard_requested;
+static guint clipboard_generation;
+static void publish_wayland_clipboard();
  
 static GtkClipboard *get_clipboard(void)
 {
@@ -3652,6 +3099,10 @@ bool OpenClipboard(HWND hwndDlg)
   RegisterClipboardFormat(NULL);
   s_clip_hwnd=hwndDlg ? hwndDlg : SWELL_topwindows; 
   s_clipboard_written = false;
+#ifdef SWELL_TARGET_WAYLAND
+  ++clipboard_generation;
+  clipboard_requested = false;
+#endif
 
   GlobalFree(s_clipboard_getstate);
   s_clipboard_getstate = NULL;
@@ -3663,50 +3114,69 @@ bool OpenClipboard(HWND hwndDlg)
 }
 
 #ifdef SWELL_TARGET_WAYLAND
-static void clipboard_received_func(GtkClipboard *cb, GtkSelectionData *data, gpointer user_data)
+static void clipboard_received_func(GtkClipboard *, GtkSelectionData *data, gpointer user_data)
 {
+  if (GPOINTER_TO_UINT(user_data) != clipboard_generation) return;
   clipboard_requested = false;
-
   if (!data) return;
 
   s_clipboard_getstate_fmt = gtk_selection_data_get_target(data);
-  int len = gtk_selection_data_get_length(data);
+  const int len = gtk_selection_data_get_length(data);
   const guchar *bytes = gtk_selection_data_get_data(data);
- 
-  HANDLE h = NULL;
-  if (!bytes || len <= 0) return;
- 
-  if (s_clipboard_getstate_fmt == urilistatom()) // drag and drop from file manager etc
-  {
-    h = urilistToDropFiles(NULL, bytes, len);
-  }
+  if (!bytes || len < 0) return;
+  if (s_clipboard_getstate_fmt == urilistatom())
+    s_clipboard_getstate = urilistToDropFiles(NULL, bytes, len);
   else
   {
-    h = GlobalAlloc(GMEM_MOVEABLE, len);
-    memcpy(GlobalLock(h), bytes, len);
-    GlobalUnlock(h);
+    s_clipboard_getstate = GlobalAlloc(GMEM_MOVEABLE, len);
+    if (s_clipboard_getstate) memcpy(s_clipboard_getstate, bytes, len);
   }
- 
-  GlobalFree(s_clipboard_getstate);
-  s_clipboard_getstate = h;
 }
-#endif
- 
-#ifdef SWELL_TARGET_WAYLAND
+
+static void clipboard_received_text(GtkClipboard *, const gchar *text, gpointer user_data)
+{
+  if (GPOINTER_TO_UINT(user_data) != clipboard_generation) return;
+  clipboard_requested = false;
+  s_clipboard_getstate_fmt = utf8atom();
+  if (!text) return;
+  WDL_FastString str;
+  for (const char *p = text; *p; ++p)
+  {
+    if (*p == '\n' && (p == text || p[-1] != '\r')) str.Append("\r", 1);
+    str.Append(p, 1);
+  }
+  const size_t len = str.GetLength() + 1;
+  s_clipboard_getstate = GlobalAlloc(GMEM_MOVEABLE, len);
+  if (s_clipboard_getstate) memcpy(s_clipboard_getstate, str.Get(), len);
+}
+
 static HANDLE req_wayland_clipboard(GdkAtom type)
 {
   if (s_clipboard_getstate_fmt == type) return s_clipboard_getstate;
-  if (type == tgtatom() && s_clipboard_getstate_fmt == atomatom())
-    return s_clipboard_getstate;
- 
-   if (clipboard_requested)
-     return NULL;
- 
-   clipboard_requested = true;
+  if (type == tgtatom() && s_clipboard_getstate_fmt == atomatom()) return s_clipboard_getstate;
 
-   gtk_clipboard_request_contents( get_clipboard(), type, clipboard_received_func, NULL);
- 
-  return NULL;
+  GlobalFree(s_clipboard_getstate);
+  s_clipboard_getstate = NULL;
+  s_clipboard_getstate_fmt = NULL;
+  const guint request = ++clipboard_generation;
+  clipboard_requested = true;
+  if (type == utf8atom())
+    gtk_clipboard_request_text(get_clipboard(), clipboard_received_text, GUINT_TO_POINTER(request));
+  else
+    gtk_clipboard_request_contents(get_clipboard(), type, clipboard_received_func, GUINT_TO_POINTER(request));
+
+  const gint64 deadline = g_get_monotonic_time() + 500000;
+  GMainContext *ctx = g_main_context_default();
+  while (clipboard_generation == request && clipboard_requested && g_get_monotonic_time() < deadline)
+    if (!g_main_context_iteration(ctx, FALSE)) g_usleep(1000);
+  if (clipboard_generation != request) return NULL;
+  if (clipboard_requested)
+  {
+    ++clipboard_generation;
+    clipboard_requested = false;
+    return NULL;
+  }
+  return s_clipboard_getstate;
 }
 #endif
 
@@ -3730,8 +3200,7 @@ static HANDLE req_clipboard(GdkAtom type)
 
     GdkDisplay *disp = gdk_window_get_display(h->m_oswindow);
     if (WDL_NORMALLY(disp) &&
-        None == XGetSelectionOwner(gdk_x11_display_get_xdisplay(disp),
-                                   gdk_x11_atom_to_xatom_for_display(disp, GDK_SELECTION_CLIPBOARD)))
+        !swell_x11_has_selection_owner(disp, GDK_SELECTION_CLIPBOARD))
     {
       return NULL;
     }
@@ -3742,28 +3211,7 @@ static HANDLE req_clipboard(GdkAtom type)
     DWORD startt = GetTickCount();
     for (;;)
     {
-      while (!s_clipboard_getstate && g_main_context_iteration(ctx,FALSE))
-      {
-        GdkEvent *evt;
-        while (!s_clipboard_getstate && gdk_events_pending() && (evt = gdk_event_get()))
-        {
-          switch (evt->type)
-          {
-            case GDK_SELECTION_NOTIFY:
-            case GDK_SELECTION_REQUEST:
-            case GDK_EXPOSE:
-            case GDK_CONFIGURE:
-            case GDK_WINDOW_STATE:
-            case GDK_GRAB_BROKEN:
-              swell_gdkEventHandler(evt,(gpointer)1);
-            break;
-            default:
-              // not ideal to drop events, but hm
-            break;
-          }
-          gdk_event_free(evt);
-        }
-      }
+      while (!s_clipboard_getstate && GetTickCount()-startt < 500 && g_main_context_iteration(ctx,FALSE)) {}
 
       if (s_clipboard_getstate) 
       {
@@ -3782,45 +3230,18 @@ static HANDLE req_clipboard(GdkAtom type)
 
 void CloseClipboard() 
 { 
+#ifdef SWELL_TARGET_WAYLAND
+  if (s_clipboard_written && GDK_IS_WAYLAND_DISPLAY(gdk_display_get_default()))
+    publish_wayland_clipboard();
+#endif
   s_clipboard_written = false;
   s_clipboard_enumstate.DeleteAll();
   s_clip_hwnd=NULL; 
 }
 
-#ifdef SWELL_TARGET_WAYLAND
-static UINT enum_wayland_clipboard_formats(UINT lastfmt)
-{
-  if (lastfmt == 0 && !s_clipboard_enumstate.GetSize())
-  {
-    gtk_clipboard_request_targets(
-      get_clipboard(),
-      [](GtkClipboard *cb, GdkAtom *atoms, gint n_atoms, gpointer user_data)
-      {
-        s_clipboard_enumstate.DeleteAll();
-        for (int i = 0; i < n_atoms; i++)
-        {
-          UINT fmt = clipboard_type_from_atom(atoms[i]);
-          if (fmt)
-          s_clipboard_enumstate.Insert(fmt);
-        }
-      },
-      NULL);
-  }
-
-  int x = 0;
-  UINT fmt;
-  if (lastfmt) while (s_clipboard_enumstate.Enumerate(x++,&fmt) && fmt != lastfmt);
-  return s_clipboard_enumstate.Enumerate(x,&fmt) ? fmt : 0;
-}
-#endif
-
 UINT EnumClipboardFormats(UINT lastfmt)
 {
-#ifdef SWELL_TARGET_WAYLAND
-  if (GDK_IS_WAYLAND_DISPLAY(gdk_display_get_default()))
-    return enum_wayland_clipboard_formats(lastfmt);
-#endif
-  if (lastfmt == 0 && !s_clipboard_enumstate.GetSize())
+  if (lastfmt == 0 && !s_clipboard_written && !s_clipboard_enumstate.GetSize())
   {
     HANDLE h = req_clipboard(tgtatom());
     if (!h) return 0;
@@ -3841,48 +3262,20 @@ UINT EnumClipboardFormats(UINT lastfmt)
   return s_clipboard_enumstate.Enumerate(x,&fmt) ? fmt : 0;
 }
 
-#ifdef SWELL_TARGET_WAYLAND
-static HANDLE get_wayland_clipboard_data(UINT type)
-{
-  RegisterClipboardFormat(NULL);
-
-  GdkAtom a;
-  if (atom_from_clipboard_type(type,&a))
-  {
-    HANDLE h = req_clipboard(a);
-    // we need to wait here for data to arrive or nothing will be pasted 
-    if (!h)
-    {
-      GMainContext *ctx = g_main_context_default();
-      int wait_ms = 0;
-      while (!s_clipboard_getstate && wait_ms < 500)
-      {
-        while (g_main_context_iteration(ctx, FALSE)) {}
-        // this is tricky here, this is minimal to make paste feel instant (from outside of reaper)
-        g_usleep(1000);
-        wait_ms += 10;
-      }
-      h = (s_clipboard_getstate_fmt == a) ? s_clipboard_getstate : NULL;
-    }
-
-    return h;
-  }
-
-  return NULL;
-}
-#endif
-
 HANDLE GetClipboardData(UINT type)
 {
-#ifdef SWELL_TARGET_WAYLAND
-  if (GDK_IS_WAYLAND_DISPLAY(gdk_display_get_default()))
-    return get_wayland_clipboard_data(type);
-#endif
   RegisterClipboardFormat(NULL);
 
   GdkAtom a;
   if (atom_from_clipboard_type(type,&a))
   {
+#ifdef SWELL_TARGET_WAYLAND
+    if (s_clipboard_written && GDK_IS_WAYLAND_DISPLAY(gdk_display_get_default()))
+    {
+      HANDLE *state = find_clipboard_setstate(a);
+      return state ? *state : NULL;
+    }
+#endif
     return req_clipboard(a);
   }
 
@@ -3895,19 +3288,45 @@ void EmptyClipboard()
     GlobalFree(s_clipboard_setstate_data.Get()[x]);
   s_clipboard_setstate.Resize(0);
   s_clipboard_setstate_data.Resize(0);
-}
-
 #ifdef SWELL_TARGET_WAYLAND
-static void clipboard_get_func(GtkClipboard *clipboard, GtkSelectionData *selection_data, guint info, gpointer user_data)
-{
-  HANDLE handle = (HANDLE)user_data;
-  guchar *data = (guchar*)GlobalLock(handle);
-  gtk_selection_data_set(selection_data, gdk_atom_intern("application/octet-stream", FALSE), 8, data, GlobalSize(handle));
-  GlobalUnlock(handle);
-}
+  if (GDK_IS_WAYLAND_DISPLAY(gdk_display_get_default()))
+  {
+    s_clipboard_written = true;
+    s_clipboard_enumstate.DeleteAll();
+  }
 #endif
+}
 
 #ifdef SWELL_TARGET_WAYLAND
+static void clipboard_get_func(GtkClipboard *, GtkSelectionData *data, guint, gpointer)
+{
+  GdkAtom target = gtk_selection_data_get_target(data);
+  const bool text = gtk_targets_include_text(&target, 1);
+  HANDLE *handle = find_clipboard_setstate(text ? utf8atom() : target);
+  if (!handle) return;
+  WDL_FastString str;
+  format_clipboard_data(text ? utf8atom() : target, *handle, str);
+  if (text) gtk_selection_data_set_text(data, str.Get(), str.GetLength());
+  else gtk_selection_data_set(data, target, 8, (const guchar*)str.Get(), str.GetLength());
+}
+
+static void publish_wayland_clipboard()
+{
+  GtkTargetList *list = gtk_target_list_new(NULL, 0);
+  for (int i = 0; i < s_clipboard_setstate.GetSize(); ++i)
+  {
+    GdkAtom target = s_clipboard_setstate.Get()[i];
+    if (target == utf8atom()) gtk_target_list_add_text_targets(list, 0);
+    else gtk_target_list_add(list, target, 0, 0);
+  }
+  gint count;
+  GtkTargetEntry empty = {};
+  GtkTargetEntry *targets = gtk_target_table_new_from_list(list, &count);
+  gtk_clipboard_set_with_data(get_clipboard(), targets ? targets : &empty, count, clipboard_get_func, NULL, NULL);
+  gtk_target_table_free(targets, count);
+  gtk_target_list_unref(list);
+}
+
 static void set_wayland_clipboard_data(UINT type, HANDLE h)
 {
   RegisterClipboardFormat(NULL);
@@ -3926,19 +3345,8 @@ static void set_wayland_clipboard_data(UINT type, HANDLE h)
       *state = h;
     }
 
-    GtkClipboard *cb = get_clipboard();
-    if (!s_clipboard_written)
-    {
-      s_clipboard_written = true;
-      s_clipboard_enumstate.DeleteAll();
- 
-      GtkTargetEntry target_entry;
-      target_entry.target = (gchar*)gdk_atom_name(a);
-      target_entry.flags = 0;
-      target_entry.info = 0;
-
-      gtk_clipboard_set_with_data(cb, &target_entry, 1, clipboard_get_func, NULL, h);
-    }
+    if (!s_clipboard_written) s_clipboard_enumstate.DeleteAll();
+    s_clipboard_written = true;
     if (WDL_NORMALLY(type != 0))
       s_clipboard_enumstate.Insert(type);
   }
@@ -3967,21 +3375,20 @@ void SetClipboardData(UINT type, HANDLE h)
       *state = h;
     }
 
-    static GdkWindow *w;
-    if (!w)
+    if (!s_clipboard_window)
     {
       GdkWindowAttr attr={0,};
       attr.title = (char *)"swell clipboard";
       attr.event_mask = GDK_ALL_EVENTS_MASK;
       attr.wclass = GDK_INPUT_ONLY;
       attr.window_type = GDK_WINDOW_TOPLEVEL;
-      w = gdk_window_new(NULL,&attr,0);
+      s_clipboard_window = gdk_window_new(NULL,&attr,0);
     }
-    if (w && !s_clipboard_written)
+    if (s_clipboard_window && !s_clipboard_written)
     {
       s_clipboard_written = true;
       s_clipboard_enumstate.DeleteAll();
-      gdk_selection_owner_set(w,GDK_SELECTION_CLIPBOARD,GDK_CURRENT_TIME,TRUE);
+      gdk_selection_owner_set(s_clipboard_window,GDK_SELECTION_CLIPBOARD,GDK_CURRENT_TIME,TRUE);
     }
     if (WDL_NORMALLY(type != 0))
       s_clipboard_enumstate.Insert(type);
@@ -4102,958 +3509,42 @@ DWORD GetMessagePos()
   return swell_lastMessagePos;
 }
 
-struct bridgeState {
-  bridgeState(bool needrep, GdkWindow *_w, Window _nw, Display *_disp, GdkWindow *_curpar, HWND _hwnd_child);
-  ~bridgeState();
-
-  GdkWindow *w;
-  Window native_w;
-  Display *native_disp;
-  GdkWindow *cur_parent;
-  Window cur_parent_xid;
-  Window cur_parent_xid2; // first child in xid, if any, otherwise cur_parent_xid
-  HWND hwnd_child;
-
-  bool lastvis;
-  bool need_reparent;
-  RECT lastrect;
-
-  GLXContext gl_ctx;
-};
-
-static bridgeState *s_last_gl_ctx;
-
-static WDL_PtrList<bridgeState> filter_windows;
-bridgeState::~bridgeState() 
-{ 
-  if (gl_ctx)
-  {
-    if (s_last_gl_ctx == this)
-    {
-      glXMakeCurrent(native_disp,None, NULL);
-      s_last_gl_ctx = NULL;
-    }
-
-    glXDestroyContext(native_disp,gl_ctx);
-    gl_ctx = NULL;
-  }
-  if (native_w && s_ddrop_forward_last_container == native_w)
-    s_ddrop_forward_last_container = 0;
-  filter_windows.DeletePtr(this); 
-  if (w) 
-  {
-    if (!need_reparent)
-    {
-      // if this window is a child of another window, it will get destroyed by the hierarchy unless it is fully
-      // released (we could do g_object_unref() again here, but reparenting feels safer in this context)
-      gdk_window_reparent(w,NULL,0,0);
-    }
-    g_object_unref(G_OBJECT(w));
-    XDestroyWindow(native_disp,native_w);
-  }
-}
-
-static Window get_x11_first_child(Display *disp, Window xid)
+HWND SWELL_CreateXBridgeWindow(HWND parent, void **window, const RECT *rect)
 {
-  Window root, par, *list=NULL;
-  unsigned int nlist=0;
-  if (!disp || !xid || !XQueryTree(disp,xid,&root,&par,&list, &nlist)) return xid;
-  Window ret = xid;
-  if (list && nlist>0) ret = list[0];
-  if (list) XFree(list);
-  return ret;
-}
-
-bridgeState::bridgeState(bool needrep, GdkWindow *_w, Window _nw, Display *_disp, GdkWindow *_curpar, HWND _hwnd_child)
-{
-  hwnd_child = _hwnd_child;
-  gl_ctx = NULL;
-  w=_w;
-  native_w=_nw;
-  native_disp=_disp;
-  lastvis=false;
-  need_reparent=needrep;
-  cur_parent = _curpar;
-  cur_parent_xid = _curpar ? GDK_WINDOW_XID(_curpar) : 0;
-  cur_parent_xid2 = get_x11_first_child(_disp, cur_parent_xid);
-  memset(&lastrect,0,sizeof(lastrect));
-  filter_windows.Add(this);
-}
-
-static LRESULT xbridgeProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam)
-{
-  switch (uMsg)
-  {
-    case WM_DESTROY:
-      if (hwnd && hwnd->m_private_data)
-      {
-        bridgeState *bs = (bridgeState*)hwnd->m_private_data;
-        hwnd->m_private_data = 0;
-        delete bs;
-      }
-    break;
-    case WM_TIMER:
-
-      if (wParam == 1010)
-      {
-        // callers can SetTimer(hwnd_container,1010,X,NULL) and have the child X window resized to fit the parent
-        // they are only resized once, but it is deferred by timer until the window is actually there.
-        // (if the window was created by another connection to the X server than ours, the window might not yet
-        // be valid on the X server).
-        bridgeState *bs = (bridgeState*)hwnd->m_private_data;
-
-        RECT r;
-        GetClientRect(hwnd,&r);
-        if (r.right>0 && r.bottom>0 && bs)
-        {
-          Window root, par, *list=NULL;
-          unsigned int nlist=0;
-          // if a plug-in created a window on a separate X11 connection, it might not be valid yet.
-          if (XQueryTree(bs->native_disp,bs->native_w,&root,&par,&list, &nlist))
-          {
-            if (!list || !nlist)
-            {
-              if (list) XFree(list);
-              return 0;
-            }
-            XSizeHints *hints = XAllocSizeHints();
-            if (hints)
-            {
-              long hints_ret=0;
-              XGetWMNormalHints(bs->native_disp,list[0],hints,&hints_ret);
-
-              if (hints->flags&PMinSize)
-              {
-                if (r.right < hints->min_width) r.right = hints->min_width;
-                if (r.bottom < hints->min_height) r.bottom = hints->min_height;
-              }
-              if (hints->flags&PMaxSize)
-              {
-                if (hints->max_width > 0 && r.right > hints->max_width) r.right = hints->max_width;
-                if (hints->max_height > 0 && r.bottom > hints->max_height) r.bottom = hints->max_height;
-              }
-              XFree(hints);
-            }
-
-            XResizeWindow(bs->native_disp,list[0],r.right,r.bottom);
-            XFree(list);
-          }
-        }
-        KillTimer(hwnd,wParam);
-      }
-
-      if (wParam != 1) break;
-    case WM_MOVE:
-    case WM_SIZE:
-      if (hwnd && hwnd->m_private_data)
-      {
-        bridgeState *bs = (bridgeState*)hwnd->m_private_data;
-        if (bs->w)
-        {
-          HWND h = hwnd->m_parent;
-          RECT tr = hwnd->m_position;
-          while (h)
-          {
-            RECT cr = h->m_position;
-            if (h->m_oswindow)
-            {
-              cr.right -= cr.left;
-              cr.bottom -= cr.top;
-              cr.left=cr.top=0;
-            }
-
-            if (h->m_wndproc)
-            {
-              NCCALCSIZE_PARAMS p = {{ cr }};
-              h->m_wndproc(h,WM_NCCALCSIZE,0,(LPARAM)&p);
-              cr = p.rgrc[0];
-            }
-            tr.left += cr.left;
-            tr.top += cr.top;
-            tr.right += cr.left;
-            tr.bottom += cr.top;
-
-            if (tr.left < cr.left) tr.left=cr.left;
-            if (tr.top < cr.top) tr.top = cr.top;
-            if (tr.right > cr.right) tr.right = cr.right;
-            if (tr.bottom > cr.bottom) tr.bottom = cr.bottom;
-
-            if (h->m_oswindow) break;
-            h=h->m_parent;
-          }
-
-          // todo: need to periodically check to see if the plug-in has resized its window
-          bool vis = IsWindowVisible(hwnd);
-          if (vis)
-          {
-#if SWELL_TARGET_GDK == 2
-            gint w=0,hh=0,d=0;
-            gdk_window_get_geometry(bs->w,NULL,NULL,&w,&hh,&d);
-#else
-            gint w=0,hh=0;
-            gdk_window_get_geometry(bs->w,NULL,NULL,&w,&hh);
-#endif
-            if (w > bs->lastrect.right-bs->lastrect.left) 
-            {
-              bs->lastrect.right = bs->lastrect.left + w;
-              tr.right++; // workaround "bug" in GDK -- if bs->w was resized via Xlib, GDK won't resize it unless it thinks the size changed
-            }
-            if (hh > bs->lastrect.bottom-bs->lastrect.top) 
-            {
-              bs->lastrect.bottom = bs->lastrect.top + hh;
-              tr.bottom++; // workaround "bug" in GDK -- if bs->w was resized via Xlib, GDK won't resize it unless it thinks the size changed
-            }
-          }
-
-          if (h && h->m_oswindow != bs->cur_parent)
-            bs->need_reparent = true;
-
-          if (h && (bs->need_reparent || (vis != bs->lastvis) || (vis&&memcmp(&tr,&bs->lastrect,sizeof(RECT))))) 
-          {
-            if (bs->lastvis && !vis)
-            {
-              gdk_window_hide(bs->w);
-              bs->lastvis = false;
-            }
-
-            if (bs->need_reparent)
-            {
-              gdk_window_reparent(bs->w,h->m_oswindow,tr.left,tr.top);
-              gdk_window_resize(bs->w, tr.right-tr.left,tr.bottom-tr.top);
-              bs->lastrect=tr;
-
-              bs->cur_parent = h->m_oswindow;
-              bs->cur_parent_xid = h->m_oswindow ? GDK_WINDOW_XID(h->m_oswindow) : 0;
-              bs->cur_parent_xid2 = get_x11_first_child(bs->native_disp, bs->cur_parent_xid);
-              bs->need_reparent=false;
-              if (vis && bs->lastvis) gdk_window_show(bs->w);
-            }
-            else if (memcmp(&tr,&bs->lastrect,sizeof(RECT)))
-            {
-              bs->lastrect = tr;
-              gdk_window_move_resize(bs->w,tr.left,tr.top, tr.right-tr.left, tr.bottom-tr.top);
-            }
-            if (vis && !bs->lastvis)
-            {
-              gdk_window_show(bs->w);
-              gdk_window_raise(bs->w);
-              bs->lastvis = true;
-            }
-          }
-        }
-      }
-    break;
-    case WM_USER+1000: // allow parent to query size of child window
-      if (hwnd && hwnd->m_private_data && wParam && lParam)
-      {
-        bridgeState *bs = (bridgeState*)hwnd->m_private_data;
-        if (bs->native_disp && bs->native_w)
-        {
-          Window root, par, *list=NULL;
-          unsigned int nlist=0;
-          // if a plug-in created a window on a separate X11 connection, it might not be valid yet.
-          if (XQueryTree(bs->native_disp,bs->native_w,&root,&par,&list, &nlist))
-          {
-            if (!list || !nlist)
-            {
-              if (list) XFree(list);
-              return 0;
-            }
-            XWindowAttributes attr;
-            memset(&attr,0,sizeof(attr));
-            if (XGetWindowAttributes(bs->native_disp, list[0], &attr) && attr.width && attr.height)
-            {
-              *((int *)(INT_PTR)wParam) = attr.width;
-              *((int *)(INT_PTR)lParam) = attr.height;
-            }
-            XFree(list);
-          }
-        }
-      }
-    break;
-  }
-  return DefWindowProc(hwnd,uMsg,wParam,lParam);
-}
-
-
-static void forward_x11_drag_message(int gdkmsg, GdkEventDND *gdkevent, Window new_target, Window container)
-{
-  GdkDisplay *display = gdk_window_get_display(gdkevent->window);
-  Display *dpy = gdk_x11_display_get_xdisplay(display);
-  if (WDL_NOT_NORMALLY(!dpy)) return;
-
-  if (WDL_NOT_NORMALLY(!container)) return;
-
-  XClientMessageEvent xev;
-  memset(&xev, 0, sizeof(xev));
-  xev.type = ClientMessage;
-  xev.window = new_target;
-  xev.format = 32;
-  xev.data.l[0] = container;
-
-  switch (gdkmsg)
-  {
-    case GDK_DRAG_ENTER:
-      {
-        // make sure our containerwindow is tagged XdndAware, in case the plug-in checks
-        Atom ver = 5;
-        XChangeProperty(dpy, container, XInternAtom(dpy,"XdndAware",false), XA_ATOM, 32, PropModeReplace, (unsigned char*)&ver, 1);
-      }
-
-      xev.message_type = XInternAtom(dpy, "XdndEnter", False);
-      xev.data.l[1] = (3 << 24); // protocol version 3
-      {
-        // mime types in 2/3/4, prioritizing any uri-list
-        GList * const lb = gdk_drag_context_list_targets(gdkevent->context);
-        int cnt = 0;
-        for (int pass = 0; cnt <= 3 && pass < 2; pass ++)
-        {
-          GList *l = lb;
-          while (cnt <= 3 && l)
-          {
-            const char *n = gdk_atom_name((GdkAtom)l->data);
-            if (n && (!strstr(n,"uri-list")) == pass)
-            {
-              if (cnt<3)
-                xev.data.l[2+cnt] = gdk_x11_atom_to_xatom_for_display(display, (GdkAtom) l->data);
-              cnt++;
-            }
-            l = l->next;
-          }
-        }
-        if (cnt > 3)
-        {
-          Atom *p = (Atom *)malloc(cnt * sizeof(Atom));
-          if (WDL_NORMALLY(p))
-          {
-            xev.data.l[1] |= 1;
-            GList *l = lb;
-            int i = 0;
-            while (i < cnt && l)
-            {
-              p[i++] = gdk_x11_atom_to_xatom_for_display(display,(GdkAtom)l->data);
-              l = l->next;
-            }
-            XChangeProperty(dpy, container, XInternAtom(dpy,"XdndTypeList",False), XA_ATOM, 32, PropModeReplace, (unsigned char*)p, i);
-            free(p);
-          }
-        }
-      }
-    break;
-    case GDK_DRAG_LEAVE:
-      xev.message_type = XInternAtom(dpy, "XdndLeave", False);
-    break;
-    case GDK_DRAG_MOTION:
-      xev.message_type = XInternAtom(dpy, "XdndPosition", False);
-      xev.data.l[1] = 0;
-      xev.data.l[2] = ((int)gdkevent->x_root << 16) | ((int)gdkevent->y_root & 0xFFFF);
-      xev.data.l[3] = gdkevent->time;
-      switch (gdk_drag_context_get_suggested_action(gdkevent->context))
-      {
-        case GDK_ACTION_MOVE: xev.data.l[4] = XInternAtom(dpy, "XdndActionMove", False); break;
-        case GDK_ACTION_LINK: xev.data.l[4] = XInternAtom(dpy, "XdndActionLink", False); break;
-        case GDK_ACTION_PRIVATE: xev.data.l[4] = XInternAtom(dpy, "XdndActionPrivate", False); break;
-        case GDK_ACTION_ASK: xev.data.l[4] = XInternAtom(dpy, "XdndActionAsk", False); break;
-        default: xev.data.l[4] = XInternAtom(dpy, "XdndActionCopy", False); break;
-      }
-    break;
-    case GDK_DROP_START:
-      xev.message_type = XInternAtom(dpy, "XdndDrop", False);
-      xev.data.l[2] = gdkevent->time;
-    break;
-    default:
-      WDL_ASSERT(false);
-    return;
-  }
-
-  XSendEvent(dpy, new_target, False, NoEventMask, (XEvent*)&xev);
-  XFlush(dpy);
-}
-
-
-static void notify_drag_enter(int xpos, int ypos)
-{
-  if (!SWELL_DDrop_onDragEnter) return;
-
-  const char *fn = swell_dragsrc_fn ? swell_dragsrc_fn : "/tmp/<<<<<unknown>>>>>>>";
-  HGLOBAL h=GlobalAlloc(0,sizeof(DROPFILES) + strlen(fn) + 2);
-  if (WDL_NORMALLY(h))
-  {
-    DROPFILES *hdr = (DROPFILES *)GlobalLock(h);
-    if (WDL_NORMALLY(hdr))
-    {
-      memset(hdr,0,sizeof(*hdr));
-      hdr->pFiles = sizeof(DROPFILES);
-      hdr->pt.x = xpos;
-      hdr->pt.y = ypos;
-      char *ep = ((char *)hdr) + sizeof(*hdr);
-      memcpy(ep, fn, strlen(fn)+1);
-      ep[strlen(fn)+1] = 0;
-      GlobalUnlock(h);
-    }
-    POINT pt = {xpos, ypos};
-    SWELL_DDrop_onDragEnter(h,pt);
-    GlobalFree(h);
-  }
-}
-
-static bool validate_top_hwnd(HWND hwnd)
-{
-  if (!hwnd) return false;
-  HWND h = SWELL_topwindows;
-  while (h && h != hwnd) h = h->m_next;
-  return h != NULL;
-}
-
-static bool validate_bridged_xw_from_tlhwnd(HWND hwnd, Window xw)
-{
-  if (WDL_NOT_NORMALLY(!hwnd || !hwnd->m_oswindow || !xw)) return false;
-  Display *dpy = gdk_x11_display_get_xdisplay(gdk_window_get_display(hwnd->m_oswindow));
-  for (int x = 0; x < filter_windows.GetSize(); x ++)
-  {
-    bridgeState *bs = filter_windows.Get(x);
-    if (bs->cur_parent != hwnd->m_oswindow) continue;
-
-    Window root, par, *list=NULL;
-    unsigned int nlist=0;
-    if (XQueryTree(dpy,bs->native_w,&root,&par,&list, &nlist) && list)
-    {
-      for (unsigned int i = 0; i < nlist; i ++)
-      {
-        if (list[i] == xw)
-        {
-          XFree(list);
-          return true;
-        }
-      }
-      XFree(list);
-    }
-  }
-  return false;
-}
-
-static Window hit_test_bridged_xw(HWND hwnd, int xpos, int ypos, Window *containerOut)
-{
-  if (WDL_NOT_NORMALLY(!hwnd || !hwnd->m_oswindow)) return false;
-  POINT pt = { xpos, ypos };
-  Display *dpy = gdk_x11_display_get_xdisplay(gdk_window_get_display(hwnd->m_oswindow));
-  Window new_target = 0;
-  for (int x = 0; !new_target && x < filter_windows.GetSize(); x ++)
-  {
-    bridgeState *bs = filter_windows.Get(x);
-    if (bs->cur_parent != hwnd->m_oswindow) continue;
-    if (!IsWindowVisible(bs->hwnd_child)) continue;
-
-    RECT r;
-    GetWindowRect(bs->hwnd_child,&r);
-    if (!PtInRect(&r,pt)) continue;
-
-    Window root, par, *list=NULL;
-    unsigned int nlist=0;
-    if (XQueryTree(dpy,bs->native_w,&root,&par,&list, &nlist) && list)
-    {
-      for (unsigned int i = 0; !new_target && i < nlist; i ++)
-      {
-        int lx = 0, ly = 0;
-        Window cr = 0;
-        if (!XTranslateCoordinates(dpy, root, list[i], xpos, ypos, &lx, &ly, &cr)) continue;
-
-        XWindowAttributes xwa;
-        memset(&xwa,0,sizeof(xwa));
-        if (XGetWindowAttributes(dpy, list[i], &xwa) && lx >= xwa.x && ly >= xwa.y && lx < xwa.x+xwa.width && ly < xwa.y+xwa.height)
-        {
-          // make sure this window can do XdndAware
-          Atom type;
-          gint format;
-          gulong nitems=0, bytes_after;
-          guchar *data = NULL;
-
-          if (XGetWindowProperty(dpy, list[i], XInternAtom(dpy,"XdndAware",False), 0, 1, false, XA_ATOM, &type, &format, &nitems, &bytes_after, &data) == Success && nitems > 0)
-          {
-            if (type == XA_ATOM)
-            {
-              // this would be where to check for XdndProxy and resolve it.
-              new_target = list[i];
-              *containerOut = bs->native_w;
-            }
-            if (data) XFree(data);
-          }
-
-        }
-      }
-      XFree(list);
-    }
-  }
-  return new_target;
-}
-
-
-static void run_drag_finish_abort()
-{
-  Display *disp = gdk_x11_display_get_xdisplay(gdk_window_get_display(s_ddrop_forward_last_hwnd->m_oswindow));
-  XClientMessageEvent xclient;
-  memset(&xclient,0,sizeof(xclient));
-  xclient.type = ClientMessage;
-  xclient.window = s_ddrop_forward_last_source;
-  xclient.send_event = True;
-  xclient.message_type = XInternAtom(disp, "XdndFinished", False);
-  xclient.format = 32;
-  xclient.data.l[0] = GDK_WINDOW_XID(s_ddrop_forward_last_hwnd->m_oswindow);
-
-  XSendEvent(disp, s_ddrop_forward_last_source, False, NoEventMask, (XEvent*)&xclient);
-  XFlush(disp);
-}
-
-static bool OnDragEventDelegate(GdkEvent *evt)
-{
-#ifdef SWELL_TARGET_WAYLAND
-  if (s_wayland_drag_source) return false;
-#endif
-
-  // GDK sends drag events to the top level window
-  // we need to check for bridged child windows and delegate the events to them
-
-  // GDK_DRAG_ENTER -- position might not be available for these
-  // GDK_DRAG_LEAVE
-
-  // GDK_DRAG_MOTION
-  // GDK_DROP_FINISHED
-  // GDK_DROP_START
-
-  HWND hwnd = swell_oswindow_to_hwnd(((GdkEventAny*)evt)->window);
-  GdkEventDND *e = (GdkEventDND *)evt;
-
-  switch (evt->type)
-  {
-    case GDK_DRAG_LEAVE:
-      if (s_ddrop_forward_last_hwnd && s_ddrop_forward_last_hwnd == hwnd)
-      {
-        if (s_ddrop_forward_last_target)
-        {
-          if (validate_bridged_xw_from_tlhwnd(s_ddrop_forward_last_hwnd,s_ddrop_forward_last_target))
-            forward_x11_drag_message(GDK_DRAG_LEAVE, e, s_ddrop_forward_last_target, s_ddrop_forward_last_container);
-        }
-        else if (SWELL_DDrop_onDragLeave) SWELL_DDrop_onDragLeave();
-        s_ddrop_forward_last_target = 0;
-        s_ddrop_forward_last_container = s_ddrop_forward_last_source = 0;
-        s_ddrop_forward_last_hwnd = NULL;
-      }
-    break;
-    case GDK_DROP_FINISHED:
-      // todo this handler probably needs revisiting
-      if (s_ddrop_forward_last_target && validate_top_hwnd(s_ddrop_forward_last_hwnd))
-      {
-        if (validate_bridged_xw_from_tlhwnd(s_ddrop_forward_last_hwnd,s_ddrop_forward_last_target))
-          forward_x11_drag_message(GDK_DRAG_LEAVE, e, s_ddrop_forward_last_target, s_ddrop_forward_last_container);
-      }
-      s_ddrop_forward_last_target = 0;
-      s_ddrop_forward_last_container = s_ddrop_forward_last_source = 0;
-      s_ddrop_forward_last_hwnd = NULL;
-      if (SWELL_DDrop_onDragLeave) SWELL_DDrop_onDragLeave();
-    break;
-    case GDK_DRAG_ENTER:
-      if (s_ddrop_forward_last_has_dropped &&
-          s_ddrop_forward_last_source &&
-          validate_top_hwnd(s_ddrop_forward_last_hwnd) &&
-          s_ddrop_forward_last_hwnd->m_oswindow)
-      {
-#ifdef _DEBUG
-        printf("swell-generic-gdk: sending XdndFinished in response to GDK_DRAG_ENTER after previous stale drag\n");
-#endif
-        run_drag_finish_abort();
-      }
-      s_ddrop_forward_last_has_dropped = false;
-
-      if (s_ddrop_forward_last_hwnd != hwnd && validate_top_hwnd(s_ddrop_forward_last_hwnd))
-      {
-        if (s_ddrop_forward_last_target)
-        {
-          if (validate_bridged_xw_from_tlhwnd(s_ddrop_forward_last_hwnd,s_ddrop_forward_last_target))
-            forward_x11_drag_message(GDK_DRAG_LEAVE, e, s_ddrop_forward_last_target, s_ddrop_forward_last_container);
-        }
-        else if (SWELL_DDrop_onDragLeave) SWELL_DDrop_onDragLeave();
-      }
-      s_ddrop_forward_last_hwnd = hwnd;
-      s_ddrop_forward_last_container = s_ddrop_forward_last_source = 0;
-      s_ddrop_forward_last_target = 0;
-      // position info is not yet available, assume top level window will get it
-      if (WDL_NORMALLY(hwnd) && WDL_NORMALLY(e->context))
-      {
-        gdk_drag_status(e->context,GDK_ACTION_COPY,e->time);
-        notify_drag_enter((int)e->x_root, (int)e->y_root);
-      }
-    return true;
-    case GDK_DRAG_MOTION:
-      {
-        s_ddrop_forward_last_has_dropped = false;
-
-        Window newcontainer = 0;
-        Window xw = hit_test_bridged_xw(hwnd, e->x_root, e->y_root, &newcontainer);
-        if (xw)
-        {
-          if (!s_ddrop_forward_last_target)
-          {
-            if (SWELL_DDrop_onDragLeave) SWELL_DDrop_onDragLeave();
-          }
-
-          if (xw != s_ddrop_forward_last_target)
-          {
-            if (s_ddrop_forward_last_target && validate_top_hwnd(s_ddrop_forward_last_hwnd) && validate_bridged_xw_from_tlhwnd(s_ddrop_forward_last_hwnd,s_ddrop_forward_last_target))
-              forward_x11_drag_message(GDK_DRAG_LEAVE, e, s_ddrop_forward_last_target, s_ddrop_forward_last_container);
-
-            forward_x11_drag_message(GDK_DRAG_ENTER, e, xw, newcontainer);
-          }
-          s_ddrop_forward_last_target = xw;
-          s_ddrop_forward_last_container = newcontainer;
-
-          s_ddrop_forward_last_source = GDK_WINDOW_XID(gdk_drag_context_get_source_window(e->context));
-          s_ddrop_forward_last_source_time = GetTickCount();
-        }
-        else
-        {
-          if (s_ddrop_forward_last_target)
-          {
-            if (validate_top_hwnd(s_ddrop_forward_last_hwnd) && validate_bridged_xw_from_tlhwnd(s_ddrop_forward_last_hwnd,s_ddrop_forward_last_target))
-              forward_x11_drag_message(GDK_DRAG_LEAVE, e, s_ddrop_forward_last_target, s_ddrop_forward_last_container);
-            s_ddrop_forward_last_target = 0;
-            s_ddrop_forward_last_container = 0;
-            s_ddrop_forward_last_source = 0;
-            notify_drag_enter((int)e->x_root, (int)e->y_root);
-          }
-        }
-        s_ddrop_forward_last_hwnd = hwnd;
-        if (xw)
-        {
-          forward_x11_drag_message(GDK_DRAG_MOTION, e, xw, newcontainer);
-        }
-        else
-        {
-          gdk_drag_status(e->context,GDK_ACTION_COPY,e->time);
-          if (SWELL_DDrop_onDragOver)
-          {
-            POINT pt = { (int)e->x_root, (int)e->y_root };
-            SWELL_DDrop_onDragOver(pt);
-          }
-        }
-      }
-    break;
-    case GDK_DROP_START:
-#ifdef SWELL_TARGET_WAYLAND
-      if (!GDK_IS_WAYLAND_DISPLAY(gdk_display_get_default()))
-#endif
-      {
-        if (hwnd && hwnd == s_ddrop_forward_last_hwnd && s_ddrop_forward_last_target)
-        {
-          if (WDL_NORMALLY(validate_bridged_xw_from_tlhwnd(hwnd,s_ddrop_forward_last_target)))
-          {
-            s_ddrop_forward_last_source_time = GetTickCount();
-            s_ddrop_forward_last_has_dropped = true;
-            forward_x11_drag_message(GDK_DROP_START, e, s_ddrop_forward_last_target, s_ddrop_forward_last_container);
-            // do not clear forwarding state until a XdndFinished was sent, or timed out on motion
-          }
-        }
-        else
-        {
-          GdkDragContext *ctx = e->context;
-          if (ctx)
-          {
-            s_ddrop_hwnd = hwnd;
-            s_ddrop_pt.x = (int)e->x_root;
-            s_ddrop_pt.y = (int)e->y_root;
-
-            GdkAtom srca = gdk_drag_get_selection(ctx);
-            gdk_selection_convert(e->window,srca,urilistatom(),e->time);
-            gdk_drop_finish(ctx,TRUE,e->time);
-          }
-        }
-        if (SWELL_DDrop_onDragLeave) SWELL_DDrop_onDragLeave();
-      }
-    break;
-    default: return false;
-  }
-  return false;
-}
-
-
-static const char * const bridge_class_name = "__swell_xbridgewndclass";
-
-static bool want_key_embed_redirect(Display *disp, Window scan_id, Window *new_dest, int keycode, int modstate)
-{
-  for (int x=0;x<filter_windows.GetSize(); x++)
-  {
-    bridgeState *bs = filter_windows.Get(x);
-    if (bs && bs->cur_parent &&
-        (bs->cur_parent_xid == scan_id || bs->cur_parent_xid2 == scan_id) &&
-        bs->native_disp == disp)
-    {
-      HWND foc = GetFocus();
-      if (foc &&
-          foc->m_classname &&
-          !strcmp(foc->m_classname,bridge_class_name) &&
-          foc->m_private_data == (INT_PTR)bs
-          )
-      {
-        void *p = GetProp(foc,"SWELL_XBRIDGE_KBHOOK_CHECK");
-        if (p && SendMessage(GetParent(foc),(int)(INT_PTR)p,keycode,modstate))
-          return false;
-
-        Window root, par, *list=NULL;
-        unsigned int nlist=0;
-        if (XQueryTree(bs->native_disp,bs->native_w,&root,&par,&list, &nlist) && list)
-        {
-          if (nlist) *new_dest = list[0];
-          XFree(list);
-          if (nlist) return true;
-        }
-      }
-    }
-  }
-  return false;
-}
-
-static GdkFilterReturn filterCreateShowProc(GdkXEvent *xev, GdkEvent *event, gpointer data)
-{
-  XEvent *xevent = (XEvent *)xev;
-  if (WDL_NOT_NORMALLY(!xev)) return GDK_FILTER_CONTINUE;
-
-  switch (xevent->type)
-  {
-    case KeyPress:
-    case KeyRelease:
-      {
-        // only used if gdk_disable_multidevice() was called prior to gdk_init_ (maybe some env var too?)
-        Window dest;
-        Display *disp = xevent->xany.display;
-        if (!xevent->xany.send_event &&
-            want_key_embed_redirect(disp,xevent->xkey.window, &dest, xevent->xkey.keycode, xevent->xkey.state))
-        {
-          XEvent k;
-          memset(&k,0,sizeof(k));
-          k.xkey = xevent->xkey;
-          k.xkey.window = dest;
-          XSendEvent(disp, dest, False, NoEventMask, &k);
-          return GDK_FILTER_REMOVE;
-        }
-        else if (xevent->xany.send_event)
-        {
-          Window scan_id = xevent->xkey.window;
-          for (int x=0;x<filter_windows.GetSize(); x++)
-          {
-            bridgeState *bs = filter_windows.Get(x);
-            if (bs && bs->native_disp == disp && bs->cur_parent_xid && bs->native_w == scan_id)
-            {
-              // redirect to the parent window for processing
-              xevent->xkey.window = bs->cur_parent_xid;
-              return GDK_FILTER_CONTINUE;
-            }
-          }
-        }
-      }
-    break;
-    case FocusIn:
-      {
-        // only used if gdk_disable_multidevice() was called prior to gdk_init_ (maybe some env var too?)
-        Display *disp = xevent->xany.display;
-        Window scan_id = xevent->xfocus.window;
-        for (int x=0;x<filter_windows.GetSize(); x++)
-        {
-          bridgeState *bs = filter_windows.Get(x);
-          if (bs && bs->cur_parent &&
-              (bs->cur_parent_xid == scan_id || bs->cur_parent_xid2 == scan_id) &&
-              bs->native_disp == disp)
-          {
-            POINT pt;
-            GetCursorPos(&pt);
-            RECT r;
-            GetWindowRect(bs->hwnd_child,&r);
-            if (PtInRect(&r,pt))
-            {
-              SetFocus(bs->hwnd_child);
-              return GDK_FILTER_REMOVE;
-            }
-          }
-        }
-      }
-    break;
-    case GenericEvent:
-      // XInput2
-      {
-        XIDeviceEvent *xievent = (XIDeviceEvent*)xevent->xcookie.data;
-        if (!xevent->xany.send_event &&
-            xievent &&
-            (xievent->evtype == XI_KeyPress || xievent->evtype == XI_KeyRelease))
-        {
-          Window dest;
-          Display *disp = xevent->xany.display;
-          if (want_key_embed_redirect(disp,xievent->event, &dest, xievent->detail, xievent->mods.effective))
-          {
-            XEvent k;
-            if (xievent->evtype == XI_KeyPress) k.xkey.type = KeyPress;
-            else k.xkey.type = KeyRelease;
-            k.xkey.serial = xievent->serial;
-            k.xkey.send_event = xievent->send_event;
-            k.xkey.display = disp;
-            k.xkey.window = dest;
-            k.xkey.root = xievent->root;
-            k.xkey.subwindow = xievent->child;
-            k.xkey.time = xievent->time;
-            k.xkey.x = xievent->event_x;
-            k.xkey.y = xievent->event_y;
-            k.xkey.x_root = xievent->root_x;
-            k.xkey.y_root = xievent->root_y;
-            k.xkey.state = xievent->mods.effective;
-            k.xkey.keycode = xievent->detail;
-            k.xkey.same_screen = 1;
-            XSendEvent(disp, dest, False, NoEventMask, &k);
-            return GDK_FILTER_REMOVE;
-          }
-        }
-        else if (xievent && xievent->evtype == XI_FocusIn)
-        {
-          Display *disp = xevent->xany.display;
-          XIFocusInEvent *foc = (XIFocusInEvent *)xievent;
-          Window scan_id = foc->event;
-          for (int x=0;x<filter_windows.GetSize(); x++)
-          {
-            bridgeState *bs = filter_windows.Get(x);
-            if (bs && bs->cur_parent &&
-                (bs->cur_parent_xid == scan_id || bs->cur_parent_xid2 == scan_id) &&
-                bs->native_disp == disp)
-            {
-              POINT pt = { (int) foc->root_x, (int) foc->root_y };
-              RECT r;
-              GetWindowRect(bs->hwnd_child,&r);
-              if (PtInRect(&r,pt))
-              {
-                SetFocus(bs->hwnd_child);
-                return GDK_FILTER_REMOVE;
-              }
-            }
-          }
-        }
-      }
-    break;
-    case CreateNotify:
-      {
-        for (int x=0;x<filter_windows.GetSize(); x++)
-        {
-          bridgeState *bs = filter_windows.Get(x);
-          if (bs && bs->native_w == xevent->xany.window && bs->native_disp == xevent->xany.display)
-          {
-            //gint w=0,hh=0;
-            //gdk_window_get_geometry(bs->w,NULL,NULL,&w,&hh);
-            XMapWindow(bs->native_disp, xevent->xcreatewindow.window);
-            //XResizeWindow(bs->native_disp, xevent->xcreatewindow.window,w,hh);
-            return GDK_FILTER_REMOVE;
-          }
-        }
-      }
-    break;
-    case ClientMessage:
-      if (s_ddrop_forward_last_container &&
-          xevent->xany.window == s_ddrop_forward_last_container &&
-          s_ddrop_forward_last_hwnd &&
-          s_ddrop_forward_last_source &&
-          (GetTickCount()-s_ddrop_forward_last_source_time) < 10000)
-      {
-        Display *disp = xevent->xany.display;
-        const bool fin = xevent->xclient.message_type == XInternAtom(disp, "XdndFinished", False);
-        bool eat = false;
-        if ((fin || xevent->xclient.message_type == XInternAtom(disp, "XdndStatus", False)) &&
-            validate_top_hwnd(s_ddrop_forward_last_hwnd) && s_ddrop_forward_last_hwnd->m_oswindow)
-        {
-          // these messages need to get passed back to the drag source with our top-level window as the target
-          XClientMessageEvent xclient;
-          memcpy(&xclient,xevent,sizeof(xclient));
-          xclient.serial = 0;
-          xclient.send_event = True;
-          xclient.window = s_ddrop_forward_last_source;
-          xclient.data.l[0] = GDK_WINDOW_XID(s_ddrop_forward_last_hwnd->m_oswindow);
-
-          XSendEvent(disp, s_ddrop_forward_last_source, False, NoEventMask, (XEvent*)&xclient);
-          XFlush(disp);
-          eat = true;
-        }
-        if (fin)
-        {
-          // drag complete, clear relay container state
-          s_ddrop_forward_last_target = 0;
-          s_ddrop_forward_last_container = s_ddrop_forward_last_source = 0;
-          s_ddrop_forward_last_hwnd = NULL;
-        }
-        if (eat) return GDK_FILTER_REMOVE;
-      }
-    break;
-  }
-  return GDK_FILTER_CONTINUE;
-}
-
-HWND SWELL_CreateXBridgeWindow(HWND viewpar, void **wref, const RECT *r)
-{
-  HWND hwnd = NULL;
-  *wref = NULL;
 #ifdef SWELL_TARGET_WAYLAND
   if (GDK_IS_WAYLAND_DISPLAY(gdk_display_get_default()))
-    return xw_bridge_create(viewpar, wref, r, "REAPERXBridge");
+    return xw_bridge_create(parent, window, rect, "REAPERXBridge");
 #endif
-  GdkWindow *ospar = NULL;
-  HWND hpar = viewpar;
-  while (hpar)
-  {
-    ospar = hpar->m_oswindow;
-    if (ospar) break;
-    hpar = hpar->m_parent;
-  }
-
-  bool need_reparent=false;
-
-  if (!ospar)
-  {
-    need_reparent = true;
-    ospar = gdk_screen_get_root_window(gdk_screen_get_default());
-  }
-
-  Display *disp = gdk_x11_display_get_xdisplay(gdk_window_get_display(ospar));
-  Window w = XCreateWindow(disp,GDK_WINDOW_XID(ospar),0,0,
-      wdl_max(r->right-r->left,1),
-      wdl_max(r->bottom-r->top,1),
-      0,CopyFromParent, InputOutput, CopyFromParent, 0, NULL);
-  GdkWindow *gdkw = w ? gdk_x11_window_foreign_new_for_display(gdk_display_get_default(),w) : NULL;
-
-  hwnd = new HWND__(viewpar,0,r,NULL, true, xbridgeProc);
-  bridgeState *bs = gdkw ? new bridgeState(need_reparent,gdkw,w,disp, ospar, hwnd) : NULL;
-  hwnd->m_classname = bridge_class_name;
-  hwnd->m_private_data = (INT_PTR) bs;
-  if (gdkw)
-  {
-    *wref = (void *) w;
-
-    XSelectInput(disp, w, KeyPress | KeyRelease | StructureNotifyMask | SubstructureNotifyMask);
-
-    static bool filt_add;
-    if (!filt_add)
-    {
-      filt_add=true;
-      gdk_window_add_filter(NULL, filterCreateShowProc, NULL);
-    }
-    SetTimer(hwnd,1,100,NULL);
-    if (!need_reparent) SendMessage(hwnd,WM_SIZE,SIZE_RESTORED,0);
-  }
-  return hwnd;
+  return swell_x11_create_bridge(parent, window, rect);
 }
 
 struct dropSourceInfo {
-  dropSourceInfo() 
-  { 
-    srclist=NULL; srccount=0; srcfn=NULL; callback=NULL; 
+  dropSourceInfo()
+  {
+    srclist=NULL; srccount=0; srcfn=NULL; callback=NULL;
     state=0;
     dragctx=NULL;
+#ifdef SWELL_TARGET_WAYLAND
+    widget=NULL;
+    finished=false;
+#endif
   }
-  ~dropSourceInfo() 
-  { 
-    free(srcfn); 
+  ~dropSourceInfo()
+  {
+    free(srcfn);
+#ifdef SWELL_TARGET_WAYLAND
+    if (widget)
+    {
+      g_signal_handlers_disconnect_by_data(widget, this);
+      if (dragctx) gtk_drag_cancel(dragctx);
+      g_object_unref(widget);
+    }
+#endif
     if (dragctx)
     {
+#ifdef SWELL_TARGET_WAYLAND
+      if (!widget)
+#endif
       if (_gdk_drag_drop_done) _gdk_drag_drop_done(dragctx,state!=0);
       g_object_unref(dragctx);
     }
@@ -5064,10 +3555,14 @@ struct dropSourceInfo {
   // or
   void (*callback)(const char *);
   char *srcfn;
-  
+
   int state;
 
   GdkDragContext *dragctx;
+#ifdef SWELL_TARGET_WAYLAND
+  GtkWidget *widget;
+  bool finished;
+#endif
 };
 
 static void encode_uri(WDL_FastString *s, const char *rd)
@@ -5090,55 +3585,33 @@ static void encode_uri(WDL_FastString *s, const char *rd)
 #ifdef SWELL_TARGET_WAYLAND
 static void on_drag_source_data_get(GtkWidget *widget, GdkDragContext *context, GtkSelectionData *data, guint info, guint time, gpointer user_data)
 {
-  HWND source_hwnd = (HWND)user_data;
-  if (!source_hwnd) return;
-
-  dropSourceInfo *inf = (dropSourceInfo*)source_hwnd->m_private_data;
-  if (!inf) return;
-
+  dropSourceInfo *inf = (dropSourceInfo*)user_data;
   WDL_FastString str;
 
   if (inf->srclist && inf->srccount)
   {
     for (int x = 0; x < inf->srccount; x++)
     {
-      const char *fn = inf->srclist[x];
       str.Append("file://");
-      while (*fn)
-      {
-        if (isalnum_safe(*fn) || *fn == '.' || *fn == '_' || *fn == '-' || *fn == '/' || *fn == '#')
-          str.Append(fn, 1);
-        else
-          str.AppendFormatted(8, "%%%02x", *(unsigned char *)fn);
-        fn++;
-      }
+      encode_uri(&str, inf->srclist[x]);
       str.Append("\r\n");
     }
   }
-  else if (inf->callback && inf->srcfn && inf->state)
+  else if (inf->callback && inf->srcfn)
   {
-    inf->callback(inf->srcfn);
-    const char *fn = inf->srcfn;
+    if (!inf->state) inf->callback(inf->srcfn);
+    inf->state = 1;
     str.Append("file://");
-    while (*fn)
-    {
-      if (isalnum_safe(*fn) || *fn == '.' || *fn == '_' || *fn == '-' || *fn == '/' || *fn == '#')
-        str.Append(fn, 1);
-      else
-        str.AppendFormatted(8, "%%%02x", *(unsigned char *)fn);
-      fn++;
-    }
+    encode_uri(&str, inf->srcfn);
     str.Append("\r\n");
   }
   gtk_selection_data_set(data, urilistatom(), 8, (const guchar*)str.Get(), str.GetLength());
 }
 
-static void on_drag_source_end(GtkWidget *widget, GdkDragContext *context, gpointer user_data)
+static void on_drag_source_end(GtkWidget *, GdkDragContext *, gpointer data)
 {
-  if (swell_dragsrc_timeout_start == 0)
-    swell_dragsrc_timeout_start = GetTickCount();
-  if (GDK_IS_DRAG_CONTEXT(context))
-    g_object_ref(context);
+  ((dropSourceInfo*)data)->finished = true;
+  if (GetCapture() == swell_dragsrc_hwnd) ReleaseCapture();
 }
 #endif
 
@@ -5151,24 +3624,20 @@ static LRESULT WINAPI dropSourceWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPAR
 #ifdef SWELL_TARGET_WAYLAND
       if (GDK_IS_WAYLAND_DISPLAY(gdk_display_get_default()))
       {
-        if (!swell_dragsrc_widget)
+        GtkWidget *widget = s_cur_evt ? gtk_get_event_widget(s_cur_evt) : NULL;
+        if (!widget) break;
+        inf->widget = (GtkWidget*)g_object_ref(gtk_widget_get_toplevel(widget));
+        g_signal_connect(inf->widget, "drag-data-get", G_CALLBACK(on_drag_source_data_get), inf);
+        g_signal_connect(inf->widget, "drag-end", G_CALLBACK(on_drag_source_end), inf);
+        GtkTargetList *target_list = gtk_target_list_new(NULL, 0);
+        gtk_target_list_add_uri_targets(target_list, 0);
+        inf->dragctx = gtk_drag_begin_with_coordinates(inf->widget, target_list, GDK_ACTION_COPY, 1, s_cur_evt, -1, -1);
+        gtk_target_list_unref(target_list);
+        if (inf->dragctx)
         {
-          swell_dragsrc_widget = gtk_window_new(GTK_WINDOW_POPUP);
-          gtk_window_set_default_size(GTK_WINDOW(swell_dragsrc_widget), 1, 1);
-          gtk_widget_realize(swell_dragsrc_widget);
+          g_object_ref(inf->dragctx);
+          if (!inf->finished) SetCapture(hwnd);
         }
-        if (swell_dragsrc_widget)
-        {
-          GtkTargetList *target_list = gtk_target_list_new(NULL, 0);
-          gtk_target_list_add_uri_targets(target_list, 0);
-          POINT p;
-          GetCursorPos(&p);
-          inf->dragctx = gtk_drag_begin_with_coordinates(swell_dragsrc_widget, target_list, GDK_ACTION_COPY, 1, NULL, p.x, p.y);
-          gtk_target_list_unref(target_list);
-          g_signal_connect(swell_dragsrc_widget, "drag-data-get", G_CALLBACK(on_drag_source_data_get), hwnd);
-          g_signal_connect(swell_dragsrc_widget, "drag-end", G_CALLBACK(on_drag_source_end), NULL);
-        }
-        SetCapture(hwnd);
       }
       else
 #endif
@@ -5184,12 +3653,17 @@ static LRESULT WINAPI dropSourceWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPAR
         }
         if (swell_dragsrc_osw)
         {
-          inf->dragctx = gdk_drag_begin(swell_dragsrc_osw, g_list_append(NULL,urilistatom()));
+          GList *targets = g_list_append(NULL, urilistatom());
+          inf->dragctx = gdk_drag_begin(swell_dragsrc_osw, targets);
+          g_list_free(targets);
         }
         SetCapture(hwnd);
       }
     break;
     case WM_MOUSEMOVE:
+#ifdef SWELL_TARGET_WAYLAND
+      if (inf->widget) break;
+#endif
       if (inf->dragctx)
       {
         POINT p;
@@ -5206,6 +3680,9 @@ static LRESULT WINAPI dropSourceWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPAR
       }
     break;
     case WM_LBUTTONUP:
+#ifdef SWELL_TARGET_WAYLAND
+      if (inf->widget) break;
+#endif
       if (inf->dragctx && !inf->state)
       {
         inf->state=1;
@@ -5272,6 +3749,7 @@ static LRESULT WINAPI dropSourceWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPAR
 
 void SWELL_InitiateDragDrop(HWND hwnd, RECT* srcrect, const char* srcfn, void (*callback)(const char* dropfn))
 {
+  if (hwnd) hwnd->Retain();
   const bool is_osw_cursor = s_last_setcursor_oswnd && swell_oswindow_from_hwnd(hwnd) == s_last_setcursor_oswnd;
   swell_dragsrc_fn = srcfn;
   dropSourceInfo info;
@@ -5283,7 +3761,7 @@ void SWELL_InitiateDragDrop(HWND hwnd, RECT* srcrect, const char* srcfn, void (*
   swell_dragsrc_hwnd=h;
   h->m_private_data = (INT_PTR) &info;
   dropSourceWndProc(h,WM_CREATE,0,0);
-  while (GetCapture()==h)
+  while (GetCapture()==h && (!hwnd || !hwnd->m_hashaddestroy))
   {
     SWELL_RunMessageLoop();
     Sleep(10);
@@ -5293,18 +3771,20 @@ void SWELL_InitiateDragDrop(HWND hwnd, RECT* srcrect, const char* srcfn, void (*
   swell_dragsrc_hwnd=NULL;
   DestroyWindow(h);
 
-  if (is_osw_cursor && hwnd && GetFocus() != hwnd)
+  if (is_osw_cursor && hwnd && !hwnd->m_hashaddestroy && GetFocus() != hwnd)
   {
     SWELL_OSWINDOW osw = swell_oswindow_from_hwnd(hwnd);
-    gdk_window_set_cursor(osw,NULL);
+    if (osw) gdk_window_set_cursor(osw,NULL);
   }
   swell_dragsrc_fn = NULL;
+  if (hwnd) hwnd->Release();
 }
 
 // owner owns srclist, make copies here etc
 void SWELL_InitiateDragDropOfFileList(HWND hwnd, RECT *srcrect, const char **srclist, int srccount, HICON icon)
 {
   swell_dragsrc_fn = srccount>0 ? srclist[0] : NULL;
+  if (hwnd) hwnd->Retain();
   const bool is_osw_cursor = s_last_setcursor_oswnd && swell_oswindow_from_hwnd(hwnd) == s_last_setcursor_oswnd;
   dropSourceInfo info;
   info.srclist = srclist;
@@ -5315,7 +3795,7 @@ void SWELL_InitiateDragDropOfFileList(HWND hwnd, RECT *srcrect, const char **src
   swell_dragsrc_hwnd=h;
   h->m_private_data = (INT_PTR) &info;
   dropSourceWndProc(h,WM_CREATE,0,0);
-  while (GetCapture()==h)
+  while (GetCapture()==h && (!hwnd || !hwnd->m_hashaddestroy))
   {
     SWELL_RunMessageLoop();
     Sleep(10);
@@ -5325,12 +3805,13 @@ void SWELL_InitiateDragDropOfFileList(HWND hwnd, RECT *srcrect, const char **src
   swell_dragsrc_hwnd=NULL;
   DestroyWindow(h);
 
-  if (is_osw_cursor && hwnd && GetFocus() != hwnd)
+  if (is_osw_cursor && hwnd && !hwnd->m_hashaddestroy && GetFocus() != hwnd)
   {
     SWELL_OSWINDOW osw = swell_oswindow_from_hwnd(hwnd);
-    gdk_window_set_cursor(osw,NULL);
+    if (osw) gdk_window_set_cursor(osw,NULL);
   }
   swell_dragsrc_fn = NULL;
+  if (hwnd) hwnd->Release();
 }
 
 void SWELL_FinishDragDrop() { }
@@ -5354,33 +3835,7 @@ void SWELL_SetCursor(HCURSOR curs)
 #ifdef SWELL_TARGET_GDK_CURSORHACK
     if (GetCapture() && !(gdk_options & OPTION_IS_WAYLAND))
     {
-      // workaround for a GDK behavior:
-      // gdkwindow.c, gdk_window_set_cursor_internal() has a line:
-      // >>> if (_gdk_window_event_parent_of (window, pointer_info->window_under_pointer))
-      // this should also allow setting the cursor if window is in a "grabbing" state
-      GdkDisplay *gdkdisp = gdk_display_get_default();
-#if SWELL_TARGET_GDK == 2
-      if (gdkdisp && gdk_display_get_window_at_pointer(gdkdisp,NULL,NULL) != SWELL_focused_oswindow)
-#else
-      GdkDevice *dev = gdk_device_manager_get_client_pointer(gdk_display_get_device_manager(gdkdisp));
-      if (dev && gdk_device_get_window_at_position(dev,NULL,NULL) != SWELL_focused_oswindow)
-#endif
-      {
-        Display *disp = gdk_x11_display_get_xdisplay(gdkdisp);
-        Window wn =  GDK_WINDOW_XID(SWELL_focused_oswindow);
-#if SWELL_TARGET_GDK == 2
-        gint devid=2; // hardcoded default pointing device
-#else
-        gint devid = gdk_x11_device_get_id(dev);
-#endif
-        if (disp && wn)
-        {
-          if (curs)
-            XIDefineCursor(disp,devid,wn, gdk_x11_cursor_get_xcursor((GdkCursor*)curs));
-          else
-            XIUndefineCursor(disp,devid,wn);
-        }
-      }
+      swell_x11_set_grab_cursor(SWELL_focused_oswindow, (GdkCursor*)curs);
     }
 #endif // SWELL_TARGET_GDK_CURSORHACK
   }
@@ -5648,63 +4103,6 @@ BOOL GetMonitorInfo(HMONITOR hmon, void *inf)
 }
 
 
-
-void SWELL_SetViewGL(HWND h, char wantGL)
-{
-  // only works for X bridge windows
-  if (h && h->m_classname == bridge_class_name && h->m_private_data)
-  {
-    bridgeState *bs = (bridgeState*)h->m_private_data;
-    if (wantGL && !bs->gl_ctx)
-    {
-      static GLint att[] = { GLX_RGBA, None };
-      XVisualInfo* vi = glXChooseVisual(bs->native_disp, 0, att);
-      bs->gl_ctx = glXCreateContext(bs->native_disp,vi,NULL,1);
-    }
-    else if (!wantGL && bs->gl_ctx)
-    {
-      if (s_last_gl_ctx == bs)
-      {
-        glXMakeCurrent(bs->native_disp,None, NULL);
-        s_last_gl_ctx = NULL;
-      }
-
-      glXDestroyContext(bs->native_disp,bs->gl_ctx);
-      bs->gl_ctx = NULL;
-    }
-  }
-}
-
-bool SWELL_GetViewGL(HWND h)
-{
-  return h && h->m_classname == bridge_class_name && h->m_private_data &&
-    ((bridgeState*)h->m_private_data)->gl_ctx != NULL;
-}
-
-bool SWELL_SetGLContextToView(HWND h)
-{
-  if (h)
-  {
-    if (h->m_classname == bridge_class_name && h->m_private_data)
-    {
-      bridgeState *bs = (bridgeState*)h->m_private_data;
-      if (bs->gl_ctx)
-      {
-        glXMakeCurrent(bs->native_disp, bs->native_w, bs->gl_ctx);
-        s_last_gl_ctx = bs;
-        return true;
-      }
-    }
-    return false;
-  }
-
-  if (s_last_gl_ctx)
-  {
-    glXMakeCurrent(s_last_gl_ctx->native_disp,None, NULL);
-    s_last_gl_ctx = NULL;
-  }
-  return true;
-}
 
 void *SWELL_GetOSWindow(HWND hwnd, const char *type)
 {

@@ -4,141 +4,42 @@
 #define DEBUG_PRINT(...) ((void)0)
 #endif
 #include <gdk/gdkwayland.h>
+#include <algorithm>
+#include <list>
+#include "xwayland-bridge-wm.h"
 #include "xwayland-bridge.h"
+#include "swell-wayland.h"
+#include "swell-internal.h"
+#include "xwayland-bridge-gl.h"
 #include "swell-gdk-scale.h"
-#include <X11/extensions/Xcomposite.h>
-#include <X11/extensions/Xdamage.h>
-#include <X11/extensions/Xfixes.h>
-#include <X11/extensions/Xrandr.h>
-#include <X11/extensions/shape.h>
-#include <X11/keysym.h>
-#include <cairo/cairo-xlib.h>
-#include <X11/Xlib-xcb.h>
-#include <X11/extensions/XShm.h>
-#include <X11/extensions/Xrender.h>
-#include <xcb/shm.h>
-#include <sys/mman.h>
-#include <fcntl.h>
+#include <xcb/xcb_renderutil.h>
+#include "swell-xcb.h"
+#include <xcb/composite.h>
+#include <xcb/xtest.h>
+#include <xcb/xfixes.h>
+#include <xcb/randr.h>
+#include <xcb/xcb_keysyms.h>
+#include <xcb/damage.h>
+#include <xcb/shape.h>
 #include <stdint.h>
 #include <unistd.h>
 void xw_size(HWND hwnd);
 
-XWaylandWM     *g_wm           = nullptr;
-Display *g_wm_dpy       = nullptr;
-
-class CaptureImage {
-    Display *dpy = nullptr;
-    XImage *image = nullptr;
-    XShmSegmentInfo shm = {};
-    size_t image_size = 0;
-    cairo_surface_t *surface = nullptr;
-    bool attached = false, disabled = false;
-
-    bool create(Display *display, Visual *visual, int w, int h)
-    {
-        dpy = display;
-        XRenderPictFormat *format = XRenderFindVisualFormat(dpy, visual);
-        if (!format || format->type != PictTypeDirect ||
-            (format->depth != 24 && format->depth != 32) ||
-            visual->red_mask != 0xff0000 || visual->green_mask != 0xff00 ||
-            visual->blue_mask != 0xff ||
-            (format->direct.alphaMask &&
-             (format->direct.alphaMask != 0xff || format->direct.alpha != 24))) return false;
-
-        int major, minor;
-        Bool pixmaps;
-        if (!XShmQueryVersion(dpy, &major, &minor, &pixmaps) ||
-            major < 1 || (major == 1 && minor < 2)) return false;
-        xcb_connection_t *connection = XGetXCBConnection(dpy);
-        if (!connection || xcb_connection_has_error(connection) || w <= 0 || h <= 0) return false;
-
-        image = XShmCreateImage(dpy, visual, format->depth, ZPixmap, nullptr, &shm, w, h);
-        const unsigned int endian = 1;
-        if (!image || image->bits_per_pixel != 32 || image->bytes_per_line <= 0 ||
-            image->byte_order != (*(const char*)&endian ? LSBFirst : MSBFirst) ||
-            (size_t)h > SIZE_MAX / (size_t)image->bytes_per_line) return false;
-
-        image_size = (size_t)image->bytes_per_line * h;
-        int fd = memfd_create("swell-plugin", MFD_CLOEXEC | MFD_ALLOW_SEALING);
-        if (fd < 0) return false;
-        if (ftruncate(fd, image_size) < 0 ||
-            fcntl(fd, F_ADD_SEALS, F_SEAL_SHRINK | F_SEAL_GROW | F_SEAL_SEAL) < 0) {
-            close(fd);
-            return false;
-        }
-        void *mapping = mmap(nullptr, image_size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
-        if (mapping == MAP_FAILED) { close(fd); return false; }
-        shm.shmaddr = (char*)mapping;
-        image->data = shm.shmaddr;
-        shm.shmseg = xcb_generate_id(connection);
-        XFlush(dpy);
-        xcb_generic_error_t *error = xcb_request_check(connection,
-            xcb_shm_attach_fd_checked(connection, shm.shmseg, fd, False));
-        attached = !error && !xcb_connection_has_error(connection);
-        free(error);
-        if (!attached) return false;
-
-        surface = cairo_image_surface_create_for_data((unsigned char*)image->data,
-            format->direct.alphaMask ? CAIRO_FORMAT_ARGB32 : CAIRO_FORMAT_RGB24,
-            w, h, image->bytes_per_line);
-        return cairo_surface_status(surface) == CAIRO_STATUS_SUCCESS;
-    }
-
-public:
-    ~CaptureImage() { reset(); }
-
-    void reset()
-    {
-        if (surface) cairo_surface_destroy(surface);
-        surface = nullptr;
-        if (attached) XShmDetach(dpy, &shm);
-        attached = false;
-        if (image) { image->data = nullptr; XDestroyImage(image); }
-        image = nullptr;
-        if (shm.shmaddr) munmap(shm.shmaddr, image_size);
-        shm.shmaddr = nullptr;
-        image_size = 0;
-    }
-
-    cairo_surface_t *read(Display *display, Pixmap pixmap, Visual *visual, int w, int h,
-                          bool refresh)
-    {
-        if (disabled) return nullptr;
-        if (image && (image->width != w || image->height != h)) reset();
-        if (image && !refresh) return cairo_surface_reference(surface);
-        if (!image && !create(display, visual, w, h)) {
-            reset();
-            disabled = true;
-            return nullptr;
-        }
-        cairo_surface_flush(surface);
-        if (!XShmGetImage(dpy, pixmap, image, 0, 0, AllPlanes)) {
-            reset();
-            disabled = true;
-            return nullptr;
-        }
-        cairo_surface_mark_dirty(surface);
-        return cairo_surface_reference(surface);
-    }
-};
-
-
 struct Capture {
+    CapturePixmap pixmap;
     CaptureImage image;
-    Display   *dpy         = nullptr;
-    Window     parent_win  = 0;
-    Window     plugin_win  = 0;
-    Window     gui_win     = 0;
-    Pixmap     pixmap      = 0;      // XComposite-named window pixmap; refreshed on resize
-    int        pixmap_w    = 0;
-    int        pixmap_h    = 0;
+    CaptureGL gl;
+    cairo_device_t *cairo_device = nullptr;
+    xcb_connection_t *connection = nullptr;
+    xcb_window_t parent_win  = 0;
+    xcb_window_t plugin_win  = 0;
+    xcb_window_t gui_win     = 0;
     bool       pixmap_dirty = true;
-    Visual    *visual      = nullptr; // plugin_win's visual, cached for cairo_xlib_surface_create
     GtkWidget *widget      = nullptr;
     GtkWidget *active_toplevel = nullptr; // toplevel we hooked notify::is-active on; disconnected in cleanup
     HWND       hwnd        = nullptr;
     //
-    Damage     damage      = 0;
+    xcb_damage_damage_t damage      = 0;
 
     GtkWidget *popup_canvas    = nullptr;
     GtkWidget *canvas_draw     = nullptr;
@@ -147,28 +48,35 @@ struct Capture {
     int        canvas_y        = 0;
     int        gtk_x           = 0;
     int        gtk_y           = 0;
-    Window     root_popup      = 0;
+    xcb_window_t root_popup      = 0;
 
 
     struct PopupWin {
-        Window x11_win;
-        Pixmap pixmap;
+        xcb_window_t x11_win;
+        CapturePixmap pixmap;
+        CaptureImage image;
         bool pixmap_dirty;
         int x,y,w,h;
         bool visible;
-        Damage damage;
-        Visual *visual;
-        std::vector<XRectangle> shape;
+        xcb_damage_damage_t damage;
+        std::vector<xcb_rectangle_t> shape;
         bool shape_dirty;
     };
-    std::vector<PopupWin> popups;
+    std::list<PopupWin> popups;
 
     // ── Modals (real dialog windows the plugin opens) ──
-    struct ModalWin { Window x11_win; Pixmap pixmap; GtkWidget *gtk_win; GtkWidget *draw; Damage damage; int w; int h; Visual *visual; };
-    std::vector<ModalWin> modals;
+    struct ModalWin {
+        xcb_window_t x11_win;
+        CapturePixmap pixmap;
+        CaptureImage image;
+        bool pixmap_dirty;
+        GtkWidget *gtk_win, *draw;
+        xcb_damage_damage_t damage;
+    };
+    std::list<ModalWin> modals;
 };
 
-static std::map<Window, Capture*> g_captures;
+static std::map<xcb_window_t, Capture*> g_captures;
 
 bool xw_bridge_has_pending_draw()
 {
@@ -186,19 +94,18 @@ void xw_clip_capture_regions(GdkWindow *window, cairo_region_t *region)
 {
     for (auto &kv : g_captures) {
         Capture *c = kv.second;
-        if (kv.first != c->parent_win || !c->widget || !c->pixmap || !c->visual ||
+        if (kv.first != c->parent_win || !c->widget || !c->pixmap.pixmap ||
             !gtk_widget_get_mapped(c->widget) || !gtk_widget_get_has_window(c->widget) ||
             gtk_widget_get_opacity(c->widget) != 1.0) continue;
         GtkWidget *top = gtk_widget_get_toplevel(c->widget);
         if (gtk_widget_get_window(top) != window) continue;
-        XRenderPictFormat *format = XRenderFindVisualFormat(c->dpy, c->visual);
-        if (!format || format->type != PictTypeDirect || format->direct.alphaMask) continue;
+        if (c->pixmap.format.type != XCB_RENDER_PICT_TYPE_DIRECT || c->pixmap.format.direct.alpha_mask) continue;
         int x, y;
         if (!gtk_widget_translate_coordinates(c->widget, top, 0, 0, &x, &y)) continue;
         const int scale = swell_gdk_widget_scale(c->widget);
         cairo_rectangle_int_t rect = { 0, 0,
-            min(gtk_widget_get_allocated_width(c->widget), c->pixmap_w / scale),
-            min(gtk_widget_get_allocated_height(c->widget), c->pixmap_h / scale) };
+            min(gtk_widget_get_allocated_width(c->widget), c->pixmap.width / scale),
+            min(gtk_widget_get_allocated_height(c->widget), c->pixmap.height / scale) };
         cairo_region_t *visible = gdk_window_get_visible_region(gtk_widget_get_window(c->widget));
         cairo_region_intersect_rectangle(visible, &rect);
         cairo_region_translate(visible, x, y);
@@ -209,7 +116,52 @@ void xw_clip_capture_regions(GdkWindow *window, cairo_region_t *region)
 
 static int g_damage_event_base = -1;
 static int g_shape_event_base = -1;
-int g_bridge_damage_error_base = -1;
+static xcb_connection_t *wm_connection()
+{
+    return g_wm ? g_wm->connection() : nullptr;
+}
+
+static xcb_damage_damage_t create_damage(xcb_window_t window)
+{
+    if (g_damage_event_base < 0) return 0;
+    xcb_damage_damage_t damage = xcb_generate_id(wm_connection());
+    xcb_damage_create(wm_connection(), damage, window, XCB_DAMAGE_REPORT_LEVEL_BOUNDING_BOX);
+    return damage;
+}
+
+static void fake_motion(xcb_connection_t *connection, int x, int y)
+{
+    xcb_test_fake_input(connection, XCB_MOTION_NOTIFY, 0, XCB_CURRENT_TIME,
+                        swell_xcb_screen(connection)->root, x, y, 0);
+}
+
+static void fake_button(xcb_connection_t *connection, int button, bool press)
+{
+    xcb_test_fake_input(connection, press ? XCB_BUTTON_PRESS : XCB_BUTTON_RELEASE,
+                        button, XCB_CURRENT_TIME, XCB_NONE, 0, 0, 0);
+}
+
+static void forward_key(xcb_connection_t *connection, xcb_window_t window, int keycode, int state, bool press)
+{
+    xcb_key_press_event_t event = {};
+    event.response_type = press ? XCB_KEY_PRESS : XCB_KEY_RELEASE;
+    event.event = window;
+    event.root = swell_xcb_screen(connection)->root;
+    event.detail = keycode;
+    event.state = state;
+    event.same_screen = true;
+    xcb_send_event(connection, true, window, press ? XCB_EVENT_MASK_KEY_PRESS : XCB_EVENT_MASK_KEY_RELEASE,
+                    (const char*)&event);
+    xcb_flush(connection);
+}
+
+static xcb_window_t first_child(xcb_connection_t *connection, xcb_window_t window)
+{
+    xcb_query_tree_reply_t *tree = xcb_query_tree_reply(connection, xcb_query_tree(connection, window), nullptr);
+    xcb_window_t child = tree && xcb_query_tree_children_length(tree) ? xcb_query_tree_children(tree)[0] : XCB_NONE;
+    free(tree);
+    return child;
+}
 
 static void register_capture(Capture *c)
 {
@@ -223,7 +175,7 @@ static void unregister_capture(Capture *c)
     g_captures.erase(c->plugin_win);
     if (c->gui_win) g_captures.erase(c->gui_win);
 }
-static Capture* find_capture(Window w)
+static Capture* find_capture(xcb_window_t w)
 {
     auto it = g_captures.find(w);
     return it != g_captures.end() ? it->second : nullptr;
@@ -239,13 +191,13 @@ Capture *g_active_capture = nullptr;
 static void set_active_capture(Capture *c)
 {
     g_active_capture = c;
-    if (g_wm) g_wm->set_active_window(c ? c->parent_win : None);
+    if (g_wm) g_wm->set_active_window(c ? c->parent_win : XCB_NONE);
 }
 
 
 struct bridgeState {
-    Display *disp   = nullptr;   // this plugin's connection to :10
-    Window   parent = 0;         // container window on :10
+    xcb_connection_t *connection = nullptr;   // this plugin's X connection
+    xcb_window_t parent = 0;         // container window in Xwayland
     Capture *cap    = nullptr;
     bool     placed = false;     // has the SWELL widget been put in its container
     RECT     last_size_pos = {0,0,0,0}; // last hwnd->m_position xw_size actually acted on, see xw_size
@@ -253,53 +205,13 @@ struct bridgeState {
     GtkWidget *embed_container = nullptr; // resolved via xw_ensure_embed_widget, see xw_bridge_create/xw_size
 };
 
-// (Re-)name the composite pixmap of the plugin window. Automatic redirection
-// means the X server keeps drawing the window off-screen; we sample it via
-// XCompositeNameWindowPixmap and render with cairo. The named
-// pixmap is only a reference to whatever backs the window at naming time, so
-// it goes stale on every resize and on every Present flip (GLX plugin UIs swap
-// the window pixmap for the client's buffer) -- callers re-name on both.
-static bool name_pixmap(Display *dpy, Window window, Pixmap &current, int &width, int &height)
-{
-    Pixmap pixmap = XCompositeNameWindowPixmap(dpy, window);
-    if (!pixmap) return false;
-
-    Window root;
-    int x, y;
-    unsigned int w, h, border, depth;
-    if (!XGetGeometry(dpy, pixmap, &root, &x, &y, &w, &h, &border, &depth)) {
-        XFreePixmap(dpy, pixmap);
-        return false;
-    }
-
-    if (current) XFreePixmap(dpy, current);
-    current = pixmap;
-    width = w;
-    height = h;
-    return true;
-}
-
 static bool update_pixmap(Capture *c)
 {
-    if (!c || !c->dpy || !c->plugin_win) return false;
+    if (!c || !c->connection || !c->plugin_win) return false;
 
-    if (!c->visual) {
-        XWindowAttributes wa;
-        if (!XGetWindowAttributes(c->dpy, c->plugin_win, &wa)) return false;
-        c->visual = wa.visual;
-    }
-
-    if (!name_pixmap(c->dpy, c->plugin_win, c->pixmap, c->pixmap_w, c->pixmap_h))
-        return false;
+    if (!c->pixmap.update(c->connection, c->plugin_win)) return false;
     c->pixmap_dirty = false;
     return true;
-}
-
-static void destroy_pixmap(Capture *c)
-{
-    if (!c) return;
-    if (c->pixmap && c->dpy) { XFreePixmap(c->dpy, c->pixmap); c->pixmap = 0; }
-    c->pixmap_w = c->pixmap_h = 0;
 }
 
 static void refresh_pixmap(Capture *c)
@@ -310,22 +222,29 @@ static void refresh_pixmap(Capture *c)
         gtk_widget_queue_draw(c->widget);
 }
 
+static cairo_surface_t *read_pixels(Capture *c, CapturePixmap &pixmap, CaptureImage &image, bool refresh)
+{
+    cairo_surface_t *surface = image.read(pixmap, refresh);
+    if (!surface) {
+        surface = pixmap.surface();
+        if (!c->cairo_device) c->cairo_device = cairo_device_reference(cairo_surface_get_device(surface));
+    }
+    return surface;
+}
+
 static bool on_draw(GtkWidget *widget, cairo_t *cr, gpointer data)
 {
     Capture *c = (Capture*)data;
+    if (!gtk_cairo_should_draw_window(cr, gtk_widget_get_window(widget))) return FALSE;
     const bool refresh = c && c->pixmap_dirty;
     if (c && c->pixmap_dirty) {
-        const int old_w = c->pixmap_w, old_h = c->pixmap_h;
-        if (update_pixmap(c) && (old_w != c->pixmap_w || old_h != c->pixmap_h))
+        const int old_w = c->pixmap.width, old_h = c->pixmap.height;
+        if (update_pixmap(c) && (old_w != c->pixmap.width || old_h != c->pixmap.height))
             gtk_widget_queue_draw(widget);
     }
-    if (!c || !c->pixmap || !c->visual) return FALSE;
+    if (!c || !c->pixmap.pixmap) return FALSE;
 
-    cairo_surface_t *surf = c->image.read(c->dpy, c->pixmap, c->visual,
-                                        c->pixmap_w, c->pixmap_h, refresh);
-    if (!surf)
-        surf = cairo_xlib_surface_create(c->dpy, c->pixmap, c->visual,
-                                        c->pixmap_w, c->pixmap_h);
+    cairo_surface_t *surf = read_pixels(c, c->pixmap, c->image, refresh);
     if (surf) {
         if (cairo_surface_status(surf) == CAIRO_STATUS_SUCCESS) {
             const int scale = swell_gdk_widget_scale(widget);
@@ -340,67 +259,89 @@ static bool on_draw(GtkWidget *widget, cairo_t *cr, gpointer data)
     return TRUE;
 }
 
-static Window s_pointer_window;
+static Capture *find_capture(GdkWindow *window)
+{
+    for (auto &kv : g_captures) {
+        Capture *c = kv.second;
+        if (kv.first == c->parent_win && c->widget && gtk_widget_get_window(c->widget) == window) return c;
+    }
+    return nullptr;
+}
+
+bool xw_bridge_draw(GdkWindow *window)
+{
+    Capture *c = find_capture(window);
+    if (!c || !c->gl.enabled()) return false;
+    if (c->pixmap_dirty) update_pixmap(c);
+    if (!c->pixmap.pixmap) return false;
+    if (c->gl.draw(c->widget, c->pixmap)) return true;
+    c->pixmap_dirty = true;
+    return false;
+}
+
+static xcb_window_t s_pointer_window;
 static bool s_pointer_parked;
 
 static void park_pointer(int x, int y)
 {
-    if (!g_wm_dpy) return;
+    if (!wm_connection()) return;
     if (!s_pointer_window) {
-        XSetWindowAttributes attr = {};
-        attr.override_redirect = True;
-        attr.event_mask = ButtonPressMask | ButtonReleaseMask;
-        s_pointer_window = XCreateWindow(g_wm_dpy, DefaultRootWindow(g_wm_dpy),
-                                         x, y, 1, 1, 0, 0, InputOnly, CopyFromParent,
-                                         CWOverrideRedirect | CWEventMask, &attr);
+        const uint32_t values[] = { true, XCB_EVENT_MASK_BUTTON_PRESS | XCB_EVENT_MASK_BUTTON_RELEASE };
+        s_pointer_window = xcb_generate_id(wm_connection());
+        xcb_create_window(wm_connection(), XCB_COPY_FROM_PARENT, s_pointer_window,
+            swell_xcb_screen(wm_connection())->root, x, y, 1, 1, 0, XCB_WINDOW_CLASS_INPUT_ONLY,
+            XCB_COPY_FROM_PARENT, XCB_CW_OVERRIDE_REDIRECT | XCB_CW_EVENT_MASK, values);
     }
-    XMoveWindow(g_wm_dpy, s_pointer_window, x, y);
-    XMapRaised(g_wm_dpy, s_pointer_window);
-    XTestFakeMotionEvent(g_wm_dpy, DefaultScreen(g_wm_dpy), x, y, CurrentTime);
-    XSync(g_wm_dpy, False);
+    const uint32_t position[] = { (uint32_t)x, (uint32_t)y };
+    xcb_configure_window(wm_connection(), s_pointer_window, XCB_CONFIG_WINDOW_X | XCB_CONFIG_WINDOW_Y, position);
+    swell_xcb_raise(wm_connection(), s_pointer_window);
+    xcb_map_window(wm_connection(), s_pointer_window);
+    fake_motion(wm_connection(), x, y);
+    swell_xcb_sync(wm_connection());
     s_pointer_parked = true;
 }
 
 static void resume_pointer()
 {
     if (!s_pointer_parked) return;
-    XUnmapWindow(g_wm_dpy, s_pointer_window);
-    XSync(g_wm_dpy, False);
+    xcb_unmap_window(wm_connection(), s_pointer_window);
+    swell_xcb_sync(wm_connection());
     s_pointer_parked = false;
 }
 
 static void forward_motion(Capture *c, double wx, double wy)
 {
     resume_pointer();
+    swell_xcb_raise(wm_connection(), c->parent_win);
     const int scale = swell_gdk_widget_scale(c->widget);
-    Window child; int rx, ry;
-    XTranslateCoordinates(c->dpy, c->plugin_win, DefaultRootWindow(c->dpy),
-                          (int)(wx * scale), (int)(wy * scale), &rx, &ry, &child);
-    XTestFakeMotionEvent(c->dpy, DefaultScreen(c->dpy), rx, ry, CurrentTime);
+    int rx = 0, ry = 0;
+    swell_xcb_translate(wm_connection(), c->plugin_win, swell_xcb_screen(c->connection)->root,
+                          (int)(wx * scale), (int)(wy * scale), &rx, &ry);
+    fake_motion(c->connection, rx, ry);
 }
 
 static gboolean on_crossing(GtkWidget *, GdkEventCrossing *e, gpointer data)
 {
     Capture *c = (Capture*)data;
-    if (!c || !c->dpy || e->mode != GDK_CROSSING_NORMAL ||
+    if (!c || !c->connection || e->mode != GDK_CROSSING_NORMAL ||
         e->detail == GDK_NOTIFY_INFERIOR) return FALSE;
     if (e->type == GDK_ENTER_NOTIFY) {
         forward_motion(c, e->x, e->y);
-        XFlush(c->dpy);
+        xcb_flush(c->connection);
     } else if (!(e->state & (GDK_BUTTON1_MASK | GDK_BUTTON2_MASK | GDK_BUTTON3_MASK |
                             GDK_BUTTON4_MASK | GDK_BUTTON5_MASK)) && c->popups.empty()) {
-        XMotionEvent motion = {};
-        motion.type = MotionNotify;
-        motion.display = c->dpy;
-        motion.window = c->gui_win ? c->gui_win : c->plugin_win;
-        motion.root = DefaultRootWindow(c->dpy);
+        xcb_motion_notify_event_t motion = {};
+        motion.response_type = XCB_MOTION_NOTIFY;
+        motion.event = c->gui_win ? c->gui_win : c->plugin_win;
+        motion.root = swell_xcb_screen(c->connection)->root;
         motion.state = e->state;
-        motion.same_screen = True;
-        Window child;
-        if (XTranslateCoordinates(c->dpy, motion.root, motion.window, 0, 0,
-                                  &motion.x, &motion.y, &child)) {
-            XSendEvent(c->dpy, motion.window, True, PointerMotionMask, (XEvent*)&motion);
-            XSync(c->dpy, False);
+        motion.same_screen = true;
+        int x, y;
+        if (swell_xcb_translate(c->connection, motion.root, motion.event, 0, 0, &x, &y)) {
+            motion.event_x = x;
+            motion.event_y = y;
+            xcb_send_event(c->connection, true, motion.event, XCB_EVENT_MASK_POINTER_MOTION, (const char*)&motion);
+            swell_xcb_sync(c->connection);
         }
         park_pointer(0, 0);
     }
@@ -417,10 +358,12 @@ void xw_raise_modals()
         for (auto &md : c->modals)
             if (md.gtk_win)
             {
+                swell_xcb_raise(wm_connection(), md.x11_win);
                 gtk_window_present(GTK_WINDOW(md.gtk_win));
                 gtk_window_set_keep_above(GTK_WINDOW(md.gtk_win), TRUE);
             }
     }
+    if (wm_connection()) xcb_flush(wm_connection());
 }
 
 static bool any_modal_open()
@@ -434,7 +377,7 @@ static bool on_button_press(GtkWidget *widget, GdkEventButton *e, gpointer data)
 {
     DEBUG_PRINT("[DNDX] widget button PRESS btn=%d\n", e->button);
     Capture *c = (Capture*)data;
-    if (!c || !c->dpy) return false;
+    if (!c || !c->connection) return false;
     if (any_modal_open()){
         xw_raise_modals();
         return true;
@@ -448,8 +391,8 @@ static bool on_button_press(GtkWidget *widget, GdkEventButton *e, gpointer data)
     set_active_capture(c);
     if (c->hwnd) SetFocus(c->hwnd);
     forward_motion(c, e->x, e->y);
-    XTestFakeButtonEvent(c->dpy, e->button, True, CurrentTime);
-    XFlush(c->dpy);
+    fake_button(c->connection, e->button, true);
+    xcb_flush(c->connection);
     return true;
 }
 
@@ -457,10 +400,10 @@ static bool on_button_release(GtkWidget *, GdkEventButton *e, gpointer data)
 {
     DEBUG_PRINT("[DNDX] widget button RELEASE btn=%d\n", e->button);
     Capture *c = (Capture*)data;
-    if (!c || !c->dpy) return false;
+    if (!c || !c->connection) return false;
     forward_motion(c, e->x, e->y);
-    XTestFakeButtonEvent(c->dpy, e->button, False, CurrentTime);
-    XFlush(c->dpy);
+    fake_button(c->connection, e->button, false);
+    xcb_flush(c->connection);
     return true;
 }
 
@@ -472,25 +415,28 @@ static bool on_motion(GtkWidget *, GdkEventMotion *e, gpointer data)
         if (path[0]) {
             DEBUG_PRINT("[DNDX] starting native drag: %s\n", path);
             Capture *cc = (Capture*)data;
+            const xcb_window_t parent = cc ? cc->parent_win : XCB_NONE;
             const char *lst[1] = { path };
             SWELL_InitiateDragDropOfFileList(cc ? cc->hwnd : NULL, NULL, lst, 1, NULL);
             DEBUG_PRINT("[DNDX] native drag finished\n");
 
-            if (cc && cc->dpy) g_wm->dnd_release_source_button(cc->dpy);
+            const auto it = g_captures.find(parent);
+            if (!cc || it == g_captures.end() || it->second != cc) return true;
+            if (cc->connection) g_wm->dnd_release_source_button(cc->connection);
         }
     }
 
     Capture *c = (Capture*)data;
-    if (!c || !c->dpy) return false;
+    if (!c || !c->connection) return false;
     forward_motion(c, e->x, e->y);
-    XFlush(c->dpy);
+    xcb_flush(c->connection);
     return true;
 }
 
 static bool on_scroll(GtkWidget *, GdkEventScroll *e, gpointer data)
 {
     Capture *c = (Capture*)data;
-    if (!c || !c->dpy) return false;
+    if (!c || !c->connection) return false;
     unsigned int btn = 0;
     switch (e->direction) {
         case GDK_SCROLL_UP:    btn = 4; break;
@@ -500,9 +446,9 @@ static bool on_scroll(GtkWidget *, GdkEventScroll *e, gpointer data)
         default: return false;
     }
     forward_motion(c, e->x, e->y);
-    XTestFakeButtonEvent(c->dpy, btn, True,  CurrentTime);
-    XTestFakeButtonEvent(c->dpy, btn, False, CurrentTime);
-    XFlush(c->dpy);
+    fake_button(c->connection, btn, true);
+    fake_button(c->connection, btn, false);
+    xcb_flush(c->connection);
     return true;
 }
 
@@ -554,9 +500,9 @@ static void on_toplevel_active(GObject *obj, GParamSpec *, gpointer data)
                 if (cur) g_object_unref(cur);
             }
         }
-        if (c->dpy && c->parent_win) {
-            XRaiseWindow(c->dpy, c->parent_win);
-            XFlush(c->dpy);
+        if (c->connection && c->parent_win) {
+            swell_xcb_raise(wm_connection(), c->parent_win);
+            xcb_flush(wm_connection());
         }
         xw_raise_modals();
     } else if (g_active_capture == c) {
@@ -591,6 +537,11 @@ static void on_realize(GtkWidget *widget, gpointer)
     gdk_window_set_event_compression(gtk_widget_get_window(widget), FALSE);
 }
 
+static void on_unrealize(GtkWidget *, gpointer data)
+{
+    ((Capture*)data)->gl.reset();
+}
+
 static void connect_widget(Capture *c)
 {
     if (!c->widget) return;
@@ -615,6 +566,7 @@ static void connect_widget(Capture *c)
     connect_toplevel(c);
 
     g_signal_connect(c->widget, "realize", G_CALLBACK(on_realize), c);
+    g_signal_connect(c->widget, "unrealize", G_CALLBACK(on_unrealize), c);
     if (gtk_widget_get_realized(c->widget)) on_realize(c->widget, c);
     g_signal_connect(c->widget, "draw",                 G_CALLBACK(on_draw),           c);
     g_signal_connect(c->widget, "button-press-event",   G_CALLBACK(on_button_press),   c);
@@ -626,33 +578,31 @@ static void connect_widget(Capture *c)
     gtk_widget_queue_draw(c->widget);
 }
 
-static Capture* setup_capture(Display *dpy, Window parent_win, Window plugin_win, HWND hwnd)
+static Capture* setup_capture(xcb_connection_t *connection, xcb_window_t parent_win, xcb_window_t plugin_win, HWND hwnd)
 {
     Capture *c = new Capture();
-    c->dpy        = dpy;
+    c->connection        = connection;
     c->parent_win = parent_win;
     c->plugin_win = plugin_win;
     c->hwnd       = hwnd;
 
-    XFixesChangeSaveSet(dpy, plugin_win, SetModeInsert, SaveSetRoot, SaveSetUnmap);
+    xcb_xfixes_change_save_set(connection, XCB_SET_MODE_INSERT, XCB_XFIXES_SAVE_SET_TARGET_ROOT, XCB_XFIXES_SAVE_SET_MAPPING_UNMAP, plugin_win);
 
     // Automatic composite redirection: the X server keeps drawing the plugin
     // window off-screen (it never has to be visible in root), and we sample
-    // the resulting pixmap via XCompositeNameWindowPixmap. This is what the
+    // the resulting pixmap via CompositeNameWindowPixmap. This is what the
     // pre-Xvfb bridge used, and it sidesteps the Wine input regression that
     // occurs when two Wine top-levels share the same X coordinates -- with
     // Automatic redirect the plugin windows never contest hit-testing at all.
-    XCompositeRedirectWindow(dpy, plugin_win, CompositeRedirectAutomatic);
+    xcb_composite_redirect_window(connection, plugin_win, XCB_COMPOSITE_REDIRECT_AUTOMATIC);
 
     // Also caches the visual so on_draw does not have to
-    // XGetWindowAttributes every frame.
+    // GetWindowAttributes every frame.
     update_pixmap(c);
 
-    int base, err;
-    if (g_wm_dpy && XDamageQueryExtension(g_wm_dpy, &base, &err))
-        c->damage = XDamageCreate(g_wm_dpy, plugin_win, XDamageReportBoundingBox);
+    c->damage = create_damage(plugin_win);
 
-    XFlush(dpy);
+    xcb_flush(connection);
 
     register_capture(c);
     // A newly-created plugin is always the last one the user acted on -- opening
@@ -660,19 +610,19 @@ static Capture* setup_capture(Display *dpy, Window parent_win, Window plugin_win
     // immediately. notify::is-active keeps this in sync afterwards; this just
     // avoids a race between plugin map and the compositor's focus decision.
     set_active_capture(c);
-    // Raise it too: containers overlap on :10 and XTest input goes to whichever
+    // Raise it too: containers overlap in Xwayland and XTest input goes to whichever
     // is on top. notify::is-active is hooked only after the new toplevel already
     // has focus, so on_toplevel_active never raises it and input keeps landing on
     // the previous plugin.
-    XRaiseWindow(dpy, parent_win);
-    XFlush(dpy);
+    swell_xcb_raise(connection, parent_win);
+    xcb_flush(connection);
     DEBUG_PRINT("[XW] setup parent=0x%lx plugin=0x%lx (auto-composite, pixmap=0x%lx)\n",
-                parent_win, plugin_win, (unsigned long)c->pixmap);
+                (unsigned long)parent_win, (unsigned long)plugin_win, (unsigned long)c->pixmap.pixmap);
     return c;
 }
 
-static void canvas_remove_popup(Capture *c, Window x11_win);
-static void modal_remove(Capture *c, Window win);
+static void canvas_remove_popup(Capture *c, xcb_window_t x11_win);
+static void modal_remove(Capture *c, xcb_window_t win);
 
 static void cleanup_capture(Capture *c)
 {
@@ -696,20 +646,22 @@ static void cleanup_capture(Capture *c)
     }
     while (!c->popups.empty()) canvas_remove_popup(c, c->popups.back().x11_win);
     while (!c->modals.empty()) modal_remove(c, c->modals.back().x11_win);
-    if (c->damage && g_wm_dpy) XDamageDestroy(g_wm_dpy, c->damage);
-    if (g_wm_dpy) XFlush(g_wm_dpy);
-    destroy_pixmap(c);
+    if (c->damage && wm_connection()) xcb_damage_destroy(wm_connection(), c->damage);
+    if (wm_connection()) xcb_flush(wm_connection());
+    c->pixmap.reset();
+    c->gl.reset();
     c->image.reset();
-    Display *d = c->dpy;
-    c->dpy = nullptr;
-    if (d) XCloseDisplay(d);
+    if (c->cairo_device) {
+        cairo_device_finish(c->cairo_device);
+        cairo_device_destroy(c->cairo_device);
+    }
     delete c;
 }
 
 static bool canvas_draw_cb(GtkWidget *widget, cairo_t *cr, gpointer data)
 {
     Capture *c = (Capture*)data;
-    if (!c || !c->dpy) return false;
+    if (!c || !c->connection) return false;
 
     const int scale = swell_gdk_widget_scale(widget);
     cairo_save(cr);
@@ -723,9 +675,12 @@ static bool canvas_draw_cb(GtkWidget *widget, cairo_t *cr, gpointer data)
     cairo_clip_extents(cr, &clip_x1, &clip_y1, &clip_x2, &clip_y2);
 
     for (auto &p : c->popups) {
+        const bool refresh = p.pixmap_dirty;
         if (p.visible && p.pixmap_dirty) {
             const int old_w = p.w, old_h = p.h;
-            if (name_pixmap(c->dpy, p.x11_win, p.pixmap, p.w, p.h)) {
+            if (p.pixmap.update(c->connection, p.x11_win)) {
+                p.w = p.pixmap.width;
+                p.h = p.pixmap.height;
                 p.pixmap_dirty = false;
                 if (old_w != p.w || old_h != p.h) {
                     p.shape_dirty = true;
@@ -733,7 +688,7 @@ static bool canvas_draw_cb(GtkWidget *widget, cairo_t *cr, gpointer data)
                 }
             }
         }
-        if (!p.visible || p.pixmap == None) continue;
+        if (!p.visible || !p.pixmap.pixmap) continue;
 
         int draw_x = p.x - c->canvas_x;
         int draw_y = p.y - c->canvas_y;
@@ -742,21 +697,20 @@ static bool canvas_draw_cb(GtkWidget *widget, cairo_t *cr, gpointer data)
             draw_y + p.h <= clip_y1 || draw_y >= clip_y2)
             continue;
 
-        Visual *visual = p.visual ? p.visual : DefaultVisual(c->dpy, DefaultScreen(c->dpy));
-        cairo_surface_t *surf = cairo_xlib_surface_create(c->dpy, p.pixmap, visual, p.w, p.h);
+        cairo_surface_t *surf = read_pixels(c, p.pixmap, p.image, refresh);
         if (surf) {
             cairo_save(cr);
             cairo_rectangle(cr, draw_x, draw_y, p.w, p.h);
             cairo_clip(cr);
             if (g_shape_event_base >= 0) {
                 if (p.shape_dirty) {
-                    int count = 0, ordering;
-                    XRectangle *rects = XShapeGetRectangles(g_wm_dpy, p.x11_win,
-                                                           ShapeBounding, &count, &ordering);
+                    xcb_shape_get_rectangles_reply_t *reply = xcb_shape_get_rectangles_reply(wm_connection(),
+                        xcb_shape_get_rectangles(wm_connection(), p.x11_win, XCB_SHAPE_SK_BOUNDING), nullptr);
                     p.shape.clear();
-                    if (rects) {
-                        p.shape.assign(rects, rects + count);
-                        XFree(rects);
+                    if (reply) {
+                        const xcb_rectangle_t *rects = xcb_shape_get_rectangles_rectangles(reply);
+                        p.shape.assign(rects, rects + xcb_shape_get_rectangles_rectangles_length(reply));
+                        free(reply);
                     }
                     p.shape_dirty = false;
                 }
@@ -774,12 +728,13 @@ static bool canvas_draw_cb(GtkWidget *widget, cairo_t *cr, gpointer data)
     return true;
 }
 
-static bool popup_accepts_input(Display *dpy, Window window)
+static bool popup_accepts_input(xcb_connection_t *connection, xcb_window_t window)
 {
-    int count = 0, ordering;
-    XRectangle *rects = XShapeGetRectangles(dpy, window, ShapeInput, &count, &ordering);
-    if (rects) XFree(rects);
-    return count > 0;
+    xcb_shape_get_rectangles_reply_t *reply = xcb_shape_get_rectangles_reply(connection,
+        xcb_shape_get_rectangles(connection, window, XCB_SHAPE_SK_INPUT), nullptr);
+    const bool accepts = reply && xcb_shape_get_rectangles_rectangles_length(reply) > 0;
+    free(reply);
+    return accepts;
 }
 
 static void dismiss_popups(Capture *c);
@@ -787,7 +742,7 @@ static void dismiss_popups(Capture *c);
 static bool canvas_button_press(GtkWidget *widget, GdkEventButton *e, gpointer data)
 {
     Capture *c = (Capture*)data;
-    if (!c || !c->dpy) return false;
+    if (!c || !c->connection) return false;
     resume_pointer();
 
     const int scale = swell_gdk_widget_scale(widget);
@@ -801,12 +756,12 @@ static bool canvas_button_press(GtkWidget *widget, GdkEventButton *e, gpointer d
         if (!it->visible) continue;
         if (screen_x >= it->x && screen_x < it->x + it->w &&
             screen_y >= it->y && screen_y < it->y + it->h &&
-            popup_accepts_input(c->dpy, it->x11_win)) {
+            popup_accepts_input(c->connection, it->x11_win)) {
             hit = true;
-            XTestFakeMotionEvent(c->dpy, DefaultScreen(c->dpy), x11_x, x11_y, CurrentTime);
-            XFlush(c->dpy);
-            XTestFakeButtonEvent(c->dpy, e->button, True, CurrentTime);
-            XFlush(c->dpy);
+            fake_motion(c->connection, x11_x, x11_y);
+            xcb_flush(c->connection);
+            fake_button(c->connection, e->button, true);
+            xcb_flush(c->connection);
             return true;
         }
     }
@@ -821,16 +776,16 @@ static bool canvas_button_press(GtkWidget *widget, GdkEventButton *e, gpointer d
 static bool canvas_button_release(GtkWidget *, GdkEventButton *e, gpointer data)
 {
     Capture *c = (Capture*)data;
-    if (!c || !c->dpy) return false;
-    XTestFakeButtonEvent(c->dpy, e->button, False, CurrentTime);
-    XFlush(c->dpy);
+    if (!c || !c->connection) return false;
+    fake_button(c->connection, e->button, false);
+    xcb_flush(c->connection);
     return true;
 }
 
 static bool canvas_motion(GtkWidget *widget, GdkEventMotion *e, gpointer data)
 {
     Capture *c = (Capture*)data;
-    if (!c || !c->dpy) return false;
+    if (!c || !c->connection) return false;
     resume_pointer();
 
     static guint32 last_time = 0;
@@ -844,19 +799,26 @@ static bool canvas_motion(GtkWidget *widget, GdkEventMotion *e, gpointer data)
     int x11_x = screen_x - c->gtk_x;
     int x11_y = screen_y - c->gtk_y;
 
-    XTestFakeMotionEvent(c->dpy, DefaultScreen(c->dpy), x11_x, x11_y, CurrentTime);
-    XFlush(c->dpy);
+    fake_motion(c->connection, x11_x, x11_y);
+    xcb_flush(c->connection);
 
     return true;
 }
 
-static GdkRectangle capture_monitor(Display *dpy, GtkWidget *widget)
+static GdkRectangle capture_monitor(xcb_connection_t *connection, GtkWidget *widget)
 {
-    GdkRectangle bounds = { 0, 0, DisplayWidth(dpy, DefaultScreen(dpy)),
-                                 DisplayHeight(dpy, DefaultScreen(dpy)) };
-    int count = 0;
-    XRRMonitorInfo *monitors = XRRGetMonitors(dpy, DefaultRootWindow(dpy), True, &count);
-    if (!monitors) return bounds;
+    xcb_screen_t *screen = swell_xcb_screen(connection);
+    GdkRectangle bounds = { 0, 0, screen->width_in_pixels, screen->height_in_pixels };
+    xcb_get_geometry_reply_t *geometry = xcb_get_geometry_reply(connection,
+        xcb_get_geometry(connection, screen->root), nullptr);
+    if (geometry) {
+        bounds.width = geometry->width;
+        bounds.height = geometry->height;
+        free(geometry);
+    }
+    xcb_randr_get_monitors_reply_t *reply = xcb_randr_get_monitors_reply(connection,
+        xcb_randr_get_monitors(connection, screen->root, true), nullptr);
+    if (!reply) return bounds;
 
     GdkWindow *window = widget ? gtk_widget_get_window(widget) : nullptr;
     GdkMonitor *monitor = window ? gdk_display_get_monitor_at_window(
@@ -870,9 +832,9 @@ static GdkRectangle capture_monitor(Display *dpy, GtkWidget *widget)
     }
     GdkRectangle selected = bounds;
     int best = -1;
-    for (int i = 0; i < count; ++i) {
-        GdkRectangle candidate = { monitors[i].x, monitors[i].y,
-                                   monitors[i].width, monitors[i].height };
+    for (xcb_randr_monitor_info_iterator_t it = xcb_randr_get_monitors_monitors_iterator(reply);
+         it.rem; xcb_randr_monitor_info_next(&it)) {
+        GdkRectangle candidate = { it.data->x, it.data->y, it.data->width, it.data->height };
         if (!gdk_rectangle_intersect(&bounds, &candidate, &candidate)) continue;
         const int distance = abs(candidate.width - target.width) + abs(candidate.height - target.height);
         if (best < 0 || distance < best) {
@@ -880,7 +842,7 @@ static GdkRectangle capture_monitor(Display *dpy, GtkWidget *widget)
             selected = candidate;
         }
     }
-    XRRFreeMonitors(monitors);
+    free(reply);
     return selected;
 }
 
@@ -932,11 +894,11 @@ static void create_popup_canvas(Capture *c)
 
 static void refresh_gtk_offset(Capture *c, int *out_px = nullptr, int *out_py = nullptr)
 {
-    if (!c || !c->dpy || !c->widget) return;
+    if (!c || !c->connection || !c->widget) return;
 
-    Window child; int px = 0, py = 0;
-    XTranslateCoordinates(c->dpy, c->parent_win,
-                          DefaultRootWindow(c->dpy), 0, 0, &px, &py, &child);
+    int px = 0, py = 0;
+    swell_xcb_translate(c->connection, c->parent_win,
+                          swell_xcb_screen(c->connection)->root, 0, 0, &px, &py);
     if (out_px) *out_px = px;
     if (out_py) *out_py = py;
 
@@ -950,7 +912,7 @@ static void refresh_gtk_offset(Capture *c, int *out_px = nullptr, int *out_py = 
     c->gtk_y = woy * scale - py;
 }
 
-static void canvas_add_popup(Capture *c, Window x11_win, XWindowAttributes *attr)
+static void canvas_add_popup(Capture *c, xcb_window_t x11_win, xcb_get_geometry_reply_t *attr)
 {
     if (!c) return;
 
@@ -961,17 +923,16 @@ static void canvas_add_popup(Capture *c, Window x11_win, XWindowAttributes *attr
     // slot code was a real bug -- side effect matters more than the out
     // params ever did.
     refresh_gtk_offset(c);
-    Window child;
     int x, y;
-    if (!XTranslateCoordinates(c->dpy, x11_win, DefaultRootWindow(c->dpy),
-                               0, 0, &x, &y, &child)) return;
+    if (!swell_xcb_translate(c->connection, x11_win, swell_xcb_screen(c->connection)->root,
+                               0, 0, &x, &y)) return;
     x += c->gtk_x;
     y += c->gtk_y;
 
     Capture::PopupWin *pp = nullptr;
     for (auto &e : c->popups) if (e.x11_win == x11_win) { pp = &e; break; }
 
-    if (pp && pp->pixmap != None &&
+    if (pp && pp->pixmap.pixmap &&
         pp->x == x && pp->y == y &&
         pp->w == attr->width && pp->h == attr->height)
     {
@@ -987,28 +948,18 @@ static void canvas_add_popup(Capture *c, Window x11_win, XWindowAttributes *attr
 
     if (!c->popup_canvas) create_popup_canvas(c);
 
-    XCompositeRedirectWindow(c->dpy, x11_win, CompositeRedirectAutomatic);
-    XFlush(c->dpy);
-    Pixmap pixmap = XCompositeNameWindowPixmap(c->dpy, x11_win);
-
-    if (pp) {
-        if (pp->pixmap != None && pp->pixmap != pixmap) XFreePixmap(c->dpy, pp->pixmap);
-    } else {
+    xcb_composite_redirect_window(c->connection, x11_win, XCB_COMPOSITE_REDIRECT_AUTOMATIC);
+    xcb_flush(c->connection);
+    if (!pp) {
         c->popups.emplace_back();
         pp = &c->popups.back();
-        if (g_wm_dpy && g_damage_event_base >= 0)
-            pp->damage = XDamageCreate(g_wm_dpy, x11_win, XDamageReportBoundingBox);
-        if (g_wm_dpy && g_shape_event_base >= 0)
-            XShapeSelectInput(g_wm_dpy, x11_win, ShapeNotifyMask);
+        if (wm_connection() && g_damage_event_base >= 0)
+            pp->damage = create_damage(x11_win);
+        if (wm_connection() && g_shape_event_base >= 0)
+            xcb_shape_select_input(wm_connection(), x11_win, true);
     }
     pp->x11_win = x11_win;
-    pp->pixmap  = pixmap;
     pp->pixmap_dirty = true;
-    {
-        XWindowAttributes wa_local;
-        pp->visual = XGetWindowAttributes(c->dpy, x11_win, &wa_local)
-                   ? wa_local.visual : DefaultVisual(c->dpy, DefaultScreen(c->dpy));
-    }
     pp->x = x;
     pp->y = y;
     DEBUG_PRINT("[POPOFF] win=0x%lx attr=(%d,%d) gtk=(%d,%d) -> pp=(%d,%d)\n",
@@ -1019,7 +970,7 @@ static void canvas_add_popup(Capture *c, Window x11_win, XWindowAttributes *attr
     pp->visible = true;
     pp->shape_dirty = true;
 
-    if (c->root_popup == None && popup_accepts_input(c->dpy, x11_win))
+    if (c->root_popup == XCB_NONE && popup_accepts_input(c->connection, x11_win))
         c->root_popup = x11_win;
 
     if (!gtk_widget_get_visible(c->popup_canvas))
@@ -1027,19 +978,18 @@ static void canvas_add_popup(Capture *c, Window x11_win, XWindowAttributes *attr
     if (c->canvas_draw) gtk_widget_queue_draw(c->canvas_draw);
 }
 
-static void canvas_remove_popup(Capture *c, Window x11_win)
+static void canvas_remove_popup(Capture *c, xcb_window_t x11_win)
 {
     if (!c) return;
     DEBUG_PRINT("[DNDCOORD] canvas_remove_popup win=0x%lx remaining_before=%zu\n",
                 (unsigned long)x11_win, c->popups.size());
     for (auto it = c->popups.begin(); it != c->popups.end(); ) {
         if (it->x11_win == x11_win) {
-            if (it->damage && g_wm_dpy) { XDamageDestroy(g_wm_dpy, it->damage); it->damage = 0; }
-            if (it->pixmap != None) { XFreePixmap(c->dpy, it->pixmap); it->pixmap = None; }
+            if (it->damage && wm_connection()) { xcb_damage_destroy(wm_connection(), it->damage); it->damage = 0; }
             it = c->popups.erase(it);
         } else ++it;
     }
-    if (c->root_popup == x11_win) c->root_popup = None;
+    if (c->root_popup == x11_win) c->root_popup = XCB_NONE;
 
     if (c->popups.empty()) {
         if (c->popup_canvas) {
@@ -1052,23 +1002,42 @@ static void canvas_remove_popup(Capture *c, Window x11_win)
     }
 }
 
-struct ModalRender { Capture *cap; Window x11_win; };
+struct ModalRender { Capture *cap; xcb_window_t x11_win; };
+
+static void modal_request_close(Capture *c, xcb_window_t window)
+{
+    xcb_client_message_event_t event = {};
+    event.response_type = XCB_CLIENT_MESSAGE;
+    event.window = window;
+    event.type = g_wm->atoms().WM_PROTOCOLS;
+    event.format = 32;
+    event.data.data32[0] = g_wm->atoms().WM_DELETE_WINDOW;
+    event.data.data32[1] = XCB_CURRENT_TIME;
+    xcb_send_event(c->connection, false, window, XCB_EVENT_MASK_NO_EVENT, (const char*)&event);
+    xcb_flush(c->connection);
+}
+
+static gboolean modal_delete_cb(GtkWidget *, GdkEvent *, gpointer data)
+{
+    ModalRender *m = (ModalRender*)data;
+    modal_request_close(m->cap, m->x11_win);
+    return TRUE;
+}
 
 static bool modal_draw_cb(GtkWidget *widget, cairo_t *cr, gpointer data)
 {
     ModalRender *m = (ModalRender*)data;
-    if (!m || !m->cap || !m->cap->dpy) return false;
-    Display *dpy = m->cap->dpy;
-    Pixmap pm = 0;
-    Visual *visual = nullptr;
-    int gw = 0, gh = 0;
+    if (!m || !m->cap || !m->cap->connection) return false;
+    Capture::ModalWin *modal = nullptr;
     for (auto &md : m->cap->modals)
-        if (md.x11_win == m->x11_win) { pm = md.pixmap; visual = md.visual; gw = md.w; gh = md.h; break; }
-    if (!pm) return false;
+        if (md.x11_win == m->x11_win) { modal = &md; break; }
+    if (!modal) return false;
+    const bool refresh = modal->pixmap_dirty;
+    if (refresh && modal->pixmap.update(m->cap->connection, m->x11_win))
+        modal->pixmap_dirty = false;
+    if (!modal->pixmap.pixmap) return false;
 
-    if (!visual) visual = DefaultVisual(dpy, DefaultScreen(dpy));
-
-    cairo_surface_t *surf = cairo_xlib_surface_create(dpy, pm, visual, gw, gh);
+    cairo_surface_t *surf = read_pixels(m->cap, modal->pixmap, modal->image, refresh);
     if (surf) {
         const int scale = swell_gdk_widget_scale(widget);
         cairo_save(cr);
@@ -1084,74 +1053,62 @@ static bool modal_draw_cb(GtkWidget *widget, cairo_t *cr, gpointer data)
 static void modal_forward_motion(ModalRender *m, GtkWidget *widget, double wx, double wy)
 {
     resume_pointer();
+    swell_xcb_raise(wm_connection(), m->x11_win);
     const int scale = swell_gdk_widget_scale(widget);
-    Window child; int rx, ry;
-    XTranslateCoordinates(m->cap->dpy, m->x11_win, DefaultRootWindow(m->cap->dpy),
-                          (int)(wx * scale), (int)(wy * scale), &rx, &ry, &child);
-    XTestFakeMotionEvent(m->cap->dpy, DefaultScreen(m->cap->dpy), rx, ry, CurrentTime);
+    int rx = 0, ry = 0;
+    swell_xcb_translate(wm_connection(), m->x11_win, swell_xcb_screen(m->cap->connection)->root,
+                          (int)(wx * scale), (int)(wy * scale), &rx, &ry);
+    fake_motion(m->cap->connection, rx, ry);
 }
 
 static bool modal_button_press(GtkWidget *widget, GdkEventButton *e, gpointer data)
 {
     ModalRender *m = (ModalRender*)data;
-    if (!m || !m->cap->dpy) return false;
+    if (!m || !m->cap->connection) return false;
     modal_forward_motion(m, widget, e->x, e->y);
-    XTestFakeButtonEvent(m->cap->dpy, e->button, True, CurrentTime);
-    XFlush(m->cap->dpy);
+    fake_button(m->cap->connection, e->button, true);
+    xcb_flush(m->cap->connection);
     return true;
 }
 
 static bool modal_button_release(GtkWidget *widget, GdkEventButton *e, gpointer data)
 {
     ModalRender *m = (ModalRender*)data;
-    if (!m || !m->cap->dpy) return false;
+    if (!m || !m->cap->connection) return false;
     modal_forward_motion(m, widget, e->x, e->y);
-    XTestFakeButtonEvent(m->cap->dpy, e->button, False, CurrentTime);
-    XFlush(m->cap->dpy);
+    fake_button(m->cap->connection, e->button, false);
+    xcb_flush(m->cap->connection);
     return true;
 }
 
 static bool modal_motion(GtkWidget *widget, GdkEventMotion *e, gpointer data)
 {
     ModalRender *m = (ModalRender*)data;
-    if (!m || !m->cap->dpy) return false;
+    if (!m || !m->cap->connection) return false;
     modal_forward_motion(m, widget, e->x, e->y);
-    XFlush(m->cap->dpy);
+    xcb_flush(m->cap->connection);
     return true;
 }
 
 static bool modal_key(GtkWidget *, GdkEventKey *e, gpointer data)
 {
     ModalRender *m = (ModalRender*)data;
-    if (!m || !m->cap->dpy) return false;
+    if (!m || !m->cap->connection) return false;
 
-    XKeyEvent xev; memset(&xev, 0, sizeof(xev));
-    xev.type        = (e->type == GDK_KEY_PRESS) ? KeyPress : KeyRelease;
-    xev.display     = m->cap->dpy;
-    xev.window      = m->x11_win;
-    xev.root        = DefaultRootWindow(m->cap->dpy);
-    xev.time        = CurrentTime;
-    xev.keycode     = e->hardware_keycode;
-    xev.state       = e->state;
-    xev.same_screen = True;
-    XSendEvent(m->cap->dpy, m->x11_win, True,
-               (e->type == GDK_KEY_PRESS) ? KeyPressMask : KeyReleaseMask,
-               (XEvent*)&xev);
-    XFlush(m->cap->dpy);
+    forward_key(m->cap->connection, m->x11_win, e->hardware_keycode, e->state, e->type == GDK_KEY_PRESS);
     return true;
 }
 
 static void modal_render_destroy(gpointer data, GClosure *) { delete (ModalRender*)data; }
 
-static void create_modal(Capture *state, Window win, XWindowAttributes *attr)
+static void create_modal(Capture *state, xcb_window_t win, xcb_get_geometry_reply_t *attr)
 {
     // Never create a second modal for the same window.
     for (auto &m : state->modals) if (m.x11_win == win) return;
 
-    Display *dpy = state->dpy;
-    XCompositeRedirectWindow(dpy, win, CompositeRedirectAutomatic);
-    XFlush(dpy);
-    Pixmap pm = XCompositeNameWindowPixmap(dpy, win);
+    xcb_connection_t *connection = state->connection;
+    xcb_composite_redirect_window(connection, win, XCB_COMPOSITE_REDIRECT_AUTOMATIC);
+    xcb_flush(connection);
 
     GtkWidget *gtk_win = gtk_window_new(GTK_WINDOW_TOPLEVEL);
     gtk_window_set_decorated(GTK_WINDOW(gtk_win), TRUE);
@@ -1180,87 +1137,71 @@ static void create_modal(Capture *state, Window win, XWindowAttributes *attr)
     g_signal_connect(draw, "motion-notify-event",  G_CALLBACK(modal_motion),         mr);
     g_signal_connect(draw, "key-press-event",      G_CALLBACK(modal_key),            mr);
     g_signal_connect(draw, "key-release-event",    G_CALLBACK(modal_key),            mr);
-    g_signal_connect_data(draw, "draw", G_CALLBACK(modal_draw_cb), mr, modal_render_destroy, (GConnectFlags)0);
+    g_signal_connect(draw, "draw", G_CALLBACK(modal_draw_cb), mr);
+    g_signal_connect_data(gtk_win, "delete-event", G_CALLBACK(modal_delete_cb), mr, modal_render_destroy, (GConnectFlags)0);
 
     gtk_widget_show_all(gtk_win);
     gtk_widget_grab_focus(draw);
 
-    Damage dmg = 0;
-    if (g_wm_dpy && g_damage_event_base >= 0)
-        dmg = XDamageCreate(g_wm_dpy, win, XDamageReportBoundingBox);
+    xcb_damage_damage_t dmg = 0;
+    if (wm_connection() && g_damage_event_base >= 0)
+        dmg = create_damage(win);
 
-    Capture::ModalWin md;
-    md.x11_win = win; md.pixmap = pm; md.gtk_win = gtk_win; md.draw = draw; md.damage = dmg;
-    md.w = attr->width; md.h = attr->height;
-    {
-        XWindowAttributes wa_local;
-        md.visual = XGetWindowAttributes(dpy, win, &wa_local)
-                  ? wa_local.visual : DefaultVisual(dpy, DefaultScreen(dpy));
-    }
-    state->modals.push_back(md);
+    state->modals.emplace_back();
+    Capture::ModalWin &md = state->modals.back();
+    md.x11_win = win; md.gtk_win = gtk_win; md.draw = draw; md.damage = dmg;
+    md.pixmap_dirty = true;
 }
 
-static void modal_remove(Capture *c, Window win)
+static void modal_remove(Capture *c, xcb_window_t win)
 {
     for (auto it = c->modals.begin(); it != c->modals.end(); ++it)
         if (it->x11_win == win) {
-            Damage     dmg = it->damage;
-            Pixmap     pm  = it->pixmap;
+            xcb_damage_damage_t dmg = it->damage;
             GtkWidget *w   = it->gtk_win;
             c->modals.erase(it);
-            if (dmg && g_wm_dpy)       XDamageDestroy(g_wm_dpy, dmg);
-            if (pm)                    XFreePixmap(c->dpy, pm);
+            if (dmg && wm_connection())       xcb_damage_destroy(wm_connection(), dmg);
             if (w && GTK_IS_WIDGET(w)) gtk_widget_destroy(w);
             break;
         }
 }
 
-static bool is_xdnd_icon_window(Display *dpy, Window win)
-{
-    Atom atom_window_type = XInternAtom(dpy, "_NET_WM_WINDOW_TYPE", False);
-    Atom atom_type_dnd    = XInternAtom(dpy, "_NET_WM_WINDOW_TYPE_DND", False);
-    Atom actual_type; int actual_format; unsigned long nitems = 0, bytes_after = 0;
-    unsigned char *prop = nullptr;
-    bool is_dnd = false;
-    if (XGetWindowProperty(dpy, win, atom_window_type, 0, 10, False, XA_ATOM,
-                           &actual_type, &actual_format, &nitems, &bytes_after, &prop) == Success && prop)
-    {
-        if (actual_format == 32 && nitems > 0) {
-            Atom *atoms = (Atom*)prop;
-            for (unsigned long i = 0; i < nitems; i++)
-                if (atoms[i] == atom_type_dnd) { is_dnd = true; break; }
-        }
-        XFree(prop);
-    }
-    return is_dnd;
-}
-
-static void handle_new_window(Window win, Capture *state, XWindowAttributes *attr) {
-    if (!state->dpy || !win || !state) return;
+static void handle_new_window(xcb_window_t win, Capture *state, xcb_get_geometry_reply_t *attr, bool override_redirect) {
+    if (!state || !state->connection || !win) return;
 
     for (auto &p : state->popups)
         if (p.x11_win == win) { canvas_add_popup(state, win, attr); return; }
     for (auto &m : state->modals)
         if (m.x11_win == win) return;
 
-    if (is_xdnd_icon_window(state->dpy, win)) {
+    const XWaylandWM::WindowType type = g_wm->window_type(win, override_redirect);
+    if (type == XWaylandWM::DRAG_ICON) {
         DEBUG_PRINT("[DNDCOORD] ignoring XDND icon window 0x%lx (not compositing as popup)\n", (unsigned long)win);
         return;
     }
 
-    bool is_popup = classify_popup(state->dpy, win, attr);
-    if (is_popup) {
+    if (type == XWaylandWM::POPUP) {
         canvas_add_popup(state, win, attr);
     } else {
         create_modal(state, win, attr);
     }
 }
 
-static void on_popup_mapped(Window w)
+static void on_popup_mapped(xcb_window_t w)
 {
-    XWindowAttributes attr;
-    if (!XGetWindowAttributes(g_wm_dpy, w, &attr) || attr.map_state != IsViewable)
+    xcb_get_window_attributes_cookie_t attributes_request = xcb_get_window_attributes(wm_connection(), w);
+    xcb_get_geometry_cookie_t geometry_request = xcb_get_geometry(wm_connection(), w);
+    xcb_get_window_attributes_reply_t *attributes = xcb_get_window_attributes_reply(wm_connection(), attributes_request, nullptr);
+    xcb_get_geometry_reply_t *geometry = xcb_get_geometry_reply(wm_connection(), geometry_request, nullptr);
+    if (!attributes || attributes->map_state != XCB_MAP_STATE_VIEWABLE || !geometry) {
+        free(attributes);
+        free(geometry);
         return;
+    }
+    const bool override_redirect = attributes->override_redirect;
+    xcb_get_geometry_reply_t attr = *geometry;
+    free(attributes);
+    free(geometry);
 
     // Match the newly-mapped window to its owning capture.
     //
@@ -1277,22 +1218,22 @@ static void on_popup_mapped(Window w)
     // the PID loop as a safety net (e.g. popups that appear without a prior
     // focus event).
     if (g_active_capture &&
-        is_window_from_owned_plugin(g_active_capture->dpy, w, g_active_capture->gui_win)) {
-        handle_new_window(w, g_active_capture, &attr);
+        g_wm->owns_window(w, g_active_capture->gui_win)) {
+        handle_new_window(w, g_active_capture, &attr, override_redirect);
         return;
     }
 
     for (auto &kv : g_captures) {
         Capture *cand = kv.second;
         if (!cand || kv.first != cand->parent_win) continue;
-        if (cand && is_window_from_owned_plugin(cand->dpy, w, cand->gui_win)) {
-            handle_new_window(w, cand, &attr);
+        if (cand && g_wm->owns_window(w, cand->gui_win)) {
+            handle_new_window(w, cand, &attr, override_redirect);
             return;
         }
     }
 }
 
-static void on_popup_unmapped(Window w)
+static void on_popup_unmapped(xcb_window_t w)
 {
     for (auto &kv : g_captures) {
         Capture *c = kv.second;
@@ -1307,17 +1248,16 @@ static void on_popup_unmapped(Window w)
     }
 }
 
-static bool on_popup_configured(Window w, int cw, int ch)
+static bool on_popup_configured(xcb_window_t w, int cw, int ch)
 {
     for (auto &kv : g_captures) {
         Capture *c = kv.second;
         if (!c || kv.first != c->parent_win) continue;
         for (auto &p : c->popups) {
             if (p.x11_win != w) continue;
-            Window child;
             int x, y;
-            if (!XTranslateCoordinates(c->dpy, w, DefaultRootWindow(c->dpy),
-                                       0, 0, &x, &y, &child)) return true;
+            if (!swell_xcb_translate(c->connection, w, swell_xcb_screen(c->connection)->root,
+                                       0, 0, &x, &y)) return true;
             refresh_gtk_offset(c);
             int old_x = p.x, old_y = p.y, old_w = p.w, old_h = p.h;
             p.x = x + c->gtk_x;
@@ -1348,17 +1288,17 @@ static bool on_popup_configured(Window w, int cw, int ch)
     return false;
 }
 
-static void handle_damage_notify(XDamageNotifyEvent *de)
+static void handle_damage_notify(xcb_damage_notify_event_t *de)
 {
     DEBUG_PRINT("damage: %dx%d+%d+%d\n",
         de->area.width, de->area.height, de->area.x, de->area.y);
 
-    XDamageSubtract(g_wm_dpy, de->damage, None, None);
+    xcb_damage_subtract(wm_connection(), de->damage, XCB_NONE, XCB_NONE);
 
     Capture *c = find_capture(de->drawable);
     if (c && c->widget && GTK_IS_WIDGET(c->widget)) {
         c->pixmap_dirty = true;
-        if (c->pixmap_w != de->geometry.width || c->pixmap_h != de->geometry.height)
+        if (c->pixmap.width != de->geometry.width || c->pixmap.height != de->geometry.height)
             gtk_widget_queue_draw(c->widget);
         else
             swell_gdk_queue_draw_pixels(c->widget, de->area.x, de->area.y,
@@ -1386,22 +1326,7 @@ static void handle_damage_notify(XDamageNotifyEvent *de)
         for (auto &md : cc->modals) {
             if (md.x11_win == de->drawable) {
                 if (md.draw && GTK_IS_WIDGET(md.draw)) {
-                    // Refresh the modal's OWN pixmap if the modal window was
-                    // resized (composite pixmap becomes invalid on every
-                    // resize). Then just tell GTK to redraw the damaged area
-                    // -- with Automatic redirection the pixmap stays live on
-                    // its own; no explicit capture step needed.
-                    XWindowAttributes wa;
-                    if (XGetWindowAttributes(cc->dpy, md.x11_win, &wa)
-                        && wa.width > 0 && wa.height > 0) {
-                        if (md.w != wa.width || md.h != wa.height || md.pixmap == 0) {
-                            if (md.pixmap) XFreePixmap(cc->dpy, md.pixmap);
-                            XFlush(cc->dpy);
-                            md.pixmap = XCompositeNameWindowPixmap(cc->dpy, md.x11_win);
-                            md.w = wa.width;
-                            md.h = wa.height;
-                        }
-                    }
+                    md.pixmap_dirty = true;
                     swell_gdk_queue_draw_pixels(md.draw, de->area.x, de->area.y,
                                                de->area.width, de->area.height);
                 }
@@ -1411,69 +1336,45 @@ static void handle_damage_notify(XDamageNotifyEvent *de)
     }
 }
 
-static void handle_xdnd_from_plugin(XClientMessageEvent *xce)
+static void handle_xdnd_from_plugin(xcb_client_message_event_t *event)
 {
-    Display *dpy   = xce->display;
-    const Atom mt  = xce->message_type;
-    const Window self = xce->window;
-    const Window src  = (Window)xce->data.l[0];
-
-    if (src && mt == XInternAtom(dpy, "XdndPosition", False))
-    {
-        XClientMessageEvent st; memset(&st, 0, sizeof(st));
-        st.type         = ClientMessage;
-        st.display      = dpy;
-        st.window       = src;
-        st.message_type = XInternAtom(dpy, "XdndStatus", False);
-        st.format       = 32;
-        st.data.l[0]    = (long)self;
-        st.data.l[1]    = 0;      // bit 0 clear = will not accept a drop
-        st.data.l[2]    = 0;      // no "silent" rectangle: keep sending positions
-        st.data.l[3]    = 0;
-        st.data.l[4]    = None;   // no action
-        XSendEvent(dpy, src, False, NoEventMask, (XEvent*)&st);
-        XFlush(dpy);
-        return;
-    }
-    if (src && mt == XInternAtom(dpy, "XdndDrop", False))
-    {
-        XClientMessageEvent fin; memset(&fin, 0, sizeof(fin));
-        fin.type         = ClientMessage;
-        fin.display      = dpy;
-        fin.window       = src;
-        fin.message_type = XInternAtom(dpy, "XdndFinished", False);
-        fin.format       = 32;
-        fin.data.l[0]    = (long)self;
-        fin.data.l[1]    = 0;     // not accepted
-        fin.data.l[2]    = None;
-        XSendEvent(dpy, src, False, NoEventMask, (XEvent*)&fin);
-        XFlush(dpy);
-        return;
-    }
+    const WMAtoms &atoms = g_wm->atoms();
+    xcb_client_message_event_t reply = {};
+    reply.response_type = XCB_CLIENT_MESSAGE;
+    reply.window = event->data.data32[0];
+    if (!reply.window) return;
+    if (event->type == atoms.XdndPosition) reply.type = atoms.XdndStatus;
+    else if (event->type == atoms.XdndDrop) reply.type = atoms.XdndFinished;
+    else return;
+    reply.format = 32;
+    reply.data.data32[0] = event->window;
+    xcb_send_event(wm_connection(), false, reply.window, XCB_EVENT_MASK_NO_EVENT, (const char*)&reply);
+    xcb_flush(wm_connection());
 }
 
-static void bridge_handle_event(XEvent *ev)
+static void bridge_handle_event(xcb_generic_event_t *ev)
 {
-    Window dnd_catcher = g_wm ? g_wm->dnd_catcher_window() : 0;
+    const uint8_t type = ev->response_type & 0x7f;
+    xcb_window_t dnd_catcher = g_wm ? g_wm->dnd_catcher_window() : 0;
     if (dnd_catcher &&
-        ((ev->type == MapNotify   && ev->xmap.window   == dnd_catcher) ||
-         (ev->type == UnmapNotify && ev->xunmap.window == dnd_catcher) ||
-         (ev->type == ClientMessage && ev->xclient.window == dnd_catcher)))
+        ((type == XCB_MAP_NOTIFY   && ((xcb_map_notify_event_t*)ev)->window   == dnd_catcher) ||
+         (type == XCB_UNMAP_NOTIFY && ((xcb_unmap_notify_event_t*)ev)->window == dnd_catcher) ||
+         (type == XCB_CLIENT_MESSAGE && ((xcb_client_message_event_t*)ev)->window == dnd_catcher)))
         return;
 
-    if (g_damage_event_base >= 0 && ev->type == g_damage_event_base + XDamageNotify) {
-        handle_damage_notify((XDamageNotifyEvent *)ev);
+    if (g_damage_event_base >= 0 && type == g_damage_event_base + XCB_DAMAGE_NOTIFY) {
+        handle_damage_notify((xcb_damage_notify_event_t *)ev);
         return;
     }
 
-    if (g_shape_event_base >= 0 && ev->type == g_shape_event_base + ShapeNotify) {
-        XShapeEvent *shape = (XShapeEvent *)ev;
-        if (shape->kind != ShapeBounding) return;
+    if (g_shape_event_base >= 0 && type == g_shape_event_base + XCB_SHAPE_NOTIFY) {
+        xcb_shape_notify_event_t *shape = (xcb_shape_notify_event_t *)ev;
+        if (shape->shape_kind != XCB_SHAPE_SK_BOUNDING) return;
         for (auto &kv : g_captures) {
             Capture *c = kv.second;
             if (kv.first != c->parent_win) continue;
             for (auto &p : c->popups) {
-                if (p.x11_win != shape->window) continue;
+                if (p.x11_win != shape->affected_window) continue;
                 p.shape_dirty = true;
                 if (c->canvas_draw)
                     swell_gdk_queue_draw_pixels(c->canvas_draw, p.x - c->canvas_x,
@@ -1484,26 +1385,27 @@ static void bridge_handle_event(XEvent *ev)
         return;
     }
 
-    if (ev->type == ClientMessage)
+    if (type == XCB_CLIENT_MESSAGE)
     {
-        handle_xdnd_from_plugin(&ev->xclient);
+        handle_xdnd_from_plugin((xcb_client_message_event_t*)ev);
         return;
     }
 
     // Non-damage: popup lifecycle. (c set => plugin window, nothing to do here.)
-    Capture *c = find_capture(ev->xany.window);
+    if (type != XCB_MAP_NOTIFY && type != XCB_UNMAP_NOTIFY && type != XCB_CONFIGURE_NOTIFY) return;
+    Capture *c = find_capture(((xcb_map_notify_event_t*)ev)->window);
     if (c) return;
-    switch (ev->type)
+    switch (type)
     {
-        case MapNotify:
-            on_popup_mapped(ev->xmap.window);
+        case XCB_MAP_NOTIFY:
+            on_popup_mapped(((xcb_map_notify_event_t*)ev)->window);
             break;
-        case UnmapNotify:
-            on_popup_unmapped(ev->xunmap.window);
+        case XCB_UNMAP_NOTIFY:
+            on_popup_unmapped(((xcb_unmap_notify_event_t*)ev)->window);
             break;
-        case ConfigureNotify:
-            on_popup_configured(ev->xconfigure.window,
-                                ev->xconfigure.width, ev->xconfigure.height);
+        case XCB_CONFIGURE_NOTIFY:
+            on_popup_configured(((xcb_configure_notify_event_t*)ev)->window,
+                                ((xcb_configure_notify_event_t*)ev)->width, ((xcb_configure_notify_event_t*)ev)->height);
             break;
         default:
             break;
@@ -1512,13 +1414,18 @@ static void bridge_handle_event(XEvent *ev)
 
 static void dismiss_popups(Capture *c)
 {
-    if (!c || !c->dpy || c->popups.empty()) return;
+    if (!c || !c->connection || c->popups.empty()) return;
     park_pointer(0, 0);
     if (c->root_popup) {
         int levels = 0;
         for (const auto &p : c->popups)
-            if (p.visible && popup_accepts_input(c->dpy, p.x11_win)) ++levels;
-        const int keycode = XKeysymToKeycode(c->dpy, XK_Escape);
+            if (p.visible && popup_accepts_input(c->connection, p.x11_win)) ++levels;
+        xcb_key_symbols_t *symbols = xcb_key_symbols_alloc(c->connection);
+        xcb_keycode_t *codes = symbols ? xcb_key_symbols_get_keycode(symbols, 0xff1b) : nullptr;
+        const int keycode = codes ? codes[0] : 0;
+        free(codes);
+        if (symbols) xcb_key_symbols_free(symbols);
+        if (!keycode) return;
         for (int i = 0; i < wdl_max(levels, 1); ++i) {
             xw_bridge_forward_key(c->hwnd, keycode, 0, true);
             xw_bridge_forward_key(c->hwnd, keycode, 0, false);
@@ -1545,12 +1452,15 @@ bool xw_bridge_swell_on_button_event_escape()
     return any;
 }
 
-bool xw_bridge_swell_on_gdk_delete_release()
+bool xw_bridge_swell_on_gdk_delete_release(HWND hwnd)
 {
     bool any = false;
     for (auto &kv : g_captures) {
         Capture *c = kv.second;
         if (!c || kv.first != c->parent_win) continue;
+        HWND owner = c->hwnd;
+        while (owner && owner != hwnd) owner = owner->m_parent ? owner->m_parent : owner->m_owner;
+        if (!owner) continue;
         if (!c->popups.empty()) {
             any = true;
             // Tell the plugin to close its menu FIRST, while we still have the popup
@@ -1560,42 +1470,24 @@ bool xw_bridge_swell_on_gdk_delete_release()
             // destroyed, which wedges the plugin and hangs REAPER. Modals are fine
             // because they take no pointer grab.
             dismiss_popups(c);
-            for (auto &p : c->popups)
-                if (p.pixmap != None && c->dpy) XFreePixmap(c->dpy, p.pixmap);
-            c->popups.clear();
-            c->root_popup = None;
-            if (c->popup_canvas && GTK_IS_WIDGET(c->popup_canvas)) {
-                gtk_widget_destroy(c->popup_canvas);
-                c->popup_canvas = nullptr;
-                c->canvas_draw  = nullptr;
-            }
+            while (!c->popups.empty()) canvas_remove_popup(c, c->popups.back().x11_win);
         }
-        if (!c->modals.empty() && c->dpy) {
+        if (!c->modals.empty() && c->connection) {
             // Modals must be dismissed too. Previously this branch only *checked* for
             // an active modal, so Super+Q left the dialog open and, because the check
             // also gated `any`, the close did nothing at all -- leaving a plugin with
             // an open dialog that hangs the moment REAPER regains focus.
             //
             // A dialog cannot be dismissed the way a popup is: a synthetic click would
-            // press whatever button has focus, and Escape needs :10 keyboard focus we
+            // press whatever button has focus, and Escape needs X11 keyboard focus we
             // cannot guarantee. WM_DELETE_WINDOW is the protocol-correct "please
             // close" and Wine dialogs honour it regardless of focus.
-            const Atom a_prot = XInternAtom(c->dpy, "WM_PROTOCOLS", False);
-            const Atom a_del  = XInternAtom(c->dpy, "WM_DELETE_WINDOW", False);
             for (auto &md : c->modals) {
                 if (!md.x11_win) continue;
                 any = true;
-                XClientMessageEvent m; memset(&m, 0, sizeof(m));
-                m.type         = ClientMessage;
-                m.display      = c->dpy;
-                m.window       = md.x11_win;
-                m.message_type = a_prot;
-                m.format       = 32;
-                m.data.l[0]    = (long)a_del;
-                m.data.l[1]    = CurrentTime;
-                XSendEvent(c->dpy, md.x11_win, False, NoEventMask, (XEvent*)&m);
+                modal_request_close(c, md.x11_win);
             }
-            XFlush(c->dpy);
+            xcb_flush(c->connection);
         }
     }
     return any;
@@ -1603,16 +1495,17 @@ bool xw_bridge_swell_on_gdk_delete_release()
 
 void init_private_xwayland()
 {
-    if (!XWaylandWM::init_bridge_wm(":10")) return;
+    if (!XWaylandWM::init_bridge_wm()) return;
 
-    if (g_wm_dpy) {
-        int base, err;
-        if (XDamageQueryExtension(g_wm_dpy, &base, &err)) {
-            g_damage_event_base = base;
-            g_bridge_damage_error_base = err;
-        }
-        if (XShapeQueryExtension(g_wm_dpy, &base, &err))
-            g_shape_event_base = base;
+    const xcb_query_extension_reply_t *damage = xcb_get_extension_data(wm_connection(), &xcb_damage_id);
+    if (damage && damage->present) {
+        free(xcb_damage_query_version_reply(wm_connection(), xcb_damage_query_version(wm_connection(), 1, 1), nullptr));
+        g_damage_event_base = damage->first_event;
+    }
+    const xcb_query_extension_reply_t *shape = xcb_get_extension_data(wm_connection(), &xcb_shape_id);
+    if (shape && shape->present) {
+        free(xcb_shape_query_version_reply(wm_connection(), xcb_shape_query_version(wm_connection()), nullptr));
+        g_shape_event_base = shape->first_event;
     }
 
     g_wm->on_unhandled_event = bridge_handle_event;
@@ -1645,6 +1538,8 @@ static void xw_fixed_init(XwFixed *)
 // A true toplevel (h->m_oswidget already set by SWELL itself) is the recursion's
 // base case -- we never touch m_oswidget, only ever read it. Returns the widget to
 // embed into, or nullptr if something in the chain isn't embeddable.
+static void detach_bridge_widgets(GtkWidget *widget);
+
 static GtkWidget* xw_ensure_embed_widget(HWND h)
 {
     if (!h) return nullptr;
@@ -1678,42 +1573,39 @@ static GtkWidget* xw_ensure_embed_widget(HWND h)
     const int x = swell_gdk_floor(h->m_position.left, scale);
     const int y = swell_gdk_floor(h->m_position.top, scale);
 
-    GtkWidget *existing = (GtkWidget*)GetProp(h, "XBridgeEmbedFixed");
-
-    if (existing && GTK_IS_WIDGET(existing) && gtk_widget_get_parent(existing) != parent_widget) {
-        existing = nullptr;
-    }
-
-    if (existing && GTK_IS_WIDGET(existing)) {
+    GtkWidget *existing = (GtkWidget*)g_object_get_data(G_OBJECT(parent_widget), "xw-active-embed-fixed");
+    if (existing && g_object_get_data(G_OBJECT(existing), "xw-embed-hwnd") == h &&
+        gtk_widget_get_parent(existing) == parent_widget) {
         gtk_fixed_move(GTK_FIXED(parent_widget), existing, x, y);
         return existing;
     }
 
-    GtkWidget *prev_fixed = (GtkWidget*)g_object_get_data(G_OBJECT(parent_widget), "xw-active-embed-fixed");
-    if (prev_fixed && GTK_IS_WIDGET(prev_fixed) && prev_fixed != existing) {
-        gtk_widget_destroy(prev_fixed);
+    if (existing) {
+        detach_bridge_widgets(existing);
+        gtk_widget_destroy(existing);
     }
 
     GtkWidget *fixed = gtk_fixed_new();
     gtk_fixed_put(GTK_FIXED(parent_widget), fixed, x, y);
     gtk_widget_show(fixed);
 
-    g_object_set_data(G_OBJECT(parent_widget), "xw-active-embed-fixed", fixed);
-    SetProp(h, "XBridgeEmbedFixed", (HANDLE)fixed);
+    g_object_set_data(G_OBJECT(fixed), "xw-embed-hwnd", h);
+    g_object_set_data_full(G_OBJECT(parent_widget), "xw-active-embed-fixed", g_object_ref(fixed),
+                          [](gpointer widget) { g_object_unref(widget); });
     return fixed;
 }
 
-// Size the container and centre it on :10's screen. Rootless Xwayland's screen is
+// Size the container and centre it on Xwayland's screen. Rootless Xwayland's screen is
 // exactly the monitor area and its pointer is clamped to it, so a container at 0,0
 // leaves no room left/up of the plugin: knob drags stop dead there. Centring splits
 // the spare room evenly; a plugin bigger than the screen clamps back to 0, so this
 // never pushes a window further off-screen than 0,0 did.
-static GdkRectangle place_container(Display *dpy, Window container, GtkWidget *widget, int w, int h)
+static GdkRectangle place_container(xcb_connection_t *connection, xcb_window_t container, GtkWidget *widget, int w, int h)
 {
-    const GdkRectangle bounds = capture_monitor(dpy, widget);
+    const GdkRectangle bounds = capture_monitor(connection, widget);
     const int x = bounds.x + wdl_max((bounds.width - w) / 2, 0);
     const int y = bounds.y + wdl_max((bounds.height - h) / 2, 0);
-    XMoveResizeWindow(dpy, container, x, y, w, h);
+    swell_xcb_move_resize(connection, container, x, y, w, h);
     return bounds;
 }
 
@@ -1727,40 +1619,29 @@ static bool try_create_plugin(HWND hwnd)
         xw_size(hwnd);
     }
 
-     // First tick(s): the plugin creates its window as a child of our container.
-     if (!bs->cap && bs->disp && bs->parent)
-     {
-         Window root, par, *list = nullptr; unsigned int n = 0;
-         if (XQueryTree(bs->disp, bs->parent, &root, &par, &list, &n) && list && n)
-         {
-             Window plugin_win = list[0];
-             XFree(list);
+    // First tick(s): the plugin creates its window as a child of our container.
+    if (!bs->cap && bs->connection && bs->parent) {
+        xcb_window_t plugin = first_child(bs->connection, bs->parent);
+        if (plugin) {
+            xcb_get_geometry_reply_t *geometry = xcb_get_geometry_reply(bs->connection,
+                xcb_get_geometry(bs->connection, plugin), nullptr);
+            if (!geometry) return false;
+            const GdkRectangle bounds = place_container(bs->connection, bs->parent, hwnd->m_oswidget,
+                                                        geometry->width, geometry->height);
+            free(geometry);
+            xcb_flush(bs->connection);
+            Capture *c = setup_capture(bs->connection, bs->parent, plugin, hwnd);
+            c->widget = hwnd->m_oswidget;
+            c->monitor_bounds = bounds;
 
-             XWindowAttributes attr;
-             if (!XGetWindowAttributes(bs->disp, plugin_win, &attr)) return false;
-             const GdkRectangle bounds = place_container(bs->disp, bs->parent, hwnd->m_oswidget,
-                                                         attr.width, attr.height);
-             XFlush(bs->disp);
-
-             Capture *c = setup_capture(bs->disp, bs->parent, plugin_win, hwnd);
-             c->widget = hwnd->m_oswidget;
-             c->monitor_bounds = bounds;
-
-             // Wine plugins nest a child GUI window; native plugins draw directly.
-             Window gr, gp, *gk = nullptr; unsigned int gn = 0;
-             if (XQueryTree(bs->disp, plugin_win, &gr, &gp, &gk, &gn) && gn) {
-                 c->gui_win = gk[0];
-                 g_captures[c->gui_win] = c;
-                 XFree(gk);
-             } else {
-                 c->gui_win = plugin_win;
-             }
-
-             connect_widget(c);
-             bs->cap = c;
-         }
-         else if (list) XFree(list);
-     }
+            // Wine plugins nest a child GUI window; native plugins draw directly.
+            c->gui_win = first_child(bs->connection, plugin);
+            if (!c->gui_win) c->gui_win = plugin;
+            g_captures[c->gui_win] = c;
+            connect_widget(c);
+            bs->cap = c;
+        }
+    }
 
     if (bs->placed && bs->cap) {
         KillTimer(hwnd, 1);
@@ -1776,20 +1657,26 @@ void xw_destroy(HWND hwnd)
     hwnd->m_private_data = 0;
     KillTimer(hwnd, 1);
     if (bs->cap) cleanup_capture(bs->cap);
-    else if (bs->disp) {
-        Window root, parent, *children = nullptr;
-        unsigned int count = 0;
-        if (XQueryTree(bs->disp, bs->parent, &root, &parent, &children, &count)) {
-            for (unsigned int i = 0; i < count; ++i)
-                XFixesChangeSaveSet(bs->disp, children[i], SetModeInsert, SaveSetRoot, SaveSetUnmap);
+    else if (bs->connection) {
+        xcb_query_tree_reply_t *tree = xcb_query_tree_reply(bs->connection,
+            xcb_query_tree(bs->connection, bs->parent), nullptr);
+        if (tree) {
+            const xcb_window_t *children = xcb_query_tree_children(tree);
+            for (int i = 0; i < xcb_query_tree_children_length(tree); ++i)
+                xcb_xfixes_change_save_set(bs->connection, XCB_SET_MODE_INSERT,
+                    XCB_XFIXES_SAVE_SET_TARGET_ROOT, XCB_XFIXES_SAVE_SET_MAPPING_UNMAP, children[i]);
+            free(tree);
         }
-        if (children) XFree(children);
-        XCloseDisplay(bs->disp);
+    }
+    if (bs->connection) {
+        xcb_render_util_disconnect(bs->connection);
+        xcb_flush(bs->connection);
+        xcb_disconnect(bs->connection);
     }
     if (hwnd->m_oswidget && GTK_IS_WIDGET(hwnd->m_oswidget)) {
         g_signal_handlers_disconnect_by_data(hwnd->m_oswidget, hwnd);
-        g_object_remove_weak_pointer(G_OBJECT(hwnd->m_oswidget), (gpointer*)&hwnd->m_oswidget);
         gtk_widget_destroy(hwnd->m_oswidget);
+        g_object_unref(hwnd->m_oswidget);
         hwnd->m_oswidget = nullptr;
     }
     delete bs;
@@ -1810,13 +1697,7 @@ void xw_size(HWND hwnd)
     //         bs->cur_parent = h->m_oswindow;
     //
     // SWELL replaces the host toplevel when the FX window is floated/unfloated
-    // from the FX list. swell_oswindow_destroy() destroys the
-    // GdkWindow and nulls m_oswidget, then swell_oswindow_manage() builds a
-    // fresh GtkWindow. Our drawing area stays in the discarded one: GTK still
-    // reports it parented with a GtkWindow toplevel, but at the GDK level its
-    // parent is NULL and the old toplevel's window reads back freed memory, so
-    // it is never drawn again -- a live pixmap full of plugin content with
-    // nothing painting it, recoverable only by reopening the plugin.
+    // from the FX list. Reattach the drawing area to the new GtkWindow.
     //
     // Doing this here rather than from the damage callback matters: xw_size
     // runs on WM_SIZE/WM_MOVE, after SWELL has finished rebuilding the window,
@@ -1826,7 +1707,7 @@ void xw_size(HWND hwnd)
         // Re-resolve the embed container every time and re-place if it moved.
         // Fixed float/unfloat in fx list view
         GtkWidget *fresh = xw_ensure_embed_widget(hwnd->m_parent);
-        if (fresh && fresh != bs->embed_container) {
+        if (fresh != bs->embed_container || gtk_widget_get_parent(hwnd->m_oswidget) != fresh) {
             DEBUG_PRINT("[REPARENT] embed container %p -> %p, re-placing\n",
                         (void*)bs->embed_container, (void*)fresh);
             bs->embed_container = fresh;
@@ -1857,9 +1738,9 @@ void xw_size(HWND hwnd)
     // an FX-list swap), and the container resize also needs a live capture.
     if (bs->cap && size_changed) {
         refresh_pixmap(bs->cap);
-        bs->cap->monitor_bounds = place_container(bs->cap->dpy, bs->cap->parent_win,
+        bs->cap->monitor_bounds = place_container(bs->cap->connection, bs->cap->parent_win,
                                                    hwnd->m_oswidget, w, h);
-        XFlush(bs->cap->dpy);
+        xcb_flush(bs->cap->connection);
     }
 
     pos_x = swell_gdk_floor(pos_x, scale);
@@ -1931,33 +1812,101 @@ static void xw_scale_changed(GtkWidget *, GParamSpec *, gpointer data)
     xw_size((HWND)data);
 }
 
+struct XwView { GtkDrawingArea parent; };
+struct XwViewClass { GtkDrawingAreaClass parent; };
+G_DEFINE_TYPE(XwView, xw_view, GTK_TYPE_DRAWING_AREA)
+
+static void xw_view_realize(GtkWidget *widget)
+{
+    GtkAllocation allocation;
+    gtk_widget_get_allocation(widget, &allocation);
+    GdkWindowAttr attr = {};
+    attr.window_type = GDK_WINDOW_SUBSURFACE;
+    attr.wclass = GDK_INPUT_OUTPUT;
+    attr.x = allocation.x;
+    attr.y = allocation.y;
+    attr.width = allocation.width;
+    attr.height = allocation.height;
+    attr.visual = gtk_widget_get_visual(widget);
+    attr.event_mask = gtk_widget_get_events(widget) | GDK_EXPOSURE_MASK;
+    GdkWindow *window = gdk_window_new(gdk_screen_get_root_window(gtk_widget_get_screen(widget)), &attr,
+                                      GDK_WA_X | GDK_WA_Y | GDK_WA_VISUAL);
+    gdk_window_set_transient_for(window, gtk_widget_get_window(gtk_widget_get_toplevel(widget)));
+    gtk_widget_set_realized(widget, TRUE);
+    gtk_widget_register_window(widget, window);
+    gtk_widget_set_window(widget, window);
+}
+
+static void xw_view_class_init(XwViewClass *klass)
+{
+    GTK_WIDGET_CLASS(klass)->realize = xw_view_realize;
+    GTK_WIDGET_CLASS(klass)->unmap = [](GtkWidget *widget) {
+        Capture *c = find_capture(gtk_widget_get_window(widget));
+        if (c) c->gl.reset();
+        GTK_WIDGET_CLASS(xw_view_parent_class)->unmap(widget);
+    };
+}
+
+static void xw_view_init(XwView *)
+{
+}
+
+static void detach_bridge_widgets(GtkWidget *widget)
+{
+    if (G_TYPE_CHECK_INSTANCE_TYPE(widget, xw_view_get_type())) {
+        GtkWidget *parent = gtk_widget_get_parent(widget);
+        if (parent) {
+            g_signal_handlers_block_matched(widget, G_SIGNAL_MATCH_FUNC, 0, 0, NULL, (gpointer)xw_scale_changed, NULL);
+            gtk_container_remove(GTK_CONTAINER(parent), widget);
+            g_signal_handlers_unblock_matched(widget, G_SIGNAL_MATCH_FUNC, 0, 0, NULL, (gpointer)xw_scale_changed, NULL);
+        }
+    } else if (GTK_IS_CONTAINER(widget)) {
+        GList *children = gtk_container_get_children(GTK_CONTAINER(widget));
+        for (GList *p = children; p; p = p->next) detach_bridge_widgets(GTK_WIDGET(p->data));
+        g_list_free(children);
+    }
+}
+
+void xw_bridge_detach_children(HWND hwnd)
+{
+    detach_bridge_widgets(hwnd->m_oswidget);
+}
+
 HWND xw_bridge_create(HWND viewpar, void **wref, const RECT *r, const char *bridge_class_name)
 {
     HWND hwnd = nullptr;
     *wref = nullptr;
 
-    Display *disp = XOpenDisplay(":10");
-    if (!disp) {
+    if (!g_wm) init_private_xwayland();
+    xcb_connection_t *connection = g_wm ? xcb_connect(XWaylandWM::display_name(), nullptr) : nullptr;
+    if (!connection || xcb_connection_has_error(connection)) {
+        if (connection) xcb_disconnect(connection);
         hwnd = new HWND__(viewpar, 0, r, NULL, false, NULL);
         hwnd->m_classname = bridge_class_name;
         return hwnd;
     }
-
-    int screen = DefaultScreen(disp);
-    Window root = RootWindow(disp, screen);
+    const auto composite = xcb_composite_query_version(connection, 0, 4);
+    const auto fixes = xcb_xfixes_query_version(connection, 5, 0);
+    const auto randr = xcb_randr_query_version(connection, 1, 5);
+    free(xcb_composite_query_version_reply(connection, composite, nullptr));
+    free(xcb_xfixes_query_version_reply(connection, fixes, nullptr));
+    free(xcb_randr_query_version_reply(connection, randr, nullptr));
+    xcb_screen_t *screen = swell_xcb_screen(connection);
     int w = wdl_max(r->right - r->left, 1);
     int h = wdl_max(r->bottom - r->top, 1);
     HWND parent = viewpar;
     while (parent && !parent->m_oswidget) parent = parent->m_parent;
 
-    Window container = XCreateSimpleWindow(disp, root, 0, 0, w, h, 0,
-                                           BlackPixel(disp, screen),
-                                           WhitePixel(disp, screen));
-    place_container(disp, container, parent ? parent->m_oswidget : nullptr, w, h);
-    XMapWindow(disp, container);
-    XFlush(disp);
+    xcb_window_t container = xcb_generate_id(connection);
+    const uint32_t background = screen->white_pixel;
+    xcb_create_window(connection, XCB_COPY_FROM_PARENT, container, screen->root, 0, 0, w, h, 0,
+        XCB_WINDOW_CLASS_INPUT_OUTPUT, XCB_COPY_FROM_PARENT, XCB_CW_BACK_PIXEL, &background);
+    place_container(connection, container, parent ? parent->m_oswidget : nullptr, w, h);
+    xcb_map_window(connection, container);
+    xcb_flush(connection);
 
-    GtkWidget *draw_area = gtk_drawing_area_new();
+    GtkWidget *draw_area = GTK_WIDGET(g_object_new(xw_view_get_type(), nullptr));
+    g_object_ref_sink(draw_area);
     const int scale = swell_gdk_widget_scale(parent ? parent->m_oswidget : NULL);
     gtk_widget_set_size_request(draw_area, swell_gdk_ceil(w, scale), swell_gdk_ceil(h, scale));
 
@@ -1965,15 +1914,13 @@ HWND xw_bridge_create(HWND viewpar, void **wref, const RECT *r, const char *brid
     hwnd->m_classname = bridge_class_name;
     hwnd->m_oswidget  = draw_area;
 
-    g_object_add_weak_pointer(G_OBJECT(draw_area), (gpointer*)&hwnd->m_oswidget);
-
     bridgeState *bs = new bridgeState();
-    bs->disp   = disp;
+    bs->connection   = connection;
     bs->parent = container;
     hwnd->m_private_data = (INT_PTR)bs;
     g_signal_connect(draw_area, "notify::scale-factor", G_CALLBACK(xw_scale_changed), hwnd);
 
-    *wref = (void*)container;
+    *wref = (void*)(uintptr_t)container;
 
     {
         HWND top = viewpar;
@@ -1993,10 +1940,10 @@ bool xw_bridge_forward_key_to_modal(int keycode, int state, bool is_press)
     {
         Capture *c = kv.second;
         if (!c || kv.first != c->parent_win) continue;
-        if (!c || !c->dpy || c->modals.empty()) continue;
+        if (!c || !c->connection || c->modals.empty()) continue;
 
         Capture::ModalWin &md = c->modals.back();
-        Window target = md.x11_win;
+        xcb_window_t target = md.x11_win;
         if (!target) continue;
         xw_raise_modals();
         return true;
@@ -2009,23 +1956,12 @@ bool xw_bridge_forward_key(HWND hwnd, int keycode, int state, bool is_press)
     if (!hwnd || !hwnd->m_private_data) return false;
     bridgeState *bs = (bridgeState*)hwnd->m_private_data;
     Capture *c = bs->cap;
-    if (!c || !c->dpy) return false;
+    if (!c || !c->connection) return false;
 
-    Window target = (c->root_popup && !c->popups.empty()) ? c->root_popup
+    xcb_window_t target = (c->root_popup && !c->popups.empty()) ? c->root_popup
                   : (c->gui_win ? c->gui_win : c->plugin_win);
     if (!target) return false;
 
-    XKeyEvent xev; memset(&xev, 0, sizeof(xev));
-    xev.type        = is_press ? KeyPress : KeyRelease;
-    xev.display     = c->dpy;
-    xev.window      = target;
-    xev.root        = DefaultRootWindow(c->dpy);
-    xev.time        = CurrentTime;
-    xev.keycode     = keycode;
-    xev.state       = state;
-    xev.same_screen = True;
-    XSendEvent(c->dpy, target, True,
-               is_press ? KeyPressMask : KeyReleaseMask, (XEvent*)&xev);
-    XFlush(c->dpy);
+    forward_key(c->connection, target, keycode, state, is_press);
     return true;
 }
