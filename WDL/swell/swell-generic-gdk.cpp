@@ -1568,6 +1568,9 @@ static bool atom_from_clipboard_type(int type, GdkAtom *atom)
 
 static UINT clipboard_type_from_atom(GdkAtom atom)
 {
+#ifdef SWELL_TARGET_WAYLAND
+  if (gtk_targets_include_text(&atom, 1)) return CF_TEXT;
+#endif
   for (int x = 0; x < s_clip_fmts.GetSize(); x++)
     if (s_clip_fmts.Get()[x].atom == atom) return x+1;
   return 0;
@@ -1581,6 +1584,38 @@ static HANDLE *find_clipboard_setstate(GdkAtom a)
   return NULL;
 }
 
+
+static void encode_uri(WDL_FastString *s, const char *rd);
+
+static void format_clipboard_data(GdkAtom format, HANDLE handle, WDL_FastString &str)
+{
+  const char *data = (const char*)handle;
+  const int len = GlobalSize(handle);
+  if (format == utf8atom())
+  {
+    for (int i = 0; i < len && data[i]; ++i)
+    {
+      if (data[i] == '\r' && i + 1 < len && data[i+1] == '\n') continue;
+      str.Append(data + i, 1);
+    }
+  }
+  else if (format == urilistatom())
+  {
+    if (len <= (int)sizeof(DROPFILES)) return;
+    const DROPFILES *hdr = (const DROPFILES*)data;
+    if (hdr->fWide || hdr->pFiles >= (DWORD)len) return; // todo deal with UTF-16
+    for (const char *file = data + hdr->pFiles; file < data + len && *file; )
+    {
+      const char *end = (const char*)memchr(file, 0, data + len - file);
+      if (!end) break;
+      str.Append("file://");
+      encode_uri(&str, file);
+      str.Append("\r\n");
+      file = end + 1;
+    }
+  }
+  else str.SetRaw(data, len);
+}
 
 static void OnSelectionRequestEvent(GdkEventSelection *b)
 {
@@ -1629,59 +1664,8 @@ static void OnSelectionRequestEvent(GdkEventSelection *b)
       if (state)
       {
         prop = b->property;
-        int len = GlobalSize(*state);
-        guchar *ptr = (guchar*)*state;
-
         WDL_FastString str;
-        if (sf == utf8atom())
-        {
-          const char *rd = (const char *)*state;
-          while (*rd)
-          {
-            if (!strncmp(rd,"\r\n",2))
-            {
-              str.Append("\n");
-              rd+=2;
-            }
-            else
-              str.Append(rd++,1);
-          }
-          ptr = (guchar *)str.Get();
-          len = str.GetLength();
-        }
-        else if (sf == urilistatom())
-        {
-          if (len > (int)sizeof(DROPFILES))
-          {
-            DROPFILES *hdr = (DROPFILES *)ptr;
-            if (WDL_NORMALLY(hdr->pFiles < (DWORD)len) &&
-                WDL_NORMALLY(!hdr->fWide) // todo deal with UTF-16
-            )
-            {
-              const char *rd = (const char *)ptr;
-              DWORD rdo = hdr->pFiles;
-              while (rdo < (DWORD)len && rd[rdo])
-              {
-                const char *fn = rd + rdo;
-                rdo += strlen(rd+rdo)+1;
-                str.Append("file://");
-                while (*fn)
-                {
-                  if (isalnum_safe(*fn) || *fn == '.' || *fn == '_' || *fn == '-' || *fn == '/' || *fn == '#')
-                    str.Append(fn,1);
-                  else
-                    str.AppendFormatted(8,"%%%02x",*(unsigned char *)fn);
-                  fn++;
-                }
-                str.Append("\r\n");
-              }
-            }
-          }
-
-          ptr = (guchar *)str.Get();
-          len = str.GetLength();
-        }
-
+        format_clipboard_data(sf, *state, str);
 #if SWELL_TARGET_GDK == 2
         GdkWindow *pw = gdk_window_lookup(b->requestor);
         if (!pw) pw = gdk_window_foreign_new(b->requestor);
@@ -1689,7 +1673,7 @@ static void OnSelectionRequestEvent(GdkEventSelection *b)
         GdkWindow *pw = b->requestor;
 #endif
         if (pw)
-          gdk_property_change(pw,prop,b->target,8, GDK_PROP_MODE_REPLACE,ptr,len);
+          gdk_property_change(pw,prop,b->target,8, GDK_PROP_MODE_REPLACE,(const guchar*)str.Get(),str.GetLength());
       }
     }
   }
@@ -3666,6 +3650,8 @@ void swell_oswindow_invalidate(HWND hwnd, const RECT *r)
 #ifdef SWELL_TARGET_WAYLAND
 static GtkClipboard *gtk_clipboard;
 static bool clipboard_requested;
+static guint clipboard_generation;
+static void publish_wayland_clipboard();
  
 static GtkClipboard *get_clipboard(void)
 {
@@ -3680,6 +3666,10 @@ bool OpenClipboard(HWND hwndDlg)
   RegisterClipboardFormat(NULL);
   s_clip_hwnd=hwndDlg ? hwndDlg : SWELL_topwindows; 
   s_clipboard_written = false;
+#ifdef SWELL_TARGET_WAYLAND
+  ++clipboard_generation;
+  clipboard_requested = false;
+#endif
 
   GlobalFree(s_clipboard_getstate);
   s_clipboard_getstate = NULL;
@@ -3691,50 +3681,69 @@ bool OpenClipboard(HWND hwndDlg)
 }
 
 #ifdef SWELL_TARGET_WAYLAND
-static void clipboard_received_func(GtkClipboard *cb, GtkSelectionData *data, gpointer user_data)
+static void clipboard_received_func(GtkClipboard *, GtkSelectionData *data, gpointer user_data)
 {
+  if (GPOINTER_TO_UINT(user_data) != clipboard_generation) return;
   clipboard_requested = false;
-
   if (!data) return;
 
   s_clipboard_getstate_fmt = gtk_selection_data_get_target(data);
-  int len = gtk_selection_data_get_length(data);
+  const int len = gtk_selection_data_get_length(data);
   const guchar *bytes = gtk_selection_data_get_data(data);
- 
-  HANDLE h = NULL;
-  if (!bytes || len <= 0) return;
- 
-  if (s_clipboard_getstate_fmt == urilistatom()) // drag and drop from file manager etc
-  {
-    h = urilistToDropFiles(NULL, bytes, len);
-  }
+  if (!bytes || len < 0) return;
+  if (s_clipboard_getstate_fmt == urilistatom())
+    s_clipboard_getstate = urilistToDropFiles(NULL, bytes, len);
   else
   {
-    h = GlobalAlloc(GMEM_MOVEABLE, len);
-    memcpy(GlobalLock(h), bytes, len);
-    GlobalUnlock(h);
+    s_clipboard_getstate = GlobalAlloc(GMEM_MOVEABLE, len);
+    if (s_clipboard_getstate) memcpy(s_clipboard_getstate, bytes, len);
   }
- 
-  GlobalFree(s_clipboard_getstate);
-  s_clipboard_getstate = h;
 }
-#endif
- 
-#ifdef SWELL_TARGET_WAYLAND
+
+static void clipboard_received_text(GtkClipboard *, const gchar *text, gpointer user_data)
+{
+  if (GPOINTER_TO_UINT(user_data) != clipboard_generation) return;
+  clipboard_requested = false;
+  s_clipboard_getstate_fmt = utf8atom();
+  if (!text) return;
+  WDL_FastString str;
+  for (const char *p = text; *p; ++p)
+  {
+    if (*p == '\n' && (p == text || p[-1] != '\r')) str.Append("\r", 1);
+    str.Append(p, 1);
+  }
+  const size_t len = str.GetLength() + 1;
+  s_clipboard_getstate = GlobalAlloc(GMEM_MOVEABLE, len);
+  if (s_clipboard_getstate) memcpy(s_clipboard_getstate, str.Get(), len);
+}
+
 static HANDLE req_wayland_clipboard(GdkAtom type)
 {
   if (s_clipboard_getstate_fmt == type) return s_clipboard_getstate;
-  if (type == tgtatom() && s_clipboard_getstate_fmt == atomatom())
-    return s_clipboard_getstate;
- 
-   if (clipboard_requested)
-     return NULL;
- 
-   clipboard_requested = true;
+  if (type == tgtatom() && s_clipboard_getstate_fmt == atomatom()) return s_clipboard_getstate;
 
-   gtk_clipboard_request_contents( get_clipboard(), type, clipboard_received_func, NULL);
- 
-  return NULL;
+  GlobalFree(s_clipboard_getstate);
+  s_clipboard_getstate = NULL;
+  s_clipboard_getstate_fmt = NULL;
+  const guint request = ++clipboard_generation;
+  clipboard_requested = true;
+  if (type == utf8atom())
+    gtk_clipboard_request_text(get_clipboard(), clipboard_received_text, GUINT_TO_POINTER(request));
+  else
+    gtk_clipboard_request_contents(get_clipboard(), type, clipboard_received_func, GUINT_TO_POINTER(request));
+
+  const gint64 deadline = g_get_monotonic_time() + 500000;
+  GMainContext *ctx = g_main_context_default();
+  while (clipboard_generation == request && clipboard_requested && g_get_monotonic_time() < deadline)
+    if (!g_main_context_iteration(ctx, FALSE)) g_usleep(1000);
+  if (clipboard_generation != request) return NULL;
+  if (clipboard_requested)
+  {
+    ++clipboard_generation;
+    clipboard_requested = false;
+    return NULL;
+  }
+  return s_clipboard_getstate;
 }
 #endif
 
@@ -3809,45 +3818,18 @@ static HANDLE req_clipboard(GdkAtom type)
 
 void CloseClipboard() 
 { 
+#ifdef SWELL_TARGET_WAYLAND
+  if (s_clipboard_written && GDK_IS_WAYLAND_DISPLAY(gdk_display_get_default()))
+    publish_wayland_clipboard();
+#endif
   s_clipboard_written = false;
   s_clipboard_enumstate.DeleteAll();
   s_clip_hwnd=NULL; 
 }
 
-#ifdef SWELL_TARGET_WAYLAND
-static UINT enum_wayland_clipboard_formats(UINT lastfmt)
-{
-  if (lastfmt == 0 && !s_clipboard_enumstate.GetSize())
-  {
-    gtk_clipboard_request_targets(
-      get_clipboard(),
-      [](GtkClipboard *cb, GdkAtom *atoms, gint n_atoms, gpointer user_data)
-      {
-        s_clipboard_enumstate.DeleteAll();
-        for (int i = 0; i < n_atoms; i++)
-        {
-          UINT fmt = clipboard_type_from_atom(atoms[i]);
-          if (fmt)
-          s_clipboard_enumstate.Insert(fmt);
-        }
-      },
-      NULL);
-  }
-
-  int x = 0;
-  UINT fmt;
-  if (lastfmt) while (s_clipboard_enumstate.Enumerate(x++,&fmt) && fmt != lastfmt);
-  return s_clipboard_enumstate.Enumerate(x,&fmt) ? fmt : 0;
-}
-#endif
-
 UINT EnumClipboardFormats(UINT lastfmt)
 {
-#ifdef SWELL_TARGET_WAYLAND
-  if (GDK_IS_WAYLAND_DISPLAY(gdk_display_get_default()))
-    return enum_wayland_clipboard_formats(lastfmt);
-#endif
-  if (lastfmt == 0 && !s_clipboard_enumstate.GetSize())
+  if (lastfmt == 0 && !s_clipboard_written && !s_clipboard_enumstate.GetSize())
   {
     HANDLE h = req_clipboard(tgtatom());
     if (!h) return 0;
@@ -3868,48 +3850,20 @@ UINT EnumClipboardFormats(UINT lastfmt)
   return s_clipboard_enumstate.Enumerate(x,&fmt) ? fmt : 0;
 }
 
-#ifdef SWELL_TARGET_WAYLAND
-static HANDLE get_wayland_clipboard_data(UINT type)
-{
-  RegisterClipboardFormat(NULL);
-
-  GdkAtom a;
-  if (atom_from_clipboard_type(type,&a))
-  {
-    HANDLE h = req_clipboard(a);
-    // we need to wait here for data to arrive or nothing will be pasted 
-    if (!h)
-    {
-      GMainContext *ctx = g_main_context_default();
-      int wait_ms = 0;
-      while (!s_clipboard_getstate && wait_ms < 500)
-      {
-        while (g_main_context_iteration(ctx, FALSE)) {}
-        // this is tricky here, this is minimal to make paste feel instant (from outside of reaper)
-        g_usleep(1000);
-        wait_ms += 10;
-      }
-      h = (s_clipboard_getstate_fmt == a) ? s_clipboard_getstate : NULL;
-    }
-
-    return h;
-  }
-
-  return NULL;
-}
-#endif
-
 HANDLE GetClipboardData(UINT type)
 {
-#ifdef SWELL_TARGET_WAYLAND
-  if (GDK_IS_WAYLAND_DISPLAY(gdk_display_get_default()))
-    return get_wayland_clipboard_data(type);
-#endif
   RegisterClipboardFormat(NULL);
 
   GdkAtom a;
   if (atom_from_clipboard_type(type,&a))
   {
+#ifdef SWELL_TARGET_WAYLAND
+    if (s_clipboard_written && GDK_IS_WAYLAND_DISPLAY(gdk_display_get_default()))
+    {
+      HANDLE *state = find_clipboard_setstate(a);
+      return state ? *state : NULL;
+    }
+#endif
     return req_clipboard(a);
   }
 
@@ -3922,19 +3876,45 @@ void EmptyClipboard()
     GlobalFree(s_clipboard_setstate_data.Get()[x]);
   s_clipboard_setstate.Resize(0);
   s_clipboard_setstate_data.Resize(0);
-}
-
 #ifdef SWELL_TARGET_WAYLAND
-static void clipboard_get_func(GtkClipboard *clipboard, GtkSelectionData *selection_data, guint info, gpointer user_data)
-{
-  HANDLE handle = (HANDLE)user_data;
-  guchar *data = (guchar*)GlobalLock(handle);
-  gtk_selection_data_set(selection_data, gdk_atom_intern("application/octet-stream", FALSE), 8, data, GlobalSize(handle));
-  GlobalUnlock(handle);
-}
+  if (GDK_IS_WAYLAND_DISPLAY(gdk_display_get_default()))
+  {
+    s_clipboard_written = true;
+    s_clipboard_enumstate.DeleteAll();
+  }
 #endif
+}
 
 #ifdef SWELL_TARGET_WAYLAND
+static void clipboard_get_func(GtkClipboard *, GtkSelectionData *data, guint, gpointer)
+{
+  GdkAtom target = gtk_selection_data_get_target(data);
+  const bool text = gtk_targets_include_text(&target, 1);
+  HANDLE *handle = find_clipboard_setstate(text ? utf8atom() : target);
+  if (!handle) return;
+  WDL_FastString str;
+  format_clipboard_data(text ? utf8atom() : target, *handle, str);
+  if (text) gtk_selection_data_set_text(data, str.Get(), str.GetLength());
+  else gtk_selection_data_set(data, target, 8, (const guchar*)str.Get(), str.GetLength());
+}
+
+static void publish_wayland_clipboard()
+{
+  GtkTargetList *list = gtk_target_list_new(NULL, 0);
+  for (int i = 0; i < s_clipboard_setstate.GetSize(); ++i)
+  {
+    GdkAtom target = s_clipboard_setstate.Get()[i];
+    if (target == utf8atom()) gtk_target_list_add_text_targets(list, 0);
+    else gtk_target_list_add(list, target, 0, 0);
+  }
+  gint count;
+  GtkTargetEntry empty = {};
+  GtkTargetEntry *targets = gtk_target_table_new_from_list(list, &count);
+  gtk_clipboard_set_with_data(get_clipboard(), targets ? targets : &empty, count, clipboard_get_func, NULL, NULL);
+  gtk_target_table_free(targets, count);
+  gtk_target_list_unref(list);
+}
+
 static void set_wayland_clipboard_data(UINT type, HANDLE h)
 {
   RegisterClipboardFormat(NULL);
@@ -3953,19 +3933,8 @@ static void set_wayland_clipboard_data(UINT type, HANDLE h)
       *state = h;
     }
 
-    GtkClipboard *cb = get_clipboard();
-    if (!s_clipboard_written)
-    {
-      s_clipboard_written = true;
-      s_clipboard_enumstate.DeleteAll();
- 
-      GtkTargetEntry target_entry;
-      target_entry.target = (gchar*)gdk_atom_name(a);
-      target_entry.flags = 0;
-      target_entry.info = 0;
-
-      gtk_clipboard_set_with_data(cb, &target_entry, 1, clipboard_get_func, NULL, h);
-    }
+    if (!s_clipboard_written) s_clipboard_enumstate.DeleteAll();
+    s_clipboard_written = true;
     if (WDL_NORMALLY(type != 0))
       s_clipboard_enumstate.Insert(type);
   }
