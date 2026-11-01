@@ -329,8 +329,10 @@ static void swell_wayland_scale_changed(GtkWidget *widget, GParamSpec *, gpointe
   GdkEventConfigure cfg = {};
   cfg.window = hwnd->m_oswindow;
   gdk_window_get_geometry(cfg.window, &cfg.x, &cfg.y, &cfg.width, &cfg.height);
+  hwnd->Retain();
   OnConfigureEvent(&cfg);
-  InvalidateRect(hwnd, NULL, FALSE);
+  if (!hwnd->m_hashaddestroy) InvalidateRect(hwnd, NULL, FALSE);
+  hwnd->Release();
 }
 
 // Wayland allows only one popup per parent. Tooltip and a
@@ -626,7 +628,11 @@ void swell_recalcMinMaxInfo(HWND hwnd)
     mmi.ptMaxSize.x = mmi.ptMaxTrackSize.x = 16384;
     mmi.ptMinTrackSize.y = 20;
     mmi.ptMaxSize.y = mmi.ptMaxTrackSize.y = 16384;
+    hwnd->Retain();
     SendMessage(hwnd,WM_GETMINMAXINFO,0,(LPARAM)&mmi);
+    const bool destroyed = hwnd->m_hashaddestroy != 0;
+    hwnd->Release();
+    if (destroyed) return;
   }
   else
   {
@@ -2016,10 +2022,12 @@ static void OnConfigureEvent(GdkEventConfigure *cfg)
   hwnd->m_position.top = cfg_y;
   hwnd->m_position.right = cfg_x + cfg_width;
   hwnd->m_position.bottom = cfg_y + cfg_height;
+  hwnd->Retain();
   if (flag&1) SendMessage(hwnd,WM_MOVE,0,0);
   if (flag&2) SendMessage(hwnd,WM_SIZE,hwnd->m_is_maximized ? SIZE_MAXIMIZED : SIZE_RESTORED,0);
   if (!hwnd->m_hashaddestroy && hwnd->m_oswindow && (hwnd->m_style & WS_THICKFRAME))
     swell_recalcMinMaxInfo(hwnd);
+  hwnd->Release();
 }
 
 static void OnWindowStateEvent(GdkEventWindowState *evt)

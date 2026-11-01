@@ -705,6 +705,7 @@ void GetClientRect(HWND hwnd, RECT *r)
 void SetWindowPos(HWND hwnd, HWND zorder, int x, int y, int cx, int cy, int flags)
 {
   if (WDL_NOT_NORMALLY(!hwnd)) return;
+  hwnd->Retain();
  // todo: handle SWP_SHOWWINDOW
   RECT f = hwnd->m_position;
   int reposflag = 0;
@@ -789,10 +790,12 @@ void SetWindowPos(HWND hwnd, HWND zorder, int x, int y, int cx, int cy, int flag
     else
     {
       if (reposflag&2) SendMessage(hwnd,WM_SIZE,SIZE_RESTORED,0);
-      InvalidateRect(hwnd->m_parent ? hwnd->m_parent : hwnd,NULL,FALSE);
+      if (!hwnd->m_hashaddestroy)
+        InvalidateRect(hwnd->m_parent ? hwnd->m_parent : hwnd,NULL,FALSE);
     }
   }
-  swell_oswindow_postresize(hwnd,f);
+  if (!hwnd->m_hashaddestroy) swell_oswindow_postresize(hwnd,f);
+  hwnd->Release();
 }
 
 
