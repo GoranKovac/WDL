@@ -109,6 +109,7 @@ LICE_OBJS = lice.o  lice_arc.o lice_colorspace.o lice_line.o lice_text.o \
 OBJS = $(SWELL_OBJS)
 
 ifndef NOGDK
+  SWELL_OBJS += swell-generic-x11.o
   CFLAGS += $(shell $(PKG_CONFIG) --cflags x11-xcb xcb-icccm xcb-xinput)
   LINKEXTRA += $(shell $(PKG_CONFIG) --libs x11-xcb xcb-icccm xcb-xinput)
   ifdef GDK2
@@ -122,7 +123,7 @@ ifndef NOGDK
   else
     #Wayland (SWELL_TARGET_WAYLAND) depends on GTK3 so load it automatically
     ifdef WAYLAND
-      SWELL_OBJS += xwayland-bridge.o xwayland-bridge-wm.o xwayland-bridge-display.o xwayland-bridge-gl.o xwayland-bridge-image.o
+      SWELL_OBJS += swell-generic-wayland.o xwayland-bridge.o xwayland-bridge-wm.o xwayland-bridge-display.o xwayland-bridge-gl.o xwayland-bridge-image.o
       CFLAGS += $(shell $(PKG_CONFIG) --cflags wayland-client wayland-egl xcb-keysyms xcb-randr xcb-damage xcb-shape xcb-shm xcb-dri3 xcb-sync xcb-composite xcb-ewmh xcb-icccm xcb-xtest xcb-xfixes xcb-image xcb-renderutil cairo-xcb epoxy libdrm)
       LINKEXTRA += $(shell $(PKG_CONFIG) --libs wayland-client wayland-egl xcb-keysyms xcb-randr xcb-damage xcb-shape xcb-shm xcb-dri3 xcb-sync xcb-composite xcb-ewmh xcb-icccm xcb-xtest xcb-xfixes xcb-image xcb-renderutil cairo-xcb epoxy libdrm)
       override SWELL_GDK_ONLY =
@@ -193,9 +194,11 @@ swell-kb-generic.o: $(SWELL_HEADERS)
 swell-miscdlg-generic.o: $(SWELL_HEADERS)
 swell-modstub-generic.o: $(SWELL_HEADERS)
 swell-appstub-generic.o: $(SWELL_HEADERS)
-swell-generic-gdk.o xwayland-bridge.o: $(SWELL_HEADERS)
-swell-generic-gdk.o: swell-xcb.h
-swell-generic-gdk.o xwayland-bridge.o: xwayland-bridge.h
+swell-generic-gdk.o xwayland-bridge.o swell-generic-x11.o swell-generic-wayland.o: $(SWELL_HEADERS)
+swell-generic-gdk.o swell-generic-x11.o: swell-x11.h swell-xcb.h
+swell-generic-gdk.o swell-generic-x11.o swell-generic-wayland.o: swell-gdk.h
+swell-generic-gdk.o swell-generic-wayland.o xwayland-bridge.o: swell-wayland.h
+swell-generic-gdk.o xwayland-bridge.o swell-generic-wayland.o: xwayland-bridge.h
 xwayland-bridge.o xwayland-bridge-wm.o: xwayland-bridge-wm.h swell-xcb.h
 xwayland-bridge-wm.o xwayland-bridge-display.o: xwayland-bridge-display.h
 xwayland-bridge.o xwayland-bridge-gl.o: xwayland-bridge-gl.h

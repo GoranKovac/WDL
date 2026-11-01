@@ -4,8 +4,12 @@
 #define DEBUG_PRINT(...) ((void)0)
 #endif
 #include <gdk/gdkwayland.h>
+#include <algorithm>
 #include <list>
+#include "xwayland-bridge-wm.h"
 #include "xwayland-bridge.h"
+#include "swell-wayland.h"
+#include "swell-internal.h"
 #include "xwayland-bridge-gl.h"
 #include "swell-gdk-scale.h"
 #include <xcb/xcb_renderutil.h>
@@ -20,7 +24,6 @@
 #include <stdint.h>
 #include <unistd.h>
 void xw_size(HWND hwnd);
-
 
 struct Capture {
     CapturePixmap pixmap;
