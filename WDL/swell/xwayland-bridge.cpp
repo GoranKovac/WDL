@@ -1512,6 +1512,8 @@ static void xw_fixed_init(XwFixed *)
 // A true toplevel (h->m_oswidget already set by SWELL itself) is the recursion's
 // base case -- we never touch m_oswidget, only ever read it. Returns the widget to
 // embed into, or nullptr if something in the chain isn't embeddable.
+static void detach_bridge_widgets(GtkWidget *widget);
+
 static GtkWidget* xw_ensure_embed_widget(HWND h)
 {
     if (!h) return nullptr;
@@ -1545,28 +1547,25 @@ static GtkWidget* xw_ensure_embed_widget(HWND h)
     const int x = swell_gdk_floor(h->m_position.left, scale);
     const int y = swell_gdk_floor(h->m_position.top, scale);
 
-    GtkWidget *existing = (GtkWidget*)GetProp(h, "XBridgeEmbedFixed");
-
-    if (existing && GTK_IS_WIDGET(existing) && gtk_widget_get_parent(existing) != parent_widget) {
-        existing = nullptr;
-    }
-
-    if (existing && GTK_IS_WIDGET(existing)) {
+    GtkWidget *existing = (GtkWidget*)g_object_get_data(G_OBJECT(parent_widget), "xw-active-embed-fixed");
+    if (existing && g_object_get_data(G_OBJECT(existing), "xw-embed-hwnd") == h &&
+        gtk_widget_get_parent(existing) == parent_widget) {
         gtk_fixed_move(GTK_FIXED(parent_widget), existing, x, y);
         return existing;
     }
 
-    GtkWidget *prev_fixed = (GtkWidget*)g_object_get_data(G_OBJECT(parent_widget), "xw-active-embed-fixed");
-    if (prev_fixed && GTK_IS_WIDGET(prev_fixed) && prev_fixed != existing) {
-        gtk_widget_destroy(prev_fixed);
+    if (existing) {
+        detach_bridge_widgets(existing);
+        gtk_widget_destroy(existing);
     }
 
     GtkWidget *fixed = gtk_fixed_new();
     gtk_fixed_put(GTK_FIXED(parent_widget), fixed, x, y);
     gtk_widget_show(fixed);
 
-    g_object_set_data(G_OBJECT(parent_widget), "xw-active-embed-fixed", fixed);
-    SetProp(h, "XBridgeEmbedFixed", (HANDLE)fixed);
+    g_object_set_data(G_OBJECT(fixed), "xw-embed-hwnd", h);
+    g_object_set_data_full(G_OBJECT(parent_widget), "xw-active-embed-fixed", g_object_ref(fixed),
+                          [](gpointer widget) { g_object_unref(widget); });
     return fixed;
 }
 
@@ -1650,8 +1649,8 @@ void xw_destroy(HWND hwnd)
     }
     if (hwnd->m_oswidget && GTK_IS_WIDGET(hwnd->m_oswidget)) {
         g_signal_handlers_disconnect_by_data(hwnd->m_oswidget, hwnd);
-        g_object_remove_weak_pointer(G_OBJECT(hwnd->m_oswidget), (gpointer*)&hwnd->m_oswidget);
         gtk_widget_destroy(hwnd->m_oswidget);
+        g_object_unref(hwnd->m_oswidget);
         hwnd->m_oswidget = nullptr;
     }
     delete bs;
@@ -1672,13 +1671,7 @@ void xw_size(HWND hwnd)
     //         bs->cur_parent = h->m_oswindow;
     //
     // SWELL replaces the host toplevel when the FX window is floated/unfloated
-    // from the FX list. swell_oswindow_destroy() destroys the
-    // GdkWindow and nulls m_oswidget, then swell_oswindow_manage() builds a
-    // fresh GtkWindow. Our drawing area stays in the discarded one: GTK still
-    // reports it parented with a GtkWindow toplevel, but at the GDK level its
-    // parent is NULL and the old toplevel's window reads back freed memory, so
-    // it is never drawn again -- a live pixmap full of plugin content with
-    // nothing painting it, recoverable only by reopening the plugin.
+    // from the FX list. Reattach the drawing area to the new GtkWindow.
     //
     // Doing this here rather than from the damage callback matters: xw_size
     // runs on WM_SIZE/WM_MOVE, after SWELL has finished rebuilding the window,
@@ -1688,7 +1681,7 @@ void xw_size(HWND hwnd)
         // Re-resolve the embed container every time and re-place if it moved.
         // Fixed float/unfloat in fx list view
         GtkWidget *fresh = xw_ensure_embed_widget(hwnd->m_parent);
-        if (fresh && fresh != bs->embed_container) {
+        if (fresh != bs->embed_container || gtk_widget_get_parent(hwnd->m_oswidget) != fresh) {
             DEBUG_PRINT("[REPARENT] embed container %p -> %p, re-placing\n",
                         (void*)bs->embed_container, (void*)fresh);
             bs->embed_container = fresh;
@@ -1832,6 +1825,27 @@ static void xw_view_init(XwView *)
 {
 }
 
+static void detach_bridge_widgets(GtkWidget *widget)
+{
+    if (G_TYPE_CHECK_INSTANCE_TYPE(widget, xw_view_get_type())) {
+        GtkWidget *parent = gtk_widget_get_parent(widget);
+        if (parent) {
+            g_signal_handlers_block_matched(widget, G_SIGNAL_MATCH_FUNC, 0, 0, NULL, (gpointer)xw_scale_changed, NULL);
+            gtk_container_remove(GTK_CONTAINER(parent), widget);
+            g_signal_handlers_unblock_matched(widget, G_SIGNAL_MATCH_FUNC, 0, 0, NULL, (gpointer)xw_scale_changed, NULL);
+        }
+    } else if (GTK_IS_CONTAINER(widget)) {
+        GList *children = gtk_container_get_children(GTK_CONTAINER(widget));
+        for (GList *p = children; p; p = p->next) detach_bridge_widgets(GTK_WIDGET(p->data));
+        g_list_free(children);
+    }
+}
+
+void xw_bridge_detach_children(HWND hwnd)
+{
+    detach_bridge_widgets(hwnd->m_oswidget);
+}
+
 HWND xw_bridge_create(HWND viewpar, void **wref, const RECT *r, const char *bridge_class_name)
 {
     HWND hwnd = nullptr;
@@ -1866,14 +1880,13 @@ HWND xw_bridge_create(HWND viewpar, void **wref, const RECT *r, const char *brid
     xcb_flush(connection);
 
     GtkWidget *draw_area = GTK_WIDGET(g_object_new(xw_view_get_type(), nullptr));
+    g_object_ref_sink(draw_area);
     const int scale = swell_gdk_widget_scale(parent ? parent->m_oswidget : NULL);
     gtk_widget_set_size_request(draw_area, swell_gdk_ceil(w, scale), swell_gdk_ceil(h, scale));
 
     hwnd = new HWND__(viewpar, 0, r, NULL, true, xw_bridgeProc);
     hwnd->m_classname = bridge_class_name;
     hwnd->m_oswidget  = draw_area;
-
-    g_object_add_weak_pointer(G_OBJECT(draw_area), (gpointer*)&hwnd->m_oswidget);
 
     bridgeState *bs = new bridgeState();
     bs->connection   = connection;

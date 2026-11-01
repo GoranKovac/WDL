@@ -27,6 +27,7 @@ extern int g_swell_wayland_title_h;
 extern int SWELL_WAYLAND_BORDER_WIDTH;
 
 void init_private_xwayland();
+void xw_bridge_detach_children(HWND hwnd);
 HWND xw_bridge_create(
     HWND viewpar,
     void **wref,
