@@ -11,7 +11,7 @@
 
 // ─── Atoms we manage ─────────────────────────────────────────────────────────
 struct WMAtoms : xcb_ewmh_connection_t {
-    xcb_atom_t WM_DELETE_WINDOW, WM_TAKE_FOCUS, WM_STATE;
+    xcb_atom_t WM_DELETE_WINDOW, WM_TAKE_FOCUS, WM_STATE, WM_S0;
     xcb_atom_t _XWAYLAND_ALLOW_COMMITS, _REAPERX_TIMESTAMP;
     xcb_atom_t XdndSelection, XdndAware, XdndEnter, XdndPosition;
     xcb_atom_t XdndStatus, XdndDrop, XdndFinished, XdndLeave, XdndActionCopy;
@@ -39,7 +39,7 @@ public:
     enum WindowType { NORMAL, POPUP, DRAG_ICON };
     WindowType window_type(xcb_window_t window, bool override_redirect);
 
-    // One-shot bring-up: spawn Xwayland on a free display, open the WM
+    // One-shot bring-up: spawn Xwayland, open the WM
     // connection, construct + announce the WM, and attach a
     // GIO watch that pumps events on the GLib main loop. Returns the global WM
     // instance (also stored in g_wm) or nullptr on failure. Infrastructure that

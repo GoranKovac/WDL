@@ -10,6 +10,7 @@
 
 #include <wayland-client.h>
 #include <sys/socket.h>
+#include <sys/un.h>
 #include <fcntl.h>
 #include <errno.h>
 #include <stdint.h>
@@ -159,9 +160,47 @@ static void relay_wayland(std::shared_ptr<WaylandConnection> connection, bool fr
     connection->stop();
 }
 
-pid_t xw_spawn_xwayland(char *display_name, size_t size)
+static char *socket_directory;
+static sockaddr_un socket_address;
+
+static void remove_xwayland_socket()
 {
-    if (size < 3) return -1;
+    if (!socket_directory) return;
+    unlink(socket_address.sun_path);
+    rmdir(socket_directory);
+    g_free(socket_directory);
+    socket_directory = nullptr;
+}
+
+static int create_xwayland_socket(char *display_name, size_t size)
+{
+    remove_xwayland_socket();
+    socket_directory = g_build_filename(g_get_user_runtime_dir(), "swell-xwayland-XXXXXX", nullptr);
+    if (!g_mkdtemp(socket_directory)) {
+        g_free(socket_directory);
+        socket_directory = nullptr;
+        return -1;
+    }
+    socket_address.sun_family = AF_UNIX;
+    const int length = snprintf(socket_address.sun_path, sizeof(socket_address.sun_path), "%s/X", socket_directory);
+    if (length < 0 || (size_t)length >= sizeof(socket_address.sun_path) || (size_t)length >= size) {
+        socket_address.sun_path[0] = 0;
+        remove_xwayland_socket();
+        return -1;
+    }
+    const int fd = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
+    if (fd < 0 || bind(fd, (sockaddr*)&socket_address, sizeof(socket_address)) < 0 || listen(fd, SOMAXCONN) < 0) {
+        if (fd >= 0) close(fd);
+        remove_xwayland_socket();
+        return -1;
+    }
+    memcpy(display_name, socket_address.sun_path, length + 1);
+    return fd;
+}
+
+pid_t xw_spawn_xwayland(char *display_name, size_t size, int *wm_fd)
+{
+    *wm_fd = -1;
     wl_display *display = wl_display_connect(nullptr);
     if (!display) return -1;
     int sockets[2];
@@ -176,35 +215,45 @@ pid_t xw_spawn_xwayland(char *display_name, size_t size)
         close(sockets[1]);
         return -1;
     }
-    int ready[2];
-    if (pipe2(ready, O_CLOEXEC) < 0) {
-        close(sockets[1]);
+    int ready[2] = { -1, -1 }, wm[2] = { -1, -1 };
+    const int listener = create_xwayland_socket(display_name, size);
+    if (listener < 0 || pipe2(ready, O_CLOEXEC) < 0 ||
+        socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, wm) < 0) {
+        for (int fd : { listener, ready[0], ready[1], wm[0], wm[1], sockets[1] })
+            if (fd >= 0) close(fd);
+        remove_xwayland_socket();
         return -1;
     }
-    char ready_fd[32], socket_env[64];
+    char ready_fd[32], wm_fd_string[32], listener_fd[32], socket_env[64];
     snprintf(ready_fd, sizeof(ready_fd), "%d", ready[1]);
+    snprintf(wm_fd_string, sizeof(wm_fd_string), "%d", wm[1]);
+    snprintf(listener_fd, sizeof(listener_fd), "%d", listener);
     snprintf(socket_env, sizeof(socket_env), "WAYLAND_SOCKET=%d", sockets[1]);
     extern char **environ;
     std::vector<char*> env;
     for (char **p = environ; *p; ++p)
-        if (strncmp(*p, "WAYLAND_SOCKET=", 15)) env.push_back(*p);
+        if (strncmp(*p, "WAYLAND_SOCKET=", 15) && strncmp(*p, "DISPLAY=", 8)) env.push_back(*p);
     env.push_back(socket_env);
     env.push_back(nullptr);
     char *args[] = { (char*)"Xwayland", (char*)"-displayfd", ready_fd,
+                     (char*)"-wm", wm_fd_string, (char*)"-listenfd", listener_fd,
                      (char*)"-rootless", (char*)"-nolisten", (char*)"tcp", nullptr };
     const pid_t parent = getpid();
     const pid_t pid = fork();
     if (pid == 0) {
         if (prctl(PR_SET_PDEATHSIG, SIGTERM) < 0 || getppid() != parent) _exit(1);
         close(ready[0]);
-        if (fcntl(ready[1], F_SETFD, 0) < 0) _exit(1);
+        close(wm[0]);
         close(sockets[0]);
         close(server);
-        if (fcntl(sockets[1], F_SETFD, 0) < 0) _exit(1);
+        for (int fd : { ready[1], wm[1], listener, sockets[1] })
+            if (fcntl(fd, F_SETFD, 0) < 0) _exit(1);
         execve("/usr/bin/Xwayland", args, env.data());
         _exit(1);
     }
     close(ready[1]);
+    close(wm[1]);
+    close(listener);
     close(sockets[1]);
     if (pid > 0) {
         std::thread to_server, to_client;
@@ -213,41 +262,47 @@ pid_t xw_spawn_xwayland(char *display_name, size_t size)
             to_client = std::thread(relay_wayland, connection, true);
         } catch (...) {
             close(ready[0]);
+            close(wm[0]);
             connection->stop();
             if (to_server.joinable()) to_server.join();
             if (to_client.joinable()) to_client.join();
             kill(pid, SIGTERM);
             while (waitpid(pid, nullptr, 0) < 0 && errno == EINTR) {}
+            remove_xwayland_socket();
             return -1;
         }
         to_server.detach();
         to_client.detach();
     }
-    display_name[0] = ':';
-    size_t length = 1;
+    char display_number[32];
+    size_t length = 0;
     const gint64 deadline = g_get_monotonic_time() + 10000000;
-    while (pid > 0 && length < size) {
+    while (pid > 0 && length < sizeof(display_number)) {
         const int remaining = (deadline - g_get_monotonic_time()) / 1000;
         if (remaining <= 0) break;
         pollfd fd = { ready[0], POLLIN, 0 };
         const int result = poll(&fd, 1, remaining);
         if (result < 0 && errno == EINTR) continue;
         if (result <= 0) break;
-        const ssize_t count = read(ready[0], display_name + length, size - length);
+        const ssize_t count = read(ready[0], display_number + length, sizeof(display_number) - length);
         if (count < 0 && errno == EINTR) continue;
         if (count <= 0) break;
         length += count;
-        if (display_name[length - 1] == '\n') {
-            display_name[--length] = 0;
-            if (length <= 1 || strspn(display_name + 1, "0123456789") != length - 1) break;
+        if (display_number[length - 1] == '\n') {
+            display_number[--length] = 0;
+            if (!length || strspn(display_number, "0123456789") != length) break;
             close(ready[0]);
+            *wm_fd = wm[0];
+            atexit(remove_xwayland_socket);
             return pid;
         }
     }
     close(ready[0]);
+    close(wm[0]);
     if (pid > 0) {
         kill(pid, SIGTERM);
         while (waitpid(pid, nullptr, 0) < 0 && errno == EINTR) {}
     }
+    remove_xwayland_socket();
     return -1;
 }
