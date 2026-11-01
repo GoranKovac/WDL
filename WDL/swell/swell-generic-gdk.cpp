@@ -593,6 +593,25 @@ void swell_oswindow_focus(HWND hwnd)
   }
 }
 
+void swell_gdk_close(HWND hwnd)
+{
+  if (!hwnd) return;
+  hwnd->Retain();
+#ifdef SWELL_TARGET_WAYLAND
+  // Destroy the plugin popup's overlay canvas (an xdg_popup on Wayland) and
+  // release the plugin's :10 grab BEFORE closing. If the xdg_popup is still
+  // mapped when its parent (the FX window) closes, the compositor raises a
+  // protocol error that kills GTK's Wayland connection and hangs REAPER. With
+  // the canvas destroyed first, the close can proceed normally.
+  xw_bridge_swell_on_gdk_delete_release(hwnd);
+#endif
+  if (IsWindowEnabled(hwnd) &&
+      !DestroyPopupMenus() && // ignore if a menu is open, instead just close the menu
+      !SendMessage(hwnd,WM_CLOSE,0,0))
+    SendMessage(hwnd,WM_COMMAND,IDCANCEL,0);
+  hwnd->Release();
+}
+
 void swell_recalcMinMaxInfo(HWND hwnd)
 {
   if (!hwnd || !hwnd->m_oswindow || !(hwnd->m_style & WS_CAPTION)) return;
@@ -2709,8 +2728,7 @@ static void OnButtonEvent(GdkEventButton *b)
     }
     if (hit == 1)
     {
-      if (IsWindowEnabled(hwnd) && !DestroyPopupMenus() && !SendMessage(hwnd,WM_CLOSE,0,0))
-        SendMessage(hwnd,WM_COMMAND,IDCANCEL,0);
+      swell_gdk_close(hwnd);
       return;
     }
     else if (hit == 3)
@@ -3007,6 +3025,9 @@ static void swell_gdkEventHandler(GdkEvent *evt, gpointer data)
 #endif
   GdkEvent *oldEvt = s_cur_evt;
   s_cur_evt = evt;
+#ifdef SWELL_SUPPORT_GTK
+  const bool swell_delete = evt->type == GDK_DELETE && swell_oswindow_to_hwnd(evt->any.window);
+#endif
 
   switch (evt->type)
   {
@@ -3057,18 +3078,7 @@ static void swell_gdkEventHandler(GdkEvent *evt, gpointer data)
     case GDK_DELETE:
      {
        HWND hwnd = swell_oswindow_to_hwnd(((GdkEventAny*)evt)->window);
-#ifdef SWELL_TARGET_WAYLAND
-       // Destroy the plugin popup's overlay canvas (an xdg_popup on Wayland) and
-       // release the plugin's :10 grab BEFORE closing. If the xdg_popup is still
-       // mapped when its parent (the FX window) closes, the compositor raises a
-       // protocol error that kills GTK's Wayland connection and hangs REAPER. With
-       // the canvas destroyed first, the close can proceed normally.
-       xw_bridge_swell_on_gdk_delete_release();
-#endif
-       if (hwnd && IsWindowEnabled(hwnd) &&
-           !DestroyPopupMenus() && // ignore if a menu is open, instead just close the menu
-           !SendMessage(hwnd,WM_CLOSE,0,0))
-        SendMessage(hwnd,WM_COMMAND,IDCANCEL,0);
+       swell_gdk_close(hwnd);
      }
     break;
     case GDK_EXPOSE: // paint! GdkEventExpose...
@@ -3217,13 +3227,13 @@ static void swell_gdkEventHandler(GdkEvent *evt, gpointer data)
     break;
   }
 #ifdef SWELL_SUPPORT_GTK
-  // Do NOT hand GDK_DELETE to GTK's default handler: SWELL already processed it
+  // Do NOT hand SWELL's GDK_DELETE to GTK's default handler: SWELL already processed it
   // above (the WM_CLOSE path). GTK's default delete handler runs g_object_run_dispose
   // on the window (hide/withdraw/destroy), which tears the window down itself —
   // "window closes but process keeps running". On X11 the modal grab happened to
   // stop GTK from routing the delete here; on Wayland (no grab) it reached this and
   // disposed the window. Skipping it is correct on both.
-  if (evt->type != GDK_DELETE && swell_gtk_main_do_event)
+  if (!swell_delete && swell_gtk_main_do_event)
     swell_gtk_main_do_event(evt);
 #endif
 #ifdef SWELL_TARGET_WAYLAND

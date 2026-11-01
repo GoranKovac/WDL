@@ -999,6 +999,26 @@ static void canvas_remove_popup(Capture *c, xcb_window_t x11_win)
 
 struct ModalRender { Capture *cap; xcb_window_t x11_win; };
 
+static void modal_request_close(Capture *c, xcb_window_t window)
+{
+    xcb_client_message_event_t event = {};
+    event.response_type = XCB_CLIENT_MESSAGE;
+    event.window = window;
+    event.type = g_wm->atoms().WM_PROTOCOLS;
+    event.format = 32;
+    event.data.data32[0] = g_wm->atoms().WM_DELETE_WINDOW;
+    event.data.data32[1] = XCB_CURRENT_TIME;
+    xcb_send_event(c->connection, false, window, XCB_EVENT_MASK_NO_EVENT, (const char*)&event);
+    xcb_flush(c->connection);
+}
+
+static gboolean modal_delete_cb(GtkWidget *, GdkEvent *, gpointer data)
+{
+    ModalRender *m = (ModalRender*)data;
+    modal_request_close(m->cap, m->x11_win);
+    return TRUE;
+}
+
 static bool modal_draw_cb(GtkWidget *widget, cairo_t *cr, gpointer data)
 {
     ModalRender *m = (ModalRender*)data;
@@ -1111,7 +1131,8 @@ static void create_modal(Capture *state, xcb_window_t win, xcb_get_geometry_repl
     g_signal_connect(draw, "motion-notify-event",  G_CALLBACK(modal_motion),         mr);
     g_signal_connect(draw, "key-press-event",      G_CALLBACK(modal_key),            mr);
     g_signal_connect(draw, "key-release-event",    G_CALLBACK(modal_key),            mr);
-    g_signal_connect_data(draw, "draw", G_CALLBACK(modal_draw_cb), mr, modal_render_destroy, (GConnectFlags)0);
+    g_signal_connect(draw, "draw", G_CALLBACK(modal_draw_cb), mr);
+    g_signal_connect_data(gtk_win, "delete-event", G_CALLBACK(modal_delete_cb), mr, modal_render_destroy, (GConnectFlags)0);
 
     gtk_widget_show_all(gtk_win);
     gtk_widget_grab_focus(draw);
@@ -1425,12 +1446,15 @@ bool xw_bridge_swell_on_button_event_escape()
     return any;
 }
 
-bool xw_bridge_swell_on_gdk_delete_release()
+bool xw_bridge_swell_on_gdk_delete_release(HWND hwnd)
 {
     bool any = false;
     for (auto &kv : g_captures) {
         Capture *c = kv.second;
         if (!c || kv.first != c->parent_win) continue;
+        HWND owner = c->hwnd;
+        while (owner && owner != hwnd) owner = owner->m_parent ? owner->m_parent : owner->m_owner;
+        if (!owner) continue;
         if (!c->popups.empty()) {
             any = true;
             // Tell the plugin to close its menu FIRST, while we still have the popup
@@ -1455,14 +1479,7 @@ bool xw_bridge_swell_on_gdk_delete_release()
             for (auto &md : c->modals) {
                 if (!md.x11_win) continue;
                 any = true;
-                xcb_client_message_event_t event = {};
-                event.response_type = XCB_CLIENT_MESSAGE;
-                event.window = md.x11_win;
-                event.type = g_wm->atoms().WM_PROTOCOLS;
-                event.format = 32;
-                event.data.data32[0] = g_wm->atoms().WM_DELETE_WINDOW;
-                event.data.data32[1] = XCB_CURRENT_TIME;
-                xcb_send_event(c->connection, false, md.x11_win, XCB_EVENT_MASK_NO_EVENT, (const char*)&event);
+                modal_request_close(c, md.x11_win);
             }
             xcb_flush(c->connection);
         }
