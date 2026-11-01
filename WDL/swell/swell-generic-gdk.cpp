@@ -428,7 +428,11 @@ static void on_deactivate()
 {
   swell_app_is_inactive=true;
   HWND lf = swell_oswindow_to_hwnd(SWELL_focused_oswindow);
-  s_last_desktop = lf && lf->m_oswindow ? _gdk_x11_window_get_desktop(lf->m_oswindow)+1 : 0;
+  s_last_desktop = 0;
+#ifdef SWELL_TARGET_WAYLAND
+  if (!GDK_IS_WAYLAND_DISPLAY(gdk_display_get_default()))
+#endif
+    if (lf && lf->m_oswindow) s_last_desktop = _gdk_x11_window_get_desktop(lf->m_oswindow)+1;
 
   HWND h = SWELL_topwindows; 
   while (h)
@@ -900,6 +904,7 @@ static void init_options()
     if (wayland_display && *wayland_display) gdk_options |= OPTION_IS_WAYLAND;
 
 #ifdef SWELL_TARGET_WAYLAND
+    if (GDK_IS_WAYLAND_DISPLAY(gdk_display_get_default())) gdk_options |= OPTION_IS_WAYLAND;
     swell_wayland_init_application_id();
     swell_wayland_init_titlebar_height();
     swell_wayland_suppress_csd_shadow_once();
@@ -928,7 +933,11 @@ static void init_options()
       default: break;
     }
 
-    const char *wmname = gdk_x11_screen_get_window_manager_name(gdk_screen_get_default());
+    const char *wmname = NULL;
+#ifdef SWELL_TARGET_WAYLAND
+    if (!GDK_IS_WAYLAND_DISPLAY(gdk_display_get_default()))
+#endif
+      wmname = gdk_x11_screen_get_window_manager_name(gdk_screen_get_default());
     switch (swell_gdk_option("gdk_fullscreen_for_owner_windows", "auto (default is 1 on kwin, otherwise 0)",-1))
     {
       case -1:
@@ -1329,6 +1338,9 @@ void swell_oswindow_manage(HWND hwnd, bool wantfocus)
           }
 
           if (s_force_window_time)
+#ifdef SWELL_TARGET_WAYLAND
+            if (!gtk_win)
+#endif
             gdk_x11_window_set_user_time(hwnd->m_oswindow,s_force_window_time);
 
           if (!wantfocus || swell_app_is_inactive)
