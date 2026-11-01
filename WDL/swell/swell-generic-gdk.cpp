@@ -1915,6 +1915,7 @@ static gboolean swell_wayland_draw(GtkWidget *widget, cairo_t *cr, gpointer data
   cairo_save(cr);
   cairo_region_t *region = gdk_window_get_visible_region(window);
   xw_clip_capture_regions(window, region);
+  gdk_window_set_opaque_region(window, gtk_widget_get_opacity(widget) == 1.0 ? region : NULL);
   gdk_cairo_region(cr, region);
   cairo_region_destroy(region);
   cairo_clip(cr);
