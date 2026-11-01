@@ -355,10 +355,12 @@ void xw_raise_modals()
         for (auto &md : c->modals)
             if (md.gtk_win)
             {
+                swell_xcb_raise(wm_connection(), md.x11_win);
                 gtk_window_present(GTK_WINDOW(md.gtk_win));
                 gtk_window_set_keep_above(GTK_WINDOW(md.gtk_win), TRUE);
             }
     }
+    if (wm_connection()) xcb_flush(wm_connection());
 }
 
 static bool any_modal_open()
@@ -496,8 +498,8 @@ static void on_toplevel_active(GObject *obj, GParamSpec *, gpointer data)
             }
         }
         if (c->connection && c->parent_win) {
-            swell_xcb_raise(c->connection, c->parent_win);
-            xcb_flush(c->connection);
+            swell_xcb_raise(wm_connection(), c->parent_win);
+            xcb_flush(wm_connection());
         }
         xw_raise_modals();
     } else if (g_active_capture == c) {
@@ -1048,9 +1050,10 @@ static bool modal_draw_cb(GtkWidget *widget, cairo_t *cr, gpointer data)
 static void modal_forward_motion(ModalRender *m, GtkWidget *widget, double wx, double wy)
 {
     resume_pointer();
+    swell_xcb_raise(wm_connection(), m->x11_win);
     const int scale = swell_gdk_widget_scale(widget);
     int rx = 0, ry = 0;
-    swell_xcb_translate(m->cap->connection, m->x11_win, swell_xcb_screen(m->cap->connection)->root,
+    swell_xcb_translate(wm_connection(), m->x11_win, swell_xcb_screen(m->cap->connection)->root,
                           (int)(wx * scale), (int)(wy * scale), &rx, &ry);
     fake_motion(m->cap->connection, rx, ry);
 }
