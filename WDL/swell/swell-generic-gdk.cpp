@@ -1918,7 +1918,15 @@ static void OnExposeEvent(GdkEventExpose *exp, cairo_t *draw_ctx = NULL, bool ba
   if (tmpbm.getWidth()>0 && tmpbm.getHeight()>0) 
   {
     void SWELL_internalLICEpaint(HWND hwnd, LICE_IBitmap *bmout, int bmout_xpos, int bmout_ypos, bool forceref);
+    hwnd->Retain();
     SWELL_internalLICEpaint(hwnd, &tmpbm, r.left, r.top, forceref);
+    const bool destroyed = hwnd->m_hashaddestroy != 0;
+    hwnd->Release();
+    if (destroyed)
+    {
+      if (!draw_ctx && !background) gdk_window_end_paint(exp->window);
+      return;
+    }
 
     LICE_IBitmap *bm = hwnd->m_backingstore;
     cairo_surface_t *temp_surface = (cairo_surface_t*)bm->Extended(0xca140,NULL);
