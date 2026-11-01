@@ -27,6 +27,7 @@
 #include <cstdlib>
 #include <unistd.h>
 #include <sys/wait.h>
+#include <sys/un.h>
 #include <errno.h>
 #include <sys/prctl.h>
 #include <signal.h>
@@ -45,7 +46,7 @@ XWaylandWM::XWaylandWM(xcb_connection_t *connection) : connection_(connection),
 // owning its own X connection, process, and event loop.
 
 static pid_t s_xwayland_pid = 0;
-static char s_xwayland_display[32];
+static char s_xwayland_display[sizeof(sockaddr_un::sun_path)];
 XWaylandWM *g_wm = nullptr;
 
 struct WMEventSource {
@@ -99,10 +100,11 @@ XWaylandWM* XWaylandWM::init_bridge_wm()
 {
     if (s_xwayland_pid > 0) return g_wm;
 
-    s_xwayland_pid = xw_spawn_xwayland(s_xwayland_display, sizeof(s_xwayland_display));
+    int wm_fd;
+    s_xwayland_pid = xw_spawn_xwayland(s_xwayland_display, sizeof(s_xwayland_display), &wm_fd);
     if (s_xwayland_pid < 0) return nullptr;
 
-    xcb_connection_t *connection = xcb_connect(s_xwayland_display, nullptr);
+    xcb_connection_t *connection = xcb_connect_to_fd(wm_fd, nullptr);
     if (xcb_connection_has_error(connection)) {
         xcb_disconnect(connection);
         kill(s_xwayland_pid, SIGTERM);
@@ -146,6 +148,7 @@ void XWaylandWM::init_atoms() {
         { "WM_DELETE_WINDOW", &atoms_.WM_DELETE_WINDOW },
         { "WM_TAKE_FOCUS", &atoms_.WM_TAKE_FOCUS },
         { "WM_STATE", &atoms_.WM_STATE },
+        { "WM_S0", &atoms_.WM_S0 },
         { "_XWAYLAND_ALLOW_COMMITS", &atoms_._XWAYLAND_ALLOW_COMMITS },
         { "_REAPERX_TIMESTAMP", &atoms_._REAPERX_TIMESTAMP },
         { "XdndSelection", &atoms_.XdndSelection },
@@ -228,6 +231,7 @@ void XWaylandWM::announce_wm(xcb_window_t support_win) {
     // Only one client may hold CompositeRedirectManual, but we are the sole WM
     // on our own private display, so there is nothing to contend with.
     xcb_composite_redirect_subwindows(connection_, root_, XCB_COMPOSITE_REDIRECT_MANUAL);
+    xcb_set_selection_owner(connection_, support_win, atoms_.WM_S0, XCB_CURRENT_TIME);
     xcb_flush(connection_);
 }
 
