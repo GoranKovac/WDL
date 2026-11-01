@@ -28,7 +28,7 @@ else
 
   SWELL_OBJS = swell-wnd-generic.o swell-gdi-lice.o swell.o swell-misc-generic.o \
                swell-dlg-generic.o swell-menu-generic.o swell-kb-generic.o \
-               swell-gdi-generic.o swell-ini.o swell-generic-gdk.o \
+               swell-gdi-generic.o swell-ini.o swell-generic-gdk.o swell-generic-x11.o \
                swell-appstub-generic.o swell-miscdlg-generic.o
 
   LFLAGS += -ldl -lGL

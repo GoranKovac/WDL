@@ -846,7 +846,6 @@ SWELL_IMPLEMENT_GETOSXVERSION int SWELL_GetOSXVersion()
 
 #include <gdk/gdk.h>
 #include <gdk/gdkkeysyms.h>
-#include <gdk/gdkx.h>
 
 
 #else
