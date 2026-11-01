@@ -1437,8 +1437,6 @@ void swell_oswindow_updatetoscreen(HWND hwnd, RECT *rect)
       {
         rrr.x += SWELL_WAYLAND_BORDER_WIDTH;
         rrr.y += g_swell_wayland_title_h + SWELL_WAYLAND_BORDER_WIDTH;
-        rrr.width += SWELL_WAYLAND_BORDER_WIDTH;
-        rrr.height += g_swell_wayland_title_h + SWELL_WAYLAND_BORDER_WIDTH;
       }
       if (hwnd->m_oswidget)
         gtk_widget_queue_draw_area(GTK_WIDGET(hwnd->m_oswidget), rrr.x, rrr.y, rrr.width, rrr.height);
@@ -1852,8 +1850,8 @@ static void OnExposeEvent(GdkEventExpose *exp, cairo_t *draw_ctx = NULL)
 
   r.left = exp->area.x - bw; 
   r.top = exp->area.y - (title_h + bw); 
-  r.bottom=r.top+exp->area.height + (title_h + bw); 
-  r.right=r.left+exp->area.width + bw;
+  r.bottom=r.top+exp->area.height;
+  r.right=r.left+exp->area.width;
   if (r.left < cr.left) r.left = cr.left;
   if (r.right > cr.right) r.right = cr.right;
   if (r.top < cr.top) r.top = cr.top;
@@ -1866,7 +1864,7 @@ static void OnExposeEvent(GdkEventExpose *exp, cairo_t *draw_ctx = NULL)
 
   LICE_SubBitmap tmpbm(hwnd->m_backingstore,r.left,r.top,r.right-r.left,r.bottom-r.top);
 
-  GdkRectangle rrr={exp->area.x, exp->area.y, (int)exp->area.width + bw, (int)exp->area.height + title_h + bw*2};
+  GdkRectangle rrr=exp->area;
 #ifdef SWELL_TARGET_WAYLAND
   rrr = swell_gdk_logical_rect(rrr, scale);
 #endif
