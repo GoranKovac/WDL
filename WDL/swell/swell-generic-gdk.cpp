@@ -26,7 +26,6 @@
 #ifdef SWELL_TARGET_WAYLAND
 #include <gdk/gdkwayland.h>
 #include <gio/gdesktopappinfo.h>
-#include <wayland-client.h>
 #include "xwayland-bridge.h"
 #endif
 #include "swell.h"
@@ -240,21 +239,7 @@ static void swell_wayland_init_application_id()
 static void swell_wayland_init_titlebar_height()
 {
   GdkDisplay *disp = gdk_display_get_default();
-  bool lacks_ssd;
-  if (disp && GDK_IS_WAYLAND_DISPLAY(disp))
-  {
-    GtkWidget *probe = gtk_window_new(GTK_WINDOW_TOPLEVEL);
-    gtk_widget_show(probe);
-    struct wl_display *wl_disp = gdk_wayland_display_get_wl_display(disp);
-    for (int i = 0; i < 5 && wl_disp; i++)
-      wl_display_roundtrip(wl_disp);
-    GtkStyleContext *ctx = gtk_widget_get_style_context(probe);
-    lacks_ssd = gtk_style_context_has_class(ctx, "csd");
-    gtk_widget_destroy(probe);
-  }
-  else
-    lacks_ssd = false; // not a Wayland display at all (e.g. X11) -- SSD question doesn't apply, behave as before
-  g_swell_wayland_title_h = lacks_ssd ? 28 : 0;
+  g_swell_wayland_title_h = GDK_IS_WAYLAND_DISPLAY(disp) && !gdk_wayland_display_prefers_ssd(disp) ? 28 : 0;
 }
 
 static void swell_wayland_suppress_csd_shadow_once()
