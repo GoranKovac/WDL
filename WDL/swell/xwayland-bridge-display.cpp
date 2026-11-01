@@ -181,20 +181,27 @@ pid_t xw_spawn_xwayland(char *display_name, size_t size)
         close(sockets[1]);
         return -1;
     }
+    char ready_fd[32], socket_env[64];
+    snprintf(ready_fd, sizeof(ready_fd), "%d", ready[1]);
+    snprintf(socket_env, sizeof(socket_env), "WAYLAND_SOCKET=%d", sockets[1]);
+    extern char **environ;
+    std::vector<char*> env;
+    for (char **p = environ; *p; ++p)
+        if (strncmp(*p, "WAYLAND_SOCKET=", 15)) env.push_back(*p);
+    env.push_back(socket_env);
+    env.push_back(nullptr);
+    char *args[] = { (char*)"Xwayland", (char*)"-displayfd", ready_fd,
+                     (char*)"-rootless", (char*)"-nolisten", (char*)"tcp", nullptr };
+    const pid_t parent = getpid();
     const pid_t pid = fork();
     if (pid == 0) {
-        prctl(PR_SET_PDEATHSIG, SIGTERM);
+        if (prctl(PR_SET_PDEATHSIG, SIGTERM) < 0 || getppid() != parent) _exit(1);
         close(ready[0]);
-        char ready_fd[32];
-        snprintf(ready_fd, sizeof(ready_fd), "%d", ready[1]);
         if (fcntl(ready[1], F_SETFD, 0) < 0) _exit(1);
         close(sockets[0]);
         close(server);
-        char socket_name[32];
-        snprintf(socket_name, sizeof(socket_name), "%d", sockets[1]);
-        if (fcntl(sockets[1], F_SETFD, 0) < 0 || setenv("WAYLAND_SOCKET", socket_name, 1)) _exit(1);
-        execl("/usr/bin/Xwayland", "Xwayland", "-displayfd", ready_fd,
-              "-rootless", "-nolisten", "tcp", (char*)nullptr);
+        if (fcntl(sockets[1], F_SETFD, 0) < 0) _exit(1);
+        execve("/usr/bin/Xwayland", args, env.data());
         _exit(1);
     }
     close(ready[1]);
