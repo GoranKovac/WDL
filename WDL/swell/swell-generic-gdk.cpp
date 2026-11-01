@@ -1819,12 +1819,25 @@ static GdkWindowEdge swell_wayland_resize_edge_hittest(HWND hwnd, int x, int y, 
 }
 #endif
 
-static void OnExposeEvent(GdkEventExpose *exp, cairo_t *draw_ctx = NULL)
+static void OnExposeEvent(GdkEventExpose *exp, cairo_t *draw_ctx = NULL, bool background = false)
 {
   HWND hwnd = swell_oswindow_to_hwnd(exp->window);
   if (!hwnd) return;
 
 #ifdef SWELL_TARGET_WAYLAND
+  const bool use_background = hwnd->m_oswidget && gtk_widget_get_opacity(hwnd->m_oswidget) == 1.0;
+  if (draw_ctx && use_background && s_cur_evt && s_cur_evt->type == GDK_EXPOSE &&
+      s_cur_evt->any.window == exp->window && gdk_cairo_get_drawing_context(draw_ctx))
+  {
+    if (swell_wayland_needs_manual_titlebar(hwnd))
+      swell_wayland_paint_manual_titlebar(hwnd, exp->window, draw_ctx);
+    return;
+  }
+  if (background)
+  {
+    gdk_window_set_background_pattern(exp->window, NULL);
+    if (!use_background) return;
+  }
   const int scale = swell_gdk_window_scale(exp->window);
   GdkEventExpose pixel_event = *exp;
   pixel_event.area.x *= scale;
@@ -1868,29 +1881,44 @@ static void OnExposeEvent(GdkEventExpose *exp, cairo_t *draw_ctx = NULL)
 #ifdef SWELL_TARGET_WAYLAND
   rrr = swell_gdk_logical_rect(rrr, scale);
 #endif
-  if (!draw_ctx) gdk_window_begin_paint_rect(exp->window, &rrr);
+  if (!draw_ctx && !background) gdk_window_begin_paint_rect(exp->window, &rrr);
 
   if (tmpbm.getWidth()>0 && tmpbm.getHeight()>0) 
   {
     void SWELL_internalLICEpaint(HWND hwnd, LICE_IBitmap *bmout, int bmout_xpos, int bmout_ypos, bool forceref);
     SWELL_internalLICEpaint(hwnd, &tmpbm, r.left, r.top, forceref);
 
-    cairo_t *crc = draw_ctx ? draw_ctx : gdk_cairo_create(exp->window);
-    cairo_save(crc);
-#ifdef SWELL_TARGET_WAYLAND
-    cairo_scale(crc, 1.0 / scale, 1.0 / scale);
-#endif
     LICE_IBitmap *bm = hwnd->m_backingstore;
     cairo_surface_t *temp_surface = (cairo_surface_t*)bm->Extended(0xca140,NULL);
-    if (temp_surface) cairo_set_source_surface(crc, temp_surface, bw, title_h + bw);
-    cairo_paint(crc);
-    cairo_restore(crc);
-    if (!draw_ctx) cairo_destroy(crc);
+#ifdef SWELL_TARGET_WAYLAND
+    if (background && temp_surface)
+    {
+      cairo_surface_mark_dirty(temp_surface);
+      cairo_pattern_t *pattern = cairo_pattern_create_for_surface(temp_surface);
+      cairo_matrix_t matrix;
+      cairo_matrix_init(&matrix, scale, 0, 0, scale, -bw, -(title_h + bw));
+      cairo_pattern_set_matrix(pattern, &matrix);
+      gdk_window_set_background_pattern(exp->window, pattern);
+      cairo_pattern_destroy(pattern);
+    }
+    else
+#endif
+    {
+      cairo_t *crc = draw_ctx ? draw_ctx : gdk_cairo_create(exp->window);
+      cairo_save(crc);
+#ifdef SWELL_TARGET_WAYLAND
+      cairo_scale(crc, 1.0 / scale, 1.0 / scale);
+#endif
+      if (temp_surface) cairo_set_source_surface(crc, temp_surface, bw, title_h + bw);
+      cairo_paint(crc);
+      cairo_restore(crc);
+      if (!draw_ctx) cairo_destroy(crc);
+    }
     if (temp_surface) bm->Extended(0xca140,temp_surface); // release
   }
 
 #ifdef SWELL_TARGET_WAYLAND
-    if (swell_wayland_needs_manual_titlebar(hwnd))
+    if (!background && swell_wayland_needs_manual_titlebar(hwnd))
     {
       cairo_t *crc = draw_ctx ? draw_ctx : gdk_cairo_create(exp->window);
       swell_wayland_paint_manual_titlebar(hwnd, exp->window, crc);
@@ -1898,7 +1926,7 @@ static void OnExposeEvent(GdkEventExpose *exp, cairo_t *draw_ctx = NULL)
     }
 #endif
 
-    if (!draw_ctx) gdk_window_end_paint(exp->window);
+    if (!draw_ctx && !background) gdk_window_end_paint(exp->window);
 #endif
 }
 
@@ -3038,7 +3066,11 @@ static void swell_gdkEventHandler(GdkEvent *evt, gpointer data)
     break;
     case GDK_EXPOSE: // paint! GdkEventExpose...
 #ifdef SWELL_TARGET_WAYLAND
-      if (GDK_IS_WAYLAND_WINDOW(evt->any.window)) break;
+      if (GDK_IS_WAYLAND_WINDOW(evt->any.window))
+      {
+        OnExposeEvent((GdkEventExpose *)evt, NULL, true);
+        break;
+      }
 #endif
       OnExposeEvent((GdkEventExpose *)evt);
     break;
@@ -3186,6 +3218,11 @@ static void swell_gdkEventHandler(GdkEvent *evt, gpointer data)
   // disposed the window. Skipping it is correct on both.
   if (evt->type != GDK_DELETE && swell_gtk_main_do_event)
     swell_gtk_main_do_event(evt);
+#endif
+#ifdef SWELL_TARGET_WAYLAND
+  if (evt->type == GDK_EXPOSE && GDK_IS_WAYLAND_WINDOW(evt->any.window) &&
+      !gdk_window_is_destroyed(evt->any.window) && swell_oswindow_to_hwnd(evt->any.window))
+    gdk_window_set_background_pattern(evt->any.window, NULL);
 #endif
   s_cur_evt = oldEvt;
 }
