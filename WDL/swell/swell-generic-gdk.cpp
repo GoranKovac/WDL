@@ -3292,7 +3292,7 @@ void SWELL_RunEvents()
       if (!dispatched && xw_bridge_has_pending_draw() && g_get_monotonic_time() < deadline)
       {
         if (!wait_source)
-          wait_source = g_timeout_add_full(G_PRIORITY_HIGH,
+          wait_source = g_timeout_add_full(GDK_PRIORITY_EVENTS,
             max(1, (int)((deadline - g_get_monotonic_time() + 999) / 1000)),
             [](gpointer) -> gboolean { return G_SOURCE_CONTINUE; }, NULL, NULL);
         dispatched = g_main_context_iteration(ctx,TRUE);
