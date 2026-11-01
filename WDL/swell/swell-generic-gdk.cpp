@@ -2842,7 +2842,8 @@ static void OnButtonEvent(GdkEventButton *b)
 
 static HANDLE urilistToDropFiles(const POINT *pt, const guchar *gptr, gint sz)
 {
-  HANDLE gobj=GlobalAlloc(0,sz+sizeof(DROPFILES));
+  if (sz < 0 || sz > INT_MAX - (int)sizeof(DROPFILES) - 2) return NULL;
+  HANDLE gobj=GlobalAlloc(0,sz+sizeof(DROPFILES)+2);
   if (!gobj) return NULL;
 
   DROPFILES *df=(DROPFILES*)gobj;
@@ -2860,14 +2861,14 @@ static HANDLE urilistToDropFiles(const POINT *pt, const guchar *gptr, gint sz)
     while (rd < rd_end && *rd && isspace_safe(*rd)) rd++;
     if (rd >= rd_end) break;
 
-    if (rd+7 < rd_end && !strnicmp((const char *)rd,"file://",7))
+    if (rd_end-rd > 7 && !strnicmp((const char *)rd,"file://",7))
     {
       rd += 7;
       int c=0;
       while (rd < rd_end && *rd && !isspace_safe(*rd))
       {
         int v1,v2;
-        if (*rd == '%' && rd+2 < rd_end && (v1=hex_parse(rd[1]))>=0 && (v2=hex_parse(rd[2]))>=0)
+        if (*rd == '%' && rd_end-rd > 2 && (v1=hex_parse(rd[1]))>=0 && (v2=hex_parse(rd[2]))>=0)
         {
           *pout++ = (v1<<4) | v2;
           rd+=3;
