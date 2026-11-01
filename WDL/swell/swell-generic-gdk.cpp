@@ -179,7 +179,6 @@ static GList *s_program_icon_list;
 
 static SWELL_OSWINDOW swell_dragsrc_osw;
 #ifdef SWELL_TARGET_WAYLAND
-static SWELL_OSWIDGET swell_dragsrc_widget;
 static HWND s_wayland_drag_source, s_wayland_drag_destination;
 static GtkWidget *s_wayland_drag_widget;
 static POINT s_wayland_drag_position;
@@ -2461,7 +2460,7 @@ static void swell_wayland_drag_end(GtkWidget *widget, GdkDragContext *, gpointer
 void swell_wayland_begin_drag(HWND source)
 {
   HWND capture = GetCapture();
-  if (s_wayland_drag_source || !capture || capture == source || !s_cur_evt ||
+  if (s_wayland_drag_source || swell_dragsrc_hwnd || !capture || capture == source || !s_cur_evt ||
       s_cur_evt->type != GDK_MOTION_NOTIFY ||
       !(s_cur_evt->motion.state & GDK_BUTTON1_MASK) ||
       !GDK_IS_WAYLAND_DISPLAY(gdk_display_get_default())) return;
@@ -5035,12 +5034,27 @@ struct dropSourceInfo {
     srclist=NULL; srccount=0; srcfn=NULL; callback=NULL; 
     state=0;
     dragctx=NULL;
+#ifdef SWELL_TARGET_WAYLAND
+    widget=NULL;
+    finished=false;
+#endif
   }
   ~dropSourceInfo() 
   { 
-    free(srcfn); 
+    free(srcfn);
+#ifdef SWELL_TARGET_WAYLAND
+    if (widget)
+    {
+      g_signal_handlers_disconnect_by_data(widget, this);
+      if (dragctx) gtk_drag_cancel(dragctx);
+      g_object_unref(widget);
+    }
+#endif
     if (dragctx)
     {
+#ifdef SWELL_TARGET_WAYLAND
+      if (!widget)
+#endif
       if (_gdk_drag_drop_done) _gdk_drag_drop_done(dragctx,state!=0);
       g_object_unref(dragctx);
     }
@@ -5055,6 +5069,10 @@ struct dropSourceInfo {
   int state;
 
   GdkDragContext *dragctx;
+#ifdef SWELL_TARGET_WAYLAND
+  GtkWidget *widget;
+  bool finished;
+#endif
 };
 
 static void encode_uri(WDL_FastString *s, const char *rd)
@@ -5077,55 +5095,33 @@ static void encode_uri(WDL_FastString *s, const char *rd)
 #ifdef SWELL_TARGET_WAYLAND
 static void on_drag_source_data_get(GtkWidget *widget, GdkDragContext *context, GtkSelectionData *data, guint info, guint time, gpointer user_data)
 {
-  HWND source_hwnd = (HWND)user_data;
-  if (!source_hwnd) return;
-
-  dropSourceInfo *inf = (dropSourceInfo*)source_hwnd->m_private_data;
-  if (!inf) return;
-
+  dropSourceInfo *inf = (dropSourceInfo*)user_data;
   WDL_FastString str;
 
   if (inf->srclist && inf->srccount)
   {
     for (int x = 0; x < inf->srccount; x++)
     {
-      const char *fn = inf->srclist[x];
       str.Append("file://");
-      while (*fn)
-      {
-        if (isalnum_safe(*fn) || *fn == '.' || *fn == '_' || *fn == '-' || *fn == '/' || *fn == '#')
-          str.Append(fn, 1);
-        else
-          str.AppendFormatted(8, "%%%02x", *(unsigned char *)fn);
-        fn++;
-      }
+      encode_uri(&str, inf->srclist[x]);
       str.Append("\r\n");
     }
   }
-  else if (inf->callback && inf->srcfn && inf->state)
+  else if (inf->callback && inf->srcfn)
   {
-    inf->callback(inf->srcfn);
-    const char *fn = inf->srcfn;
+    if (!inf->state) inf->callback(inf->srcfn);
+    inf->state = 1;
     str.Append("file://");
-    while (*fn)
-    {
-      if (isalnum_safe(*fn) || *fn == '.' || *fn == '_' || *fn == '-' || *fn == '/' || *fn == '#')
-        str.Append(fn, 1);
-      else
-        str.AppendFormatted(8, "%%%02x", *(unsigned char *)fn);
-      fn++;
-    }
+    encode_uri(&str, inf->srcfn);
     str.Append("\r\n");
   }
   gtk_selection_data_set(data, urilistatom(), 8, (const guchar*)str.Get(), str.GetLength());
 }
 
-static void on_drag_source_end(GtkWidget *widget, GdkDragContext *context, gpointer user_data)
+static void on_drag_source_end(GtkWidget *, GdkDragContext *, gpointer data)
 {
-  if (swell_dragsrc_timeout_start == 0)
-    swell_dragsrc_timeout_start = GetTickCount();
-  if (GDK_IS_DRAG_CONTEXT(context))
-    g_object_ref(context);
+  ((dropSourceInfo*)data)->finished = true;
+  if (GetCapture() == swell_dragsrc_hwnd) ReleaseCapture();
 }
 #endif
 
@@ -5138,24 +5134,20 @@ static LRESULT WINAPI dropSourceWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPAR
 #ifdef SWELL_TARGET_WAYLAND
       if (GDK_IS_WAYLAND_DISPLAY(gdk_display_get_default()))
       {
-        if (!swell_dragsrc_widget)
+        GtkWidget *widget = s_cur_evt ? gtk_get_event_widget(s_cur_evt) : NULL;
+        if (!widget) break;
+        inf->widget = (GtkWidget*)g_object_ref(gtk_widget_get_toplevel(widget));
+        g_signal_connect(inf->widget, "drag-data-get", G_CALLBACK(on_drag_source_data_get), inf);
+        g_signal_connect(inf->widget, "drag-end", G_CALLBACK(on_drag_source_end), inf);
+        GtkTargetList *target_list = gtk_target_list_new(NULL, 0);
+        gtk_target_list_add_uri_targets(target_list, 0);
+        inf->dragctx = gtk_drag_begin_with_coordinates(inf->widget, target_list, GDK_ACTION_COPY, 1, s_cur_evt, -1, -1);
+        gtk_target_list_unref(target_list);
+        if (inf->dragctx)
         {
-          swell_dragsrc_widget = gtk_window_new(GTK_WINDOW_POPUP);
-          gtk_window_set_default_size(GTK_WINDOW(swell_dragsrc_widget), 1, 1);
-          gtk_widget_realize(swell_dragsrc_widget);
+          g_object_ref(inf->dragctx);
+          if (!inf->finished) SetCapture(hwnd);
         }
-        if (swell_dragsrc_widget)
-        {
-          GtkTargetList *target_list = gtk_target_list_new(NULL, 0);
-          gtk_target_list_add_uri_targets(target_list, 0);
-          POINT p;
-          GetCursorPos(&p);
-          inf->dragctx = gtk_drag_begin_with_coordinates(swell_dragsrc_widget, target_list, GDK_ACTION_COPY, 1, NULL, p.x, p.y);
-          gtk_target_list_unref(target_list);
-          g_signal_connect(swell_dragsrc_widget, "drag-data-get", G_CALLBACK(on_drag_source_data_get), hwnd);
-          g_signal_connect(swell_dragsrc_widget, "drag-end", G_CALLBACK(on_drag_source_end), NULL);
-        }
-        SetCapture(hwnd);
       }
       else
 #endif
@@ -5171,12 +5163,17 @@ static LRESULT WINAPI dropSourceWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPAR
         }
         if (swell_dragsrc_osw)
         {
-          inf->dragctx = gdk_drag_begin(swell_dragsrc_osw, g_list_append(NULL,urilistatom()));
+          GList *targets = g_list_append(NULL, urilistatom());
+          inf->dragctx = gdk_drag_begin(swell_dragsrc_osw, targets);
+          g_list_free(targets);
         }
         SetCapture(hwnd);
       }
     break;
     case WM_MOUSEMOVE:
+#ifdef SWELL_TARGET_WAYLAND
+      if (inf->widget) break;
+#endif
       if (inf->dragctx)
       {
         POINT p;
@@ -5193,6 +5190,9 @@ static LRESULT WINAPI dropSourceWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPAR
       }
     break;
     case WM_LBUTTONUP:
+#ifdef SWELL_TARGET_WAYLAND
+      if (inf->widget) break;
+#endif
       if (inf->dragctx && !inf->state)
       {
         inf->state=1;
@@ -5259,6 +5259,7 @@ static LRESULT WINAPI dropSourceWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPAR
 
 void SWELL_InitiateDragDrop(HWND hwnd, RECT* srcrect, const char* srcfn, void (*callback)(const char* dropfn))
 {
+  if (hwnd) hwnd->Retain();
   const bool is_osw_cursor = s_last_setcursor_oswnd && swell_oswindow_from_hwnd(hwnd) == s_last_setcursor_oswnd;
   swell_dragsrc_fn = srcfn;
   dropSourceInfo info;
@@ -5270,7 +5271,7 @@ void SWELL_InitiateDragDrop(HWND hwnd, RECT* srcrect, const char* srcfn, void (*
   swell_dragsrc_hwnd=h;
   h->m_private_data = (INT_PTR) &info;
   dropSourceWndProc(h,WM_CREATE,0,0);
-  while (GetCapture()==h)
+  while (GetCapture()==h && (!hwnd || !hwnd->m_hashaddestroy))
   {
     SWELL_RunMessageLoop();
     Sleep(10);
@@ -5280,18 +5281,20 @@ void SWELL_InitiateDragDrop(HWND hwnd, RECT* srcrect, const char* srcfn, void (*
   swell_dragsrc_hwnd=NULL;
   DestroyWindow(h);
 
-  if (is_osw_cursor && hwnd && GetFocus() != hwnd)
+  if (is_osw_cursor && hwnd && !hwnd->m_hashaddestroy && GetFocus() != hwnd)
   {
     SWELL_OSWINDOW osw = swell_oswindow_from_hwnd(hwnd);
-    gdk_window_set_cursor(osw,NULL);
+    if (osw) gdk_window_set_cursor(osw,NULL);
   }
   swell_dragsrc_fn = NULL;
+  if (hwnd) hwnd->Release();
 }
 
 // owner owns srclist, make copies here etc
 void SWELL_InitiateDragDropOfFileList(HWND hwnd, RECT *srcrect, const char **srclist, int srccount, HICON icon)
 {
   swell_dragsrc_fn = srccount>0 ? srclist[0] : NULL;
+  if (hwnd) hwnd->Retain();
   const bool is_osw_cursor = s_last_setcursor_oswnd && swell_oswindow_from_hwnd(hwnd) == s_last_setcursor_oswnd;
   dropSourceInfo info;
   info.srclist = srclist;
@@ -5302,7 +5305,7 @@ void SWELL_InitiateDragDropOfFileList(HWND hwnd, RECT *srcrect, const char **src
   swell_dragsrc_hwnd=h;
   h->m_private_data = (INT_PTR) &info;
   dropSourceWndProc(h,WM_CREATE,0,0);
-  while (GetCapture()==h)
+  while (GetCapture()==h && (!hwnd || !hwnd->m_hashaddestroy))
   {
     SWELL_RunMessageLoop();
     Sleep(10);
@@ -5312,12 +5315,13 @@ void SWELL_InitiateDragDropOfFileList(HWND hwnd, RECT *srcrect, const char **src
   swell_dragsrc_hwnd=NULL;
   DestroyWindow(h);
 
-  if (is_osw_cursor && hwnd && GetFocus() != hwnd)
+  if (is_osw_cursor && hwnd && !hwnd->m_hashaddestroy && GetFocus() != hwnd)
   {
     SWELL_OSWINDOW osw = swell_oswindow_from_hwnd(hwnd);
-    gdk_window_set_cursor(osw,NULL);
+    if (osw) gdk_window_set_cursor(osw,NULL);
   }
   swell_dragsrc_fn = NULL;
+  if (hwnd) hwnd->Release();
 }
 
 void SWELL_FinishDragDrop() { }
