@@ -737,6 +737,13 @@ static bool popup_accepts_input(xcb_connection_t *connection, xcb_window_t windo
     return accepts;
 }
 
+static bool has_input_popup(const Capture *c)
+{
+    for (const auto &p : c->popups)
+        if (p.visible && popup_accepts_input(c->connection, p.x11_win)) return true;
+    return false;
+}
+
 static void dismiss_popups(Capture *c);
 
 static bool canvas_button_press(GtkWidget *widget, GdkEventButton *e, gpointer data)
@@ -1020,6 +1027,7 @@ static void modal_request_close(Capture *c, xcb_window_t window)
 static gboolean modal_delete_cb(GtkWidget *, GdkEvent *, gpointer data)
 {
     ModalRender *m = (ModalRender*)data;
+    if (has_input_popup(m->cap)) return TRUE;
     modal_request_close(m->cap, m->x11_win);
     return TRUE;
 }
@@ -1452,15 +1460,30 @@ bool xw_bridge_swell_on_button_event_escape()
     return any;
 }
 
+static bool capture_owned_by(const Capture *c, HWND hwnd)
+{
+    HWND owner = c->hwnd;
+    while (owner && owner != hwnd) owner = owner->m_parent ? owner->m_parent : owner->m_owner;
+    return owner != nullptr;
+}
+
+bool xw_bridge_popup_blocks_close(HWND hwnd)
+{
+    for (auto &kv : g_captures) {
+        Capture *c = kv.second;
+        if (kv.first != c->parent_win) continue;
+        if (capture_owned_by(c, hwnd) && has_input_popup(c)) return true;
+    }
+    return false;
+}
+
 bool xw_bridge_swell_on_gdk_delete_release(HWND hwnd)
 {
     bool any = false;
     for (auto &kv : g_captures) {
         Capture *c = kv.second;
         if (!c || kv.first != c->parent_win) continue;
-        HWND owner = c->hwnd;
-        while (owner && owner != hwnd) owner = owner->m_parent ? owner->m_parent : owner->m_owner;
-        if (!owner) continue;
+        if (!capture_owned_by(c, hwnd)) continue;
         if (!c->popups.empty()) {
             any = true;
             // Tell the plugin to close its menu FIRST, while we still have the popup

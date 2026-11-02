@@ -370,6 +370,9 @@ void swell_oswindow_focus(HWND hwnd)
 void swell_gdk_close(HWND hwnd)
 {
   if (!hwnd) return;
+#ifdef SWELL_TARGET_WAYLAND
+  if (xw_bridge_popup_blocks_close(hwnd)) return;
+#endif
   hwnd->Retain();
 #ifdef SWELL_TARGET_WAYLAND
   // Destroy the plugin popup's overlay canvas (an xdg_popup on Wayland) and
