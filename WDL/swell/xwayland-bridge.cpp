@@ -728,11 +728,6 @@ static bool canvas_motion(GtkWidget *widget, GdkEventMotion *e, gpointer data)
     if (!c || !c->connection) return false;
     resume_pointer();
 
-    static guint32 last_time = 0;
-    guint32 now = g_get_monotonic_time() / 1000;
-    if (now - last_time < 16) return true;
-    last_time = now;
-
     const int scale = swell_gdk_widget_scale(widget);
     int screen_x = (int)(e->x * scale) + c->canvas_x;
     int screen_y = (int)(e->y * scale) + c->canvas_y;
