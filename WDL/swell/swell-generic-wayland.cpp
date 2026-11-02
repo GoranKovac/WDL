@@ -51,7 +51,7 @@ gboolean swell_wayland_handle_hover_enter(GtkWidget *widget, GdkEventCrossing *e
   return FALSE;
 }
 
-int g_swell_wayland_title_h; // 0 = compositor has real SSD, use it normally
+int g_swell_wayland_title_h;
 #define SWELL_WAYLAND_TITLEBAR_CLOSEBTN_W 36
 int SWELL_WAYLAND_BORDER_WIDTH = 2;
 
@@ -135,14 +135,7 @@ static void swell_wayland_scale_changed(GtkWidget *widget, GParamSpec *, gpointe
   hwnd->Release();
 }
 
-// Wayland allows only one popup per parent. Tooltip and a
-// menu cannot both be showed at the same time.
-// Track the single active tooltip
-// so we can hide it when a menu opens, and suppress tooltips while a menu is up.
 static HWND s_wayland_active_tooltip;
-// Last real toplevel the pointer was over, recorded in OnMotionEvent. Tooltips have
-// no parent/owner, so this is what tells us which window a tooltip belongs to.
-// Stored as the OS window (re-resolved on use) so a destroyed window can't dangle.
 SWELL_OSWINDOW s_last_hover_oswindow;
 bool PopupMenuIsActive();
 
@@ -176,7 +169,6 @@ bool swell_wayland_create_window(HWND hwnd, GdkWindow *transient_for)
   bool is_popup_menu = (hwnd->m_classname && strcmp(hwnd->m_classname, "__SWELL_MENU") == 0);
   bool is_tooltip = (!hwnd->m_parent && !hwnd->m_owner && (hwnd->m_style & WS_CHILD) && (!hwnd->m_title.Get() || !hwnd->m_title.Get()[0]));
 
-  // Imgui fix
   bool is_interactive_popup = (hwnd->m_style & WS_CHILD) && hwnd->m_owner;
   if (is_interactive_popup) is_popup_menu = true;
 
@@ -210,18 +202,8 @@ bool swell_wayland_create_window(HWND hwnd, GdkWindow *transient_for)
   {
     gtk_window_set_titlebar(GTK_WINDOW(gtk_win), gtk_label_new(NULL));
   }
-  // GTK sizes a toplevel to its content's natural size and asks
-  // the compositor for that — ignoring gtk_window_set_default_size when the
-  // content is larger. That makes dialogs open full-height. A max-size hint
-  // is the only thing GTK won't override, so clamp max to the requested size.
   if (!is_popup_menu && !is_tooltip && !is_splash)
   {
-    // GTK ignores set_default_size when content natural size differs, and a
-    // max-only hint just caps (doesn't force). To make the restored size
-    // actually apply on Wayland, pin min=max=restored size — GTK cannot
-    // override an exact min==max constraint. This is released on the FIRST
-    // configure event (see swell_gdk_configure), i.e. once the window has been
-    // mapped at this exact size, after which it is freely resizable.
     int rw = swell_gdk_ceil(r.right - r.left, scale), rh = swell_gdk_ceil(r.bottom - r.top, scale);
     if (rw < 1) rw = 1;
     if (rh < 1) rh = 1;
@@ -236,9 +218,6 @@ bool swell_wayland_create_window(HWND hwnd, GdkWindow *transient_for)
     swell_wayland_set_geometry_hints(hwnd, &gh);
   }
 
-  // Tooltip and a menu can't both be showed at same time,
-  // opening a menu closes any active tooltip,
-  // while a menu is open tooltips cant spawn.
   if (is_popup_menu && s_wayland_active_tooltip)
   {
     if (s_wayland_active_tooltip->m_oswindow)
@@ -247,7 +226,6 @@ bool swell_wayland_create_window(HWND hwnd, GdkWindow *transient_for)
   }
   if (is_tooltip && !is_drag_preview && PopupMenuIsActive())
   {
-    // don't show a tooltip while a menu is up
     gtk_widget_destroy(gtk_win);
     hwnd->m_oswidget = NULL;
     return false;
@@ -272,7 +250,6 @@ bool swell_wayland_create_window(HWND hwnd, GdkWindow *transient_for)
     }
     else
     {
-      // Anchor to the window that was hovered, not the focused one.
       if (s_last_hover_oswindow)
       {
         HWND hov = swell_oswindow_to_hwnd(s_last_hover_oswindow);
@@ -284,18 +261,12 @@ bool swell_wayland_create_window(HWND hwnd, GdkWindow *transient_for)
       {
         if (is_drag_preview)
         {
-          // The preview must always be visible, and its parent is only a
-          // coordinate base (it is placed by gdk_window_move, not by an anchor
-          // rect), so an imperfect parent is harmless here.
           parent_hwnd = GetFocus();
           while (parent_hwnd && !parent_hwnd->m_oswidget)
             parent_hwnd = parent_hwnd->m_parent;
         }
         else
         {
-          // Fail closed: without a known hovered window we cannot place the
-          // tooltip correctly, and showing it in the wrong window is worse than
-          // not showing it at all.
           s_wayland_active_tooltip = NULL;
           gtk_widget_destroy(gtk_win);
           hwnd->m_oswidget = NULL;
@@ -313,10 +284,6 @@ bool swell_wayland_create_window(HWND hwnd, GdkWindow *transient_for)
   g_signal_connect(G_OBJECT(gtk_win), "leave-notify-event", G_CALLBACK(swell_wayland_handle_hover_enter), hwnd);
   gtk_widget_realize(gtk_win);
 
-  // gtk_window_move is not constrained to the screen,
-  // so popups render outside of the bottom/right edge. Use gdk_window_move_to_rect
-  // so the compositor slides the popup on-screen.
-  // https://bugzilla.mozilla.org/show_bug.cgi?id=1423598
   if ((is_popup_menu || (is_tooltip && !is_drag_preview)) && popup_parent_hwnd)
   {
     GdkWindow *pw = gtk_widget_get_window(gtk_win);
@@ -357,25 +324,25 @@ void swell_wayland_paint_manual_titlebar(HWND hwnd, GdkWindow *window, cairo_t *
   const int w = swell_gdk_ceil(hwnd->m_position.right - hwnd->m_position.left, scale);
   if (w <= 0) return;
   const int bw = SWELL_WAYLAND_BORDER_WIDTH;
-  const int full_w = w + bw*2; // actual OS window width, including left+right border
+  const int full_w = w + bw*2;
   const int logical_h = swell_gdk_ceil(hwnd->m_position.bottom - hwnd->m_position.top, scale);
-  const int full_h = g_swell_wayland_title_h + logical_h + bw*2; // top border + titlebar + content + bottom border
+  const int full_h = g_swell_wayland_title_h + logical_h + bw*2;
   const bool is_focused = (hwnd->m_oswindow == SWELL_focused_oswindow);
 
   cairo_save(cr);
   cairo_set_antialias(cr, CAIRO_ANTIALIAS_NONE);
 
   if (is_focused)
-    cairo_set_source_rgb(cr, 60/255.0, 198/255.0, 251/255.0); // #3CC6FB
+    cairo_set_source_rgb(cr, 60/255.0, 198/255.0, 251/255.0);
   else
     cairo_set_source_rgb(cr, 0.16, 0.16, 0.16);
-  cairo_rectangle(cr, 0, 0, full_w, bw); // top
+  cairo_rectangle(cr, 0, 0, full_w, bw);
   cairo_fill(cr);
-  cairo_rectangle(cr, 0, 0, bw, full_h); // left
+  cairo_rectangle(cr, 0, 0, bw, full_h);
   cairo_fill(cr);
-  cairo_rectangle(cr, full_w - bw, 0, bw, full_h); // right
+  cairo_rectangle(cr, full_w - bw, 0, bw, full_h);
   cairo_fill(cr);
-  cairo_rectangle(cr, 0, full_h - bw, full_w, bw); // bottom
+  cairo_rectangle(cr, 0, full_h - bw, full_w, bw);
   cairo_fill(cr);
 
   cairo_set_source_rgb(cr, 0.16, 0.16, 0.16);
@@ -470,7 +437,7 @@ static GdkWindowEdge swell_wayland_resize_edge_hittest(HWND hwnd, int x, int y, 
   const bool left = x < m, right = x >= w-m;
   const bool top = y < m, bottom = y >= h-m;
 
-  if (!left && !right && !top && !bottom) return GDK_WINDOW_EDGE_SOUTH_EAST; // unused, *found stays false
+  if (!left && !right && !top && !bottom) return GDK_WINDOW_EDGE_SOUTH_EAST;
   *found = true;
   if (top && left) return GDK_WINDOW_EDGE_NORTH_WEST;
   if (top && right) return GDK_WINDOW_EDGE_NORTH_EAST;
@@ -488,18 +455,13 @@ void swell_wayland_motion_event(const GdkEventMotion *m)
   {
     const int dx = (int)m->x_root - s_armed_drag_root_x;
     const int dy = (int)m->y_root - s_armed_drag_root_y;
-    if (dx*dx + dy*dy >= 1*1) // ~1px threshold before committing to an actual drag
+    if (dx*dx + dy*dy >= 1*1)
     {
       gdk_window_begin_move_drag(s_armed_drag_oswindow, s_armed_drag_button,
                                   s_armed_drag_root_x, s_armed_drag_root_y, s_armed_drag_time);
       s_armed_drag_oswindow = NULL;
     }
   }
-  // Remember which real toplevel the pointer is over. m->window is the OS window the
-  // motion occurred on, so this is authoritative without needing global coordinates
-  // (which Wayland does not provide). Skip popups: tooltips and menus are both
-  // WS_CHILD, and letting the pointer entering a tooltip overwrite this would
-  // re-anchor the next tooltip to the previous one.
   {
     HWND top = swell_oswindow_to_hwnd(m->window);
     if (top && top->m_oswidget && !(top->m_style & WS_CHILD))

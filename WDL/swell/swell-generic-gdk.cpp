@@ -73,7 +73,7 @@ static void (*_gdk_drag_drop_done)(GdkDragContext *, gboolean); // may not alway
 
 // for m_oswindow_private
 #define PRIVATE_NEEDSHOW 1 
-#define PRIVATE_SIZEPIN 2 // Wayland: min==max size pin pending, see swell_oswindow_resize_mapped
+#define PRIVATE_SIZEPIN 2
 
 #ifdef SWELL_TARGET_WAYLAND
 static void swell_wl_sizepin_release(GdkFrameClock *clock, gpointer data);
@@ -266,9 +266,6 @@ void swell_oswindow_destroy(HWND hwnd)
   {
     if (SWELL_focused_oswindow == hwnd->m_oswindow) SWELL_focused_oswindow = NULL;
 #ifdef SWELL_TARGET_WAYLAND
-    // GTK popup menus don't emit GDK_GRAB_BROKEN on teardown like X11
-    // override-redirect menus do, so capture set during menu tracking is
-    // never released. Clear it here.
     if (GDK_IS_WAYLAND_WINDOW(hwnd->m_oswindow) && swell_captured_window && hwnd->m_classname &&
       !strcmp(hwnd->m_classname,"__SWELL_MENU"))
     {
@@ -375,11 +372,6 @@ void swell_gdk_close(HWND hwnd)
 #endif
   hwnd->Retain();
 #ifdef SWELL_TARGET_WAYLAND
-  // Destroy the plugin popup's overlay canvas (an xdg_popup on Wayland) and
-  // release the plugin's :10 grab BEFORE closing. If the xdg_popup is still
-  // mapped when its parent (the FX window) closes, the compositor raises a
-  // protocol error that kills GTK's Wayland connection and hangs REAPER. With
-  // the canvas destroyed first, the close can proceed normally.
   xw_bridge_swell_on_gdk_delete_release(hwnd);
 #endif
   if (IsWindowEnabled(hwnd) &&
@@ -393,7 +385,7 @@ void swell_recalcMinMaxInfo(HWND hwnd)
 {
   if (!hwnd || !hwnd->m_oswindow || !(hwnd->m_style & WS_CAPTION)) return;
 #ifdef SWELL_TARGET_WAYLAND
-  if (hwnd->m_oswindow_private & PRIVATE_SIZEPIN) return; // don't overwrite a pending pin
+  if (hwnd->m_oswindow_private & PRIVATE_SIZEPIN) return;
 #endif
   MINMAXINFO mmi;
   memset(&mmi,0,sizeof(mmi));
@@ -533,18 +525,6 @@ void SWELL_initargs(int *argc, char ***argv)
 #endif
 
 #ifdef SWELL_SUPPORT_GTK
-    // Promote GDK's already-loaded library to global symbol visibility, so
-    // UserPlugins that dlopen() later (e.g. SWS) can resolve GTK/GDK/gdk_pixbuf
-    // symbols they assume the host process already provides globally. REAPER's own
-    // loader loads SWELL.so itself with local scope, so without this, everything
-    // SWELL.so pulls in transitively stays invisible to anything loaded afterward.
-    // This isn't Wayland-specific -- confirmed the identical failure on a custom
-    // X11 (SWELL_SUPPORT_GTK) build too, so it's gated on GTK support itself, not
-    // the Wayland target. Re-dlopen()ing an already-loaded library with RTLD_GLOBAL
-    // doesn't reload it -- it just upgrades its visibility, safely, with no effect
-    // on SWELL's own (already fully resolved, eager) use of these same symbols.
-    // Confirmed libgdk-3.so.0 alone is sufficient: RTLD_GLOBAL promotes its entire
-    // transitive dependency chain (glib, gobject, gdk_pixbuf) along with it.
     dlopen("libgdk-3.so.0", RTLD_NOW | RTLD_GLOBAL);
 #endif
 
@@ -989,7 +969,6 @@ void swell_oswindow_manage(HWND hwnd, bool wantfocus)
           gdk_window_register_dnd(hwnd->m_oswindow);
 
 #ifdef SWELL_TARGET_WAYLAND
-          //NOTE: WAYLAND Drag and drop from mediaexplorer and filemanager
           if (gtk_win && gtk_window_get_window_type(GTK_WINDOW(gtk_win)) == GTK_WINDOW_TOPLEVEL)
           {
             gtk_drag_dest_set(gtk_win, (GtkDestDefaults)(GTK_DEST_DEFAULT_MOTION | GTK_DEST_DEFAULT_DROP), NULL, 0, GDK_ACTION_COPY);
@@ -1705,15 +1684,7 @@ static void OnKeyEvent(GdkEventKey *k)
   HWND hwnd = swell_oswindow_to_hwnd(k->window);
   if (!hwnd) return;
 #ifdef SWELL_TARGET_WAYLAND
-  // If the focused window is an xwayland plugin bridge, forward the key to the
-  // plugin (or its open popup) and consume it, so REAPER does not also act on it
-  // (prevents Space/Esc etc. wedging while a plugin popup is open).
   {
-    // Modals FIRST. SWELL's focus is still the bridge while a plugin dialog is open,
-    // so the branch below would fire and XSendEvent the key to plugin_win -- and Wine
-    // routes that straight to its active dialog, which is how Tab kept moving between
-    // the dialog's buttons even though the dialog was not focused. Handing the modal
-    // case a chance to run first is what lets it raise-and-swallow instead.
     if (xw_bridge_forward_key_to_modal(k->hardware_keycode, k->state,
                                        k->type == GDK_KEY_PRESS))
       return;
@@ -1725,8 +1696,6 @@ static void OnKeyEvent(GdkEventKey *k)
       return;
     }
 
-    // No modal, but a plugin popup may still be open. Nothing else dismisses it on the
-    // key path, so its grab stays and wedges further input.
     if (k->type == GDK_KEY_PRESS && xw_bridge_swell_on_button_event_escape())
       return;
   }
@@ -1864,7 +1833,6 @@ static void getMouseCoords(GdkWindow *window, double &x, double &y, double &x_ro
   x_root *= scale;
   y_root *= scale;
 
-  // Wayland has no screen coordinates. Use the same origin as ScreenToClient().
   if (hwnd && GDK_IS_WAYLAND_WINDOW(window))
   {
     x_root = x + hwnd->m_position.left;
@@ -2102,7 +2070,6 @@ static void OnButtonEvent(GdkEventButton *b)
   if (!hwnd) return;
 
 #ifdef SWELL_TARGET_WAYLAND
-  // Popup-dismiss workaround and raise modals to unstick an open plugin popup
     if (b->type == GDK_BUTTON_PRESS){
         if (xw_bridge_swell_on_button_event_escape()) return;
     }
@@ -2631,12 +2598,6 @@ static void swell_gdkEventHandler(GdkEvent *evt, gpointer data)
     break;
   }
 #ifdef SWELL_SUPPORT_GTK
-  // Do NOT hand SWELL's GDK_DELETE to GTK's default handler: SWELL already processed it
-  // above (the WM_CLOSE path). GTK's default delete handler runs g_object_run_dispose
-  // on the window (hide/withdraw/destroy), which tears the window down itself —
-  // "window closes but process keeps running". On X11 the modal grab happened to
-  // stop GTK from routing the delete here; on Wayland (no grab) it reached this and
-  // disposed the window. Skipping it is correct on both.
   if (!swell_delete && swell_gtk_main_do_event)
     swell_gtk_main_do_event(evt);
 #endif
@@ -2784,9 +2745,6 @@ void SWELL_GetViewPort(RECT *r, const RECT *sourcerect, bool wantWork)
   RECT sr;
   if (sourcerect) sr = *sourcerect;
 #ifdef SWELL_TARGET_WAYLAND
-  //TODO: NEEDS WORK AREA SO MENUS DONT GET CROPPED OUTSIDE OF APP BUT MOVED 
-  // On Wayland all coordinates are monitor-local (compositor reports surface origins as 0),
-  // so return the relevant monitor's geometry with a LOCAL origin (0,0) to match.
   if (GDK_IS_WAYLAND_DISPLAY(gdk_display_get_default()))
   {
     GdkDisplay *disp = gdk_display_get_default();
@@ -2958,8 +2916,6 @@ void swell_oswindow_resize(SWELL_OSWINDOW wnd, int reposflag, RECT f)
 }
 
 #ifdef SWELL_TARGET_WAYLAND
-// Runs after GDK's own after-paint handler (connected at realize), i.e. after
-// the commit that carried the pin -- back to the window's real limits.
 static void swell_wl_sizepin_release(GdkFrameClock *clock, gpointer data)
 {
   HWND hwnd = (HWND)data;
@@ -2968,13 +2924,6 @@ static void swell_wl_sizepin_release(GdkFrameClock *clock, gpointer data)
   swell_recalcMinMaxInfo(hwnd);
 }
 
-// SetWindowPos on an already-mapped toplevel (e.g. the FX window resizing to a
-// newly selected plugin). gdk_window_resize() alone doesn't stick: the
-// GtkWindow still holds the min==max hints from creation (see
-// swell_oswindow_manage) and clamps every request back to that size. Moving
-// that pin to the new size makes GTK resize the window itself. Some compositors
-// (Hyprland) only resize a floating window to min==max, so keep the pin on the
-// GdkWindow until the frame carrying it has been committed.
 void swell_oswindow_resize_mapped(HWND hwnd, int reposflag, RECT f)
 {
   if (!(reposflag&2) || !hwnd->m_oswidget || !GTK_IS_WINDOW(hwnd->m_oswidget) ||
@@ -2998,8 +2947,6 @@ void swell_oswindow_resize_mapped(HWND hwnd, int reposflag, RECT f)
   gh.min_width = gh.max_width = w;
   gh.min_height = gh.max_height = h;
   swell_wayland_set_geometry_hints(hwnd, &gh);
-  // GTK only sends hints that differ from the last ones it sent, which may not
-  // be what the compositor has now -- send them on the GdkWindow too.
   gdk_window_set_geometry_hints(hwnd->m_oswindow, &gh,
     (GdkWindowHints)(GDK_HINT_MIN_SIZE | GDK_HINT_MAX_SIZE));
   if (!(hwnd->m_oswindow_private & PRIVATE_SIZEPIN))
@@ -3870,7 +3817,6 @@ int SWELL_ShowCursor(BOOL bShow)
     s_last_cursor = GetCursor();
     SetCursor((HCURSOR)gdk_cursor_new_for_display(gdk_display_get_default(),GDK_BLANK_CURSOR));
 #ifdef SWELL_TARGET_WAYLAND
-    // WAYLAND: relative mouse mode when cursor hidden, or knobs are wonky
     if (GDK_IS_WAYLAND_DISPLAY(gdk_display_get_default())) g_swell_mouse_relmode=true;
 #else
     //g_swell_mouse_relmode=true;

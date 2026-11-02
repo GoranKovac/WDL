@@ -7153,7 +7153,6 @@ HWND WindowFromPoint(POINT p)
   {
     HWND drag_target;
     if (swell_wayland_drag_target(p, &drag_target)) return drag_target;
-    // imgui fix
     extern HWND g_wayland_hovered_hwnd;
     bool hover_hwnd_still_valid = false;
     if (g_wayland_hovered_hwnd)

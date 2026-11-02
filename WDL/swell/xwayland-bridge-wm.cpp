@@ -1,15 +1,3 @@
-// xwayland-bridge-wm.cpp
-// Minimal ICCCM/EWMH window manager for the XWayland bridge.
-//
-// Design goals
-// ────────────
-// 1. End the freeze: proper grab lifecycle (owner_events=True) so that clicking
-//    outside a popup/modal never deadlocks input.
-// 2. Native X11 plugin support: honour MapRequest, ConfigureRequest,
-//    send WM_TAKE_FOCUS, set WM_STATE — exactly what plugins expect from a WM.
-// 3. Stay minimal: we are NOT a full WM.  We only manage windows that are
-//    children of our plugin containers.
-
 #ifdef _DEBUG
 #define DEBUG_PRINT(...) fprintf(stderr, __VA_ARGS__)
 #else
@@ -35,15 +23,10 @@
 #include <gdk/gdk.h>
 #include <algorithm>
 
-// ─── Construction ─────────────────────────────────────────────────────────────
 XWaylandWM::XWaylandWM(xcb_connection_t *connection) : connection_(connection),
     root_(xcb_setup_roots_iterator(xcb_get_setup(connection)).data->root) {
     init_atoms();
 }
-
-// ─── Infrastructure: Xwayland spawn, error handling, event pump ───────────────
-// This has nothing to do with the bridge's compositing/input work — it's the WM
-// owning its own X connection, process, and event loop.
 
 static pid_t s_xwayland_pid = 0;
 static char s_xwayland_display[sizeof(sockaddr_un::sun_path)];
@@ -123,7 +106,6 @@ XWaylandWM* XWaylandWM::init_bridge_wm()
         -2, -2, 1, 1, 0, XCB_WINDOW_CLASS_INPUT_OUTPUT, XCB_COPY_FROM_PARENT, 0, nullptr);
     xcb_map_window(connection, support);
     g_wm->announce_wm(support);
-    // Created before we held SubstructureRedirect, so no CreateNotify for it.
     g_wm->disallow_commits(support);
 
     static GSourceFuncs funcs = { wm_event_prepare, wm_event_check, wm_event_dispatch, nullptr, nullptr, nullptr };
@@ -139,8 +121,6 @@ XWaylandWM* XWaylandWM::init_bridge_wm()
     DEBUG_PRINT("[WM] initialised\n");
     return g_wm;
 }
-
-// ─── xcb_atom_t initialisation ──────────────────────────────────────────────────────
 
 void XWaylandWM::init_atoms() {
     xcb_intern_atom_cookie_t *cookies = xcb_ewmh_init_atoms(connection_, &atoms_);
@@ -175,22 +155,11 @@ void XWaylandWM::init_atoms() {
     }
 }
 
-// Our manual redirect gives every toplevel a wl_surface on the host compositor,
-// but nothing ever gives it a role, so it never gets frame callbacks. Xwayland
-// commits to it anyway, and with a frame callback outstanding Present uses its
-// 1s TIMER_LEN_FLIP fallback -- a vsynced glXSwapBuffers then blocks for ~1s.
-// _XWAYLAND_ALLOW_COMMITS=0 stops the commits: no frame callback is requested,
-// flips are refused, and Present paces copies on its 17ms TIMER_LEN_COPY. We
-// read content back from the composite pixmap, so nothing is lost. Only the WM
-// client (the one holding SubstructureRedirect on root) may set this property,
-// and it must be CARDINAL/32 with one item or Xwayland ignores it.
 void XWaylandWM::disallow_commits(xcb_window_t w) {
     const uint32_t zero = 0;
     xcb_change_property(connection_, XCB_PROP_MODE_REPLACE, w, atoms_._XWAYLAND_ALLOW_COMMITS,
                         XCB_ATOM_CARDINAL, 32, 1, &zero);
 }
-
-// ─── WM announcement (needed by native plugins that check for a WM) ───────────
 
 void XWaylandWM::announce_wm(xcb_window_t support_win) {
     support_win_ = support_win;
@@ -211,25 +180,6 @@ void XWaylandWM::announce_wm(xcb_window_t support_win) {
     xcb_change_window_attributes(connection_, root_, XCB_CW_EVENT_MASK, &mask);
     const uint32_t support_mask = XCB_EVENT_MASK_PROPERTY_CHANGE;
     xcb_change_window_attributes(connection_, support_win, XCB_CW_EVENT_MASK, &support_mask);
-    // Manually redirect every current and future child of root, the way every
-    // real Xwayland window manager does (Mutter, KWin and wlroots all do this;
-    // Mutter's teardown code calls it "the most important part of cleanup").
-    // In rootless mode the Wayland compositor IS the X11 window manager, and
-    // this is part of that job. We previously did only per-window
-    // CompositeRedirectAutomatic on the plugin window and never this.
-    //
-    // Without it, our container toplevels stay unredirected, which makes them
-    // valid Present flip targets. The upstream fix for the exact line we were
-    // crashing on is titled "Handle clearing damage after flip in
-    // xwl_present_execute": a flip tears the window's damage down, and a later
-    // present then uses it. That matched the coredump exactly -- a valid
-    // xwl_window whose ->damage was NULL, so RegionEmpty() ran on
-    // DamageRegion(NULL) == 0x10. With toplevels manually redirected there is
-    // nothing to flip to, Present takes the copy path, and the damage stays
-    // alive. This is why vanilla REAPER under KWin's own XWM never hit it.
-    //
-    // Only one client may hold CompositeRedirectManual, but we are the sole WM
-    // on our own private display, so there is nothing to contend with.
     xcb_composite_redirect_subwindows(connection_, root_, XCB_COMPOSITE_REDIRECT_MANUAL);
     xcb_set_selection_owner(connection_, support_win, atoms_.WM_S0, XCB_CURRENT_TIME);
     xcb_flush(connection_);
@@ -242,18 +192,15 @@ void XWaylandWM::set_active_window(xcb_window_t window) {
     xcb_flush(connection_);
 }
 
-// ─── xcb_window_t tracking ──────────────────────────────────────────────────────────
 void XWaylandWM::track_window(xcb_window_t w) {
     if (states_.count(w)) return;
 
     WMWindowState st{};
-    st.input_hint       = true; // default: wants input
+    st.input_hint       = true;
 
-    // Read client-set hints
     read_wm_protocols(w, st);
     read_wm_hints(w, st);
 
-    // Subscribe to property changes so we can react to hint updates
     const uint32_t mask = XCB_EVENT_MASK_PROPERTY_CHANGE | XCB_EVENT_MASK_STRUCTURE_NOTIFY;
     xcb_change_window_attributes(connection_, w, XCB_CW_EVENT_MASK, &mask);
 
@@ -264,8 +211,6 @@ void XWaylandWM::untrack_window(xcb_window_t w) {
     states_.erase(w);
     if (pending_focus_ == w) pending_focus_ = XCB_NONE;
 }
-
-// ─── Main event dispatcher ────────────────────────────────────────────────────
 
 bool XWaylandWM::handle_event(xcb_generic_event_t *ev) {
     if (dnd_handle_event(ev)) return true;
@@ -300,21 +245,12 @@ bool XWaylandWM::handle_event(xcb_generic_event_t *ev) {
     return false;
 }
 
-// ─── CreateNotify ─────────────────────────────────────────────────────────────
-// Every new child of root is a toplevel that Xwayland gives a wl_surface (see
-// disallow_commits). Non-override-redirect windows reach us here before their
-// MapRequest, so the property is in place before the first commit; for
-// override-redirect ones Xwayland picks the change up live.
 bool XWaylandWM::on_create_notify(xcb_create_notify_event_t *ev) {
     if (ev->parent == root_)
         disallow_commits(ev->window);
     return false;
 }
 
-// ─── MapRequest ───────────────────────────────────────────────────────────────
-// Native plugins call XMapWindow; because we set SubstructureRedirect on the
-// container, the X server redirects this to us as a MapRequest.  We MUST call
-// XMapWindow ourselves or the window never appears.
 bool XWaylandWM::on_map_request(xcb_map_request_event_t *ev) {
     track_window(ev->window);
     xcb_map_window(connection_, ev->window);
@@ -327,10 +263,6 @@ bool XWaylandWM::on_map_request(xcb_map_request_event_t *ev) {
     }
     return true;
 }
-
-// ─── ConfigureRequest ─────────────────────────────────────────────────────────
-// Native plugins send ConfigureRequest to move/resize themselves.
-// We MUST respond with ConfigureWindow or they stall waiting.
 
 bool XWaylandWM::on_configure_request(xcb_configure_request_event_t *ev) {
     honour_configure_request(ev);
@@ -369,19 +301,15 @@ void XWaylandWM::honour_configure_request(xcb_configure_request_event_t *ev) {
     xcb_flush(connection_);
 }
 
-// ─── ReparentNotify ───────────────────────────────────────────────────────────
 bool XWaylandWM::on_reparent_notify(xcb_reparent_notify_event_t *ev) {
-    // A window moved under root became a toplevel without a CreateNotify there,
-    // so it needs the commit block too (see disallow_commits).
     if (ev->parent == root_) {
         disallow_commits(ev->window);
         return false;
     }
 
-    return false; // let the bridge also see this
+    return false;
 }
 
-// ─── UnmapNotify ──────────────────────────────────────────────────────────────
 bool XWaylandWM::on_unmap_notify(xcb_unmap_notify_event_t *ev) {
     auto it = states_.find(ev->window);
     if (it == states_.end()) return false;
@@ -389,16 +317,14 @@ bool XWaylandWM::on_unmap_notify(xcb_unmap_notify_event_t *ev) {
     set_wm_state(ev->window, WM_STATE_WITHDRAWN);
     if (pending_focus_ == ev->window) pending_focus_ = XCB_NONE;
 
-    return false; // let bridge also handle
+    return false;
 }
 
-// ─── DestroyNotify ────────────────────────────────────────────────────────────
 bool XWaylandWM::on_destroy_notify(xcb_destroy_notify_event_t *ev) {
     untrack_window(ev->window);
     return false;
 }
 
-// ─── WM_TAKE_FOCUS / WM_DELETE_WINDOW ────────────────────────────────────────
 void XWaylandWM::send_take_focus(xcb_window_t w, xcb_timestamp_t t) {
     xcb_client_message_event_t event = {};
     event.response_type = XCB_CLIENT_MESSAGE;
@@ -410,14 +336,11 @@ void XWaylandWM::send_take_focus(xcb_window_t w, xcb_timestamp_t t) {
     xcb_send_event(connection_, false, w, XCB_EVENT_MASK_NO_EVENT, (const char*)&event);
 }
 
-// ─── WM_STATE property helper ─────────────────────────────────────────────────
-// ICCCM §4.1.3.1  WM_STATE = { state, icon_window }
 void XWaylandWM::set_wm_state(xcb_window_t w, int state) {
     const uint32_t data[] = { (uint32_t)state, XCB_NONE };
     xcb_change_property(connection_, XCB_PROP_MODE_REPLACE, w, atoms_.WM_STATE, atoms_.WM_STATE, 32, 2, data);
 }
 
-// ─── Read WM_PROTOCOLS ────────────────────────────────────────────────────────
 void XWaylandWM::read_wm_protocols(xcb_window_t w, WMWindowState &st) {
     st.take_focus = false;
     xcb_icccm_get_wm_protocols_reply_t protocols;
@@ -428,16 +351,12 @@ void XWaylandWM::read_wm_protocols(xcb_window_t w, WMWindowState &st) {
     xcb_icccm_get_wm_protocols_reply_wipe(&protocols);
 }
 
-// ─── Read WM_HINTS ────────────────────────────────────────────────────────────
 void XWaylandWM::read_wm_hints(xcb_window_t w, WMWindowState &st) {
     xcb_icccm_wm_hints_t hints;
     st.input_hint = true;
     if (xcb_icccm_get_wm_hints_reply(connection_, xcb_icccm_get_wm_hints(connection_, w), &hints, nullptr) &&
         (hints.flags & XCB_ICCCM_WM_HINT_INPUT)) st.input_hint = hints.input;
 }
-
-
-
 
 bool XWaylandWM::owns_window(xcb_window_t window, xcb_window_t gui)
 {
@@ -488,26 +407,6 @@ XWaylandWM::WindowType XWaylandWM::window_type(xcb_window_t window, bool overrid
     return undecorated ? POPUP : NORMAL;
 }
 
-// ─── Drag-and-drop OUT of a plugin (yabridge -> REAPER) ──────────────────────
-//
-// yabridge implements plugin->host drag-and-drop itself, as an XDND drag on the X
-// display: it grabs the pointer and looks for an XdndAware window under the cursor to
-// hand the file to. Normally that would be the host's own X11 window, but REAPER is a
-// native Wayland client and has none -- so yabridge finds no target, sits in its drag
-// loop holding the pointer grab, and every XTest event sent afterwards goes to the
-// grab owner instead of the plugin. That is the "REAPER responds, plugin is frozen"
-// hang.
-//
-// The fix is the same one compositors use for X11->Wayland drags: a full-screen proxy
-// ("catcher") window that looks like a valid XDND target to the X side, and translates
-// the drop to the native side. XFixes tells us when a drag starts, because yabridge
-// takes ownership of the XdndSelection selection at that moment.
-//
-// Everything below is plain XCB/XFixes protocol handling -- no GTK, GDK, or SWELL --
-// so it lives here rather than in the bridge. Turning the fetched payload into an
-// actual native drag (GTK/SWELL, or anything else) is the caller's job; see
-// dnd_take_pending_path() and dnd_release_source_button() in the header.
-
 void XWaylandWM::dnd_init()
 {
     if (dnd_catcher_) return;
@@ -532,8 +431,6 @@ void XWaylandWM::dnd_init()
     xcb_flush(connection_);
 }
 
-// Mapped only while a drag is in flight: an InputOnly window under the pointer would
-// otherwise swallow the XTest events used to drive plugins.
 void XWaylandWM::dnd_catcher_show(bool on)
 {
     if (!dnd_catcher_) return;
@@ -576,9 +473,6 @@ void XWaylandWM::dnd_send_finished(xcb_window_t src, bool accepted)
     xcb_flush(connection_);
 }
 
-// Clears the fetched/pending payload. Called whenever a drag concludes (Drop or
-// Leave) as well as when a new one starts, so a stale file from a finished drag can
-// never leak into whatever happens next.
 void XWaylandWM::dnd_reset_payload()
 {
     dnd_requested_ = false;
@@ -587,12 +481,10 @@ void XWaylandWM::dnd_reset_payload()
     dnd_uri_[0]    = 0;
 }
 
-// Returns true if the event was part of a plugin drag-out and is fully handled.
 bool XWaylandWM::dnd_handle_event(xcb_generic_event_t *ev)
 {
     if (!dnd_catcher_ || !connection_) return false;
 
-    // Drag started / ended: yabridge (un)claims XdndSelection.
     if (dnd_xfixes_evt_base_ >= 0 &&
         (ev->response_type & 0x7f) == dnd_xfixes_evt_base_ + XCB_XFIXES_SELECTION_NOTIFY)
     {
@@ -614,15 +506,8 @@ bool XWaylandWM::dnd_handle_event(xcb_generic_event_t *ev)
             return true;
         }
         if (mt == atoms_.XdndPosition) {
-            // Accepting is what lets yabridge's drag loop proceed and release its
-            // pointer grab, which is what unfreezes the plugin.
             dnd_send_status(src, true);
 
-            // Fetch the payload NOW, not at XdndDrop. yabridge owns XdndSelection from
-            // the moment the drag starts, and XdndDrop only arrives after the user has
-            // released the button -- too late to begin a drag on the Wayland side,
-            // which needs a button still held. These XdndPosition messages stream
-            // while the button is down, so this is the window to grab it in.
             if (!dnd_requested_) {
                 dnd_requested_ = true;
                 dnd_source_    = src;
@@ -638,7 +523,7 @@ bool XWaylandWM::dnd_handle_event(xcb_generic_event_t *ev)
             return true;
         }
         if (mt == atoms_.XdndDrop) {
-            if (!dnd_have_uri_) {   // fallback: ask now, late but better than never
+            if (!dnd_have_uri_) {
                 const xcb_timestamp_t when = (xcb_timestamp_t)((xcb_client_message_event_t*)ev)->data.data32[2];
                 xcb_convert_selection(connection_, dnd_catcher_, atoms_.XdndSelection, atoms_.uri_list,
                                       atoms_.dnd_data, when);
@@ -676,8 +561,6 @@ bool XWaylandWM::dnd_handle_event(xcb_generic_event_t *ev)
     return false;
 }
 
-// "file:///a/b%20c.mid\r\n" -> "/a/b c.mid". Toolkit drag sources typically re-encode
-// this when building their own text/uri-list, so callers want a plain path back.
 bool XWaylandWM::dnd_take_pending_path(char *out, size_t outsz)
 {
     if (out && outsz) out[0] = 0;
@@ -694,18 +577,7 @@ bool XWaylandWM::dnd_take_pending_path(char *out, size_t outsz)
 
 void XWaylandWM::dnd_release_source_button(xcb_connection_t *connection)
 {
-    // SWELL's (or any toolkit's) native drag source takes the pointer capture, so the
-    // button release went to it and never reached Xwayland -- yabridge's drag loop waits
-    // for exactly that release, so without this it keeps its pointer grab forever and
-    // the NEXT drag wedges the plugin.
     if (!connection) return;
-    // The bridge's own motion forwarding stops once the toolkit's native drag grabs
-    // input, so Xwayland's virtual pointer has been sitting frozen since before the drag
-    // started. Nudge it with a motion at its own current position first -- observed
-    // behaviour is yabridge's drag loop not noticing a release for a long stretch
-    // (more XdndPosition traffic keeps arriving afterwards) before eventually giving
-    // up via XdndLeave rather than resolving via XdndDrop; a coincident motion+release
-    // pair is closer to what a real release looks like than a release alone.
     xcb_query_pointer_reply_t *pointer = xcb_query_pointer_reply(connection,
         xcb_query_pointer(connection, root_), nullptr);
     if (pointer) {

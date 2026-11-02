@@ -36,9 +36,8 @@ struct Capture {
     xcb_window_t gui_win     = 0;
     bool       pixmap_dirty = true;
     GtkWidget *widget      = nullptr;
-    GtkWidget *active_toplevel = nullptr; // toplevel we hooked notify::is-active on; disconnected in cleanup
+    GtkWidget *active_toplevel = nullptr;
     HWND       hwnd        = nullptr;
-    //
     xcb_damage_damage_t damage      = 0;
 
     GtkWidget *popup_canvas    = nullptr;
@@ -49,7 +48,6 @@ struct Capture {
     int        gtk_x           = 0;
     int        gtk_y           = 0;
     xcb_window_t root_popup      = 0;
-
 
     struct PopupWin {
         xcb_window_t x11_win;
@@ -64,7 +62,6 @@ struct Capture {
     };
     std::list<PopupWin> popups;
 
-    // ── Modals (real dialog windows the plugin opens) ──
     struct ModalWin {
         xcb_window_t x11_win;
         CapturePixmap pixmap;
@@ -181,11 +178,6 @@ static Capture* find_capture(xcb_window_t w)
     return it != g_captures.end() ? it->second : nullptr;
 }
 
-// The currently-active capture, i.e. the plugin the user is actually
-// interacting with. Set eagerly on button-press (before we forward the click
-// to X, so a synchronously-mapped popup doesn't race us) and by the
-// compositor's own focus signal on our top-level (GTK's notify::is-active)
-// for the general case.
 Capture *g_active_capture = nullptr;
 
 static void set_active_capture(Capture *c)
@@ -194,15 +186,14 @@ static void set_active_capture(Capture *c)
     if (g_wm) g_wm->set_active_window(c ? c->parent_win : XCB_NONE);
 }
 
-
 struct bridgeState {
-    xcb_connection_t *connection = nullptr;   // this plugin's X connection
-    xcb_window_t parent = 0;         // container window in Xwayland
+    xcb_connection_t *connection = nullptr;
+    xcb_window_t parent = 0;
     Capture *cap    = nullptr;
-    bool     placed = false;     // has the SWELL widget been put in its container
-    RECT     last_size_pos = {0,0,0,0}; // last hwnd->m_position xw_size actually acted on, see xw_size
+    bool     placed = false;
+    RECT     last_size_pos = {0,0,0,0};
     bool     has_last_size_pos = false;
-    GtkWidget *embed_container = nullptr; // resolved via xw_ensure_embed_widget, see xw_bridge_create/xw_size
+    GtkWidget *embed_container = nullptr;
 };
 
 static bool update_pixmap(Capture *c)
@@ -382,12 +373,6 @@ static bool on_button_press(GtkWidget *widget, GdkEventButton *e, gpointer data)
         xw_raise_modals();
         return true;
     }
-    // Update active BEFORE forwarding the click. The plugin may synchronously
-    // spawn a popup in response, and if we relied on notify::is-active to
-    // update g_active_capture that signal wouldn't have fired yet -- the popup
-    // would map first and be misattributed to the previously-active capture.
-    // Button-press is the earliest reliable "user just started interacting
-    // with THIS plugin" signal we have.
     set_active_capture(c);
     if (c->hwnd) SetFocus(c->hwnd);
     forward_motion(c, e->x, e->y);
@@ -452,23 +437,6 @@ static bool on_scroll(GtkWidget *, GdkEventScroll *e, gpointer data)
     return true;
 }
 
-
-// Compositor told GTK that our top-level's is-active state changed. Under
-// normal Wayland behaviour is-active only becomes true when the user has
-// actually clicked/focused the window, so this is the right signal for
-// "user wants to interact with this plugin".
-//
-// In floating mode there's one capture per top-level, so this is exact. In
-// embedded mode (FX chain) all captures share one top-level, so is-active
-// tells us "someone in this group is active"; we set g_active_capture to
-// whichever capture the signal fired for and last-wins. That's fine because
-// only one plugin is genuinely being interacted with at a time.
-// Does this capture have an open modal? Modals are heavyweight -- a real
-// dialog window the user is filling in -- so focus changes must NOT flip
-// g_active_capture while one is up. Popups deliberately do NOT lock: clicking
-// on another plugin while a menu is up is a legitimate "dismiss and switch"
-// gesture, matching menu behaviour everywhere else. Menus close on focus loss
-// on their own.
 static bool has_live_ui(Capture *c)
 {
     return c && !c->modals.empty();
@@ -483,15 +451,10 @@ static void on_toplevel_active(GObject *obj, GParamSpec *, gpointer data)
     g_object_get(obj, "is-active", &active, NULL);
 
     if (active) {
-        // Don't steal active from a capture that is mid-interaction with the
-        // user (menu up / modal open). Its own is-active is temporarily false
-        // because the popup canvas or modal toplevel took focus; that's not a
-        // genuine "user moved to a different plugin" event.
         if (g_active_capture && g_active_capture != c && has_live_ui(g_active_capture))
             return;
 
         set_active_capture(c);
-        // Update cursor + raise on real activation only, not on hover noise.
         if (c->widget) {
             GdkWindow *gw = gtk_widget_get_window(c->widget);
             if (gw) {
@@ -506,9 +469,6 @@ static void on_toplevel_active(GObject *obj, GParamSpec *, gpointer data)
         }
         xw_raise_modals();
     } else if (g_active_capture == c) {
-        // Don't drop active while our own popup/modal is up -- the compositor
-        // is just handing focus to the popup canvas / modal we spawned, not
-        // telling us the user is done with this plugin.
         if (has_live_ui(c)) return;
         set_active_capture(nullptr);
     }
@@ -554,10 +514,6 @@ static void connect_widget(Capture *c)
                           GDK_BUTTON_RELEASE_MASK |
                           GDK_SCROLL_MASK);
 
-    // disable GTK's animation system entirely, globally -- the narrower
-    // CSS-transition-property attempt didn't stop the repeated on_draw calls, so
-    // testing whether animations are the cause at all, via a broader, more
-    // definitive switch, before looking for a different mechanism entirely.
     {
         GtkSettings *settings = gtk_widget_get_settings(c->widget);
         if (settings) g_object_set(settings, "gtk-enable-animations", FALSE, NULL);
@@ -588,16 +544,8 @@ static Capture* setup_capture(xcb_connection_t *connection, xcb_window_t parent_
 
     xcb_xfixes_change_save_set(connection, XCB_SET_MODE_INSERT, XCB_XFIXES_SAVE_SET_TARGET_ROOT, XCB_XFIXES_SAVE_SET_MAPPING_UNMAP, plugin_win);
 
-    // Automatic composite redirection: the X server keeps drawing the plugin
-    // window off-screen (it never has to be visible in root), and we sample
-    // the resulting pixmap via CompositeNameWindowPixmap. This is what the
-    // pre-Xvfb bridge used, and it sidesteps the Wine input regression that
-    // occurs when two Wine top-levels share the same X coordinates -- with
-    // Automatic redirect the plugin windows never contest hit-testing at all.
     xcb_composite_redirect_window(connection, plugin_win, XCB_COMPOSITE_REDIRECT_AUTOMATIC);
 
-    // Also caches the visual so on_draw does not have to
-    // GetWindowAttributes every frame.
     update_pixmap(c);
 
     c->damage = create_damage(plugin_win);
@@ -605,15 +553,7 @@ static Capture* setup_capture(xcb_connection_t *connection, xcb_window_t parent_
     xcb_flush(connection);
 
     register_capture(c);
-    // A newly-created plugin is always the last one the user acted on -- opening
-    // it is itself the "activate" action -- so treat it as the active capture
-    // immediately. notify::is-active keeps this in sync afterwards; this just
-    // avoids a race between plugin map and the compositor's focus decision.
     set_active_capture(c);
-    // Raise it too: containers overlap in Xwayland and XTest input goes to whichever
-    // is on top. notify::is-active is hooked only after the new toplevel already
-    // has focus, so on_toplevel_active never raises it and input keeps landing on
-    // the previous plugin.
     swell_xcb_raise(connection, parent_win);
     xcb_flush(connection);
     DEBUG_PRINT("[XW] setup parent=0x%lx plugin=0x%lx (auto-composite, pixmap=0x%lx)\n",
@@ -628,11 +568,6 @@ static void cleanup_capture(Capture *c)
 {
     if (!c) return;
     if (g_active_capture == c) set_active_capture(nullptr);
-    // Disconnect notify::is-active BEFORE freeing the capture -- the toplevel
-    // (REAPER's main window in embedded/FX-list mode) outlives us, and the
-    // compositor routinely changes focus during an FX swap. Without this, the
-    // signal fires with a dangling Capture* and gtk_widget_get_window(c->widget)
-    // asserts.
     if (c->active_toplevel && GTK_IS_WIDGET(c->active_toplevel)) {
         g_signal_handlers_disconnect_by_data(c->active_toplevel, c);
         g_object_remove_weak_pointer(G_OBJECT(c->active_toplevel),
@@ -772,7 +707,6 @@ static bool canvas_button_press(GtkWidget *widget, GdkEventButton *e, gpointer d
             return true;
         }
     }
-    // Clicked outside any popup — dismiss.
     if (!hit) {
         dismiss_popups(c);
         return true;
@@ -923,12 +857,6 @@ static void canvas_add_popup(Capture *c, xcb_window_t x11_win, xcb_get_geometry_
 {
     if (!c) return;
 
-    // Refresh the cached gtk offset before using it below. Without this,
-    // c->gtk_x/y is only whatever xw_size last stored, which can be stale
-    // when the plugin toplevel has moved (e.g. user drags a floating FX
-    // window) between size events. Removing this call while removing the
-    // slot code was a real bug -- side effect matters more than the out
-    // params ever did.
     refresh_gtk_offset(c);
     int x, y;
     if (!swell_xcb_translate(c->connection, x11_win, swell_xcb_screen(c->connection)->root,
@@ -1111,7 +1039,6 @@ static void modal_render_destroy(gpointer data, GClosure *) { delete (ModalRende
 
 static void create_modal(Capture *state, xcb_window_t win, xcb_get_geometry_reply_t *attr)
 {
-    // Never create a second modal for the same window.
     for (auto &m : state->modals) if (m.x11_win == win) return;
 
     xcb_connection_t *connection = state->connection;
@@ -1211,20 +1138,6 @@ static void on_popup_mapped(xcb_window_t w)
     free(attributes);
     free(geometry);
 
-    // Match the newly-mapped window to its owning capture.
-    //
-    // Only the ACTIVE plugin can spawn popups. The user has to interact with a
-    // plugin for it to open a menu / dialog, and "interact" implies the
-    // compositor gave that plugin focus, which is what g_active_capture tracks.
-    // Preferring it over PID first solves the multi-instance case: two copies
-    // of the same plugin under one Wine host share a PID, so PID-only matching
-    // would misattribute the popup to whichever capture the map iterates over
-    // first.
-    //
-    // Still verify the PID relationship: if the active capture's PID doesn't
-    // own this window, this popup is unrelated to it and we fall through to
-    // the PID loop as a safety net (e.g. popups that appear without a prior
-    // focus event).
     if (g_active_capture &&
         g_wm->owns_window(w, g_active_capture->gui_win)) {
         handle_new_window(w, g_active_capture, &attr, override_redirect);
@@ -1399,7 +1312,6 @@ static void bridge_handle_event(xcb_generic_event_t *ev)
         return;
     }
 
-    // Non-damage: popup lifecycle. (c set => plugin window, nothing to do here.)
     if (type != XCB_MAP_NOTIFY && type != XCB_UNMAP_NOTIFY && type != XCB_CONFIGURE_NOTIFY) return;
     Capture *c = find_capture(((xcb_map_notify_event_t*)ev)->window);
     if (c) return;
@@ -1486,25 +1398,10 @@ bool xw_bridge_swell_on_gdk_delete_release(HWND hwnd)
         if (!capture_owned_by(c, hwnd)) continue;
         if (!c->popups.empty()) {
             any = true;
-            // Tell the plugin to close its menu FIRST, while we still have the popup
-            // list -- dismiss_popups() returns immediately if popups is empty,
-            // so doing this after the clear below (as the `if (any)` block used to) was
-            // a no-op. Wine was left holding the menu's pointer grab as its window was
-            // destroyed, which wedges the plugin and hangs REAPER. Modals are fine
-            // because they take no pointer grab.
             dismiss_popups(c);
             while (!c->popups.empty()) canvas_remove_popup(c, c->popups.back().x11_win);
         }
         if (!c->modals.empty() && c->connection) {
-            // Modals must be dismissed too. Previously this branch only *checked* for
-            // an active modal, so Super+Q left the dialog open and, because the check
-            // also gated `any`, the close did nothing at all -- leaving a plugin with
-            // an open dialog that hangs the moment REAPER regains focus.
-            //
-            // A dialog cannot be dismissed the way a popup is: a synthetic click would
-            // press whatever button has focus, and Escape needs X11 keyboard focus we
-            // cannot guarantee. WM_DELETE_WINDOW is the protocol-correct "please
-            // close" and Wine dialogs honour it regardless of focus.
             for (auto &md : c->modals) {
                 if (!md.x11_win) continue;
                 any = true;
@@ -1583,11 +1480,6 @@ static void xw_fixed_init(XwFixed *)
 {
 }
 
-// Recursively ensures h has its own real, positioned GtkFixed widget, creating one
-// (and recursively ensuring its own parent has one first) if it doesn't already.
-// A true toplevel (h->m_oswidget already set by SWELL itself) is the recursion's
-// base case -- we never touch m_oswidget, only ever read it. Returns the widget to
-// embed into, or nullptr if something in the chain isn't embeddable.
 static void detach_bridge_widgets(GtkWidget *widget);
 
 static GtkWidget* xw_ensure_embed_widget(HWND h)
@@ -1595,10 +1487,8 @@ static GtkWidget* xw_ensure_embed_widget(HWND h)
     if (!h) return nullptr;
 
     if (h->m_oswidget) {
-        // Real SWELL toplevel. Get (or create) its inner GtkFixed content area,
-        // same as the existing container-unwrapping logic in xw_size.
         GtkWidget *top = (GtkWidget*)h->m_oswidget;
-        if (!GTK_IS_WINDOW(top)) return top; // already a plain container, not a toplevel wrapper
+        if (!GTK_IS_WINDOW(top)) return top;
         GtkWidget *child = gtk_bin_get_child(GTK_BIN(top));
         if (child) return child;
         GtkWidget *fixed = GTK_WIDGET(g_object_new(xw_fixed_get_type(), NULL));
@@ -1613,10 +1503,6 @@ static GtkWidget* xw_ensure_embed_widget(HWND h)
         return fixed;
     }
 
-    // No size request on these intermediate fixeds: it was only refreshed when a
-    // bridge xw_size ran, so after REAPER resized h it went stale -- and GTK won't
-    // let a toplevel shrink below its content's request, so a host window could
-    // never get smaller than its previous plugin. Sized by their parent instead.
     GtkWidget *parent_widget = xw_ensure_embed_widget(h->m_parent);
     if (!parent_widget || !GTK_IS_FIXED(parent_widget)) return nullptr;
     const int scale = swell_gdk_widget_scale(parent_widget);
@@ -1645,11 +1531,6 @@ static GtkWidget* xw_ensure_embed_widget(HWND h)
     return fixed;
 }
 
-// Size the container and centre it on Xwayland's screen. Rootless Xwayland's screen is
-// exactly the monitor area and its pointer is clamped to it, so a container at 0,0
-// leaves no room left/up of the plugin: knob drags stop dead there. Centring splits
-// the spare room evenly; a plugin bigger than the screen clamps back to 0, so this
-// never pushes a window further off-screen than 0,0 did.
 static GdkRectangle place_container(xcb_connection_t *connection, xcb_window_t container, GtkWidget *widget, int w, int h)
 {
     const GdkRectangle bounds = capture_monitor(connection, widget);
@@ -1669,7 +1550,6 @@ static bool try_create_plugin(HWND hwnd)
         xw_size(hwnd);
     }
 
-    // First tick(s): the plugin creates its window as a child of our container.
     if (!bs->cap && bs->connection && bs->parent) {
         xcb_window_t plugin = first_child(bs->connection, bs->parent);
         if (plugin) {
@@ -1684,7 +1564,6 @@ static bool try_create_plugin(HWND hwnd)
             c->widget = hwnd->m_oswidget;
             c->monitor_bounds = bounds;
 
-            // Wine plugins nest a child GUI window; native plugins draw directly.
             c->gui_win = first_child(bs->connection, plugin);
             if (!c->gui_win) c->gui_win = plugin;
             g_captures[c->gui_win] = c;
@@ -1737,31 +1616,13 @@ void xw_size(HWND hwnd)
     if (!hwnd || !hwnd->m_private_data || !hwnd->m_oswidget) return;
     bridgeState *bs = (bridgeState*)hwnd->m_private_data;
  
-    // Has REAPER replaced the host toplevel underneath us?
-    //
-    // Same check SWELL's X11 bridge does in xbridgeProc's WM_SIZE/WM_MOVE
-    // (swell-generic-gdk.cpp):
-    //
-    //     if (h && h->m_oswindow != bs->cur_parent) bs->need_reparent = true;
-    //     ... gdk_window_reparent(bs->w, h->m_oswindow, ...);
-    //         bs->cur_parent = h->m_oswindow;
-    //
-    // SWELL replaces the host toplevel when the FX window is floated/unfloated
-    // from the FX list. Reattach the drawing area to the new GtkWindow.
-    //
-    // Doing this here rather than from the damage callback matters: xw_size
-    // runs on WM_SIZE/WM_MOVE, after SWELL has finished rebuilding the window,
-    // which is exactly where the X11 bridge does it. Attempting the same from
-    // a damage callback ran mid-teardown and segfaulted.
     {
-        // Re-resolve the embed container every time and re-place if it moved.
-        // Fixed float/unfloat in fx list view
         GtkWidget *fresh = xw_ensure_embed_widget(hwnd->m_parent);
         if (fresh != bs->embed_container || gtk_widget_get_parent(hwnd->m_oswidget) != fresh) {
             DEBUG_PRINT("[REPARENT] embed container %p -> %p, re-placing\n",
                         (void*)bs->embed_container, (void*)fresh);
             bs->embed_container = fresh;
-            bs->placed = false;   // the put/show path below re-places it
+            bs->placed = false;
         }
     }
 
@@ -1783,9 +1644,6 @@ void xw_size(HWND hwnd)
         r.left != bs->last_size_pos.left || r.top != bs->last_size_pos.top ||
         r.right != bs->last_size_pos.right || r.bottom != bs->last_size_pos.bottom;
 
-    // Refresh the pixmap on the next draw after resizing. Guard on bs->cap:
-    // WM_SIZE/SetWindowPos can fire before the plugin is captured (e.g. during
-    // an FX-list swap), and the container resize also needs a live capture.
     if (bs->cap && size_changed) {
         refresh_pixmap(bs->cap);
         bs->cap->monitor_bounds = place_container(bs->cap->connection, bs->cap->parent_win,
@@ -1799,10 +1657,6 @@ void xw_size(HWND hwnd)
     h = swell_gdk_ceil(h, scale);
 
     if (!bs->placed) {
-        // If we are re-placing after the host toplevel was replaced, the widget
-        // may still be parented to the old (now dead) container. gtk_fixed_put()
-        // refuses an already-parented widget, so detach it first, holding a
-        // reference across the move so it is not finalized in between.
         {
             GtkWidget *oldp = gtk_widget_get_parent((GtkWidget*)hwnd->m_oswidget);
             if (oldp && oldp != container && GTK_IS_CONTAINER(oldp)) {
@@ -1837,12 +1691,6 @@ void xw_size(HWND hwnd)
         bs->has_last_size_pos = true;
     }
 
-    // Refresh the popup offset so popups position correctly in both floating and
-    // FX-list embedded modes. Must run after the widget's own repositioning above
-    // (gtk_fixed_move/put), not before -- it reads the widget's actual on-screen
-    // position, so computing it before the move used stale, pre-resize data. This
-    // is what broke popup positioning specifically during a resize (e.g. Virtual Mix
-    // Rack expanding the rack to make room for a dragged-in module).
     if (bs->cap) { connect_toplevel(bs->cap); refresh_gtk_offset(bs->cap); }
 }
 

@@ -138,8 +138,6 @@ static void relay_wayland(std::shared_ptr<WaylandConnection> connection, bool fr
         }
         if (from_server && is_registry) {
             if (opcode == 0 && message.body.size() >= 2) {
-                // xwayland_shell_v1: wlroots compositors (e.g. mango) advertise it to
-                // every client but kill any non-compositor Xwayland that binds it.
                 static const char *const hidden[] = { "zxdg_output_manager_v1", "xwayland_shell_v1" };
                 bool hide = false;
                 for (const char *interface : hidden) {
