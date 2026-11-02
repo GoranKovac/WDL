@@ -427,7 +427,9 @@ void XWaylandWM::dnd_init()
     xcb_change_property(connection_, XCB_PROP_MODE_REPLACE, dnd_catcher_, atoms_.XdndAware,
                         XCB_ATOM_ATOM, 32, 1, &ver);
     xcb_xfixes_select_selection_input(connection_, root_, atoms_.XdndSelection,
-                                      XCB_XFIXES_SELECTION_EVENT_MASK_SET_SELECTION_OWNER);
+        XCB_XFIXES_SELECTION_EVENT_MASK_SET_SELECTION_OWNER |
+        XCB_XFIXES_SELECTION_EVENT_MASK_SELECTION_WINDOW_DESTROY |
+        XCB_XFIXES_SELECTION_EVENT_MASK_SELECTION_CLIENT_CLOSE);
     xcb_flush(connection_);
 }
 
@@ -490,7 +492,7 @@ bool XWaylandWM::dnd_handle_event(xcb_generic_event_t *ev)
     {
         xcb_xfixes_selection_notify_event_t *se = (xcb_xfixes_selection_notify_event_t*)ev;
         if (se->selection == atoms_.XdndSelection) {
-            if (se->owner != XCB_NONE) dnd_reset_payload();
+            dnd_reset_payload();
             dnd_catcher_show(se->owner != XCB_NONE);
         }
         return true;
