@@ -157,13 +157,18 @@ bool CaptureGL::read(const CapturePixmap &pixmap, GdkWindow *window)
             G_CALLBACK(+[](GdkFrameClock *, gpointer) { gdk_gl_context_clear_current(); }),
             context, G_CONNECT_AFTER);
     }
+    const int scale = gdk_window_get_scale_factor(window);
+    const int next_width = gdk_window_get_width(window) * scale;
+    const int next_height = gdk_window_get_height(window) * scale;
+    if (width != next_width || height != next_height) {
+        width = next_width;
+        height = next_height;
+        if (native_window) wl_egl_window_resize(native_window, width, height, 0, 0);
+    }
     if (!make_current() ||
         epoxy_gl_version() < (epoxy_is_desktop_gl() ? 32 : 30) ||
         !epoxy_has_gl_extension("GL_OES_EGL_image")) return false;
     display = eglGetCurrentDisplay();
-    const int scale = gdk_window_get_scale_factor(window);
-    const int next_width = gdk_window_get_width(window) * scale;
-    const int next_height = gdk_window_get_height(window) * scale;
     if (!native_window) {
         EGLint id, count, min_interval;
         EGLConfig config;
@@ -178,11 +183,6 @@ bool CaptureGL::read(const CapturePixmap &pixmap, GdkWindow *window)
         if (!native_window) return false;
         target = eglCreateWindowSurface(display, config, (EGLNativeWindowType)native_window, nullptr);
         if (target == EGL_NO_SURFACE || !make_current() || !eglSwapInterval(display, 0)) return false;
-    }
-    if (width != next_width || height != next_height) {
-        width = next_width;
-        height = next_height;
-        wl_egl_window_resize(native_window, width, height, 0, 0);
     }
     wl_surface_set_buffer_scale(surface, scale);
     EGLImageKHR image = buffer.import(display);
