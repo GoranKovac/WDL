@@ -737,6 +737,13 @@ static bool popup_accepts_input(xcb_connection_t *connection, xcb_window_t windo
     return accepts;
 }
 
+static bool has_input_popup(const Capture *c)
+{
+    for (const auto &p : c->popups)
+        if (p.visible && popup_accepts_input(c->connection, p.x11_win)) return true;
+    return false;
+}
+
 static void dismiss_popups(Capture *c);
 
 static bool canvas_button_press(GtkWidget *widget, GdkEventButton *e, gpointer data)
@@ -1020,6 +1027,7 @@ static void modal_request_close(Capture *c, xcb_window_t window)
 static gboolean modal_delete_cb(GtkWidget *, GdkEvent *, gpointer data)
 {
     ModalRender *m = (ModalRender*)data;
+    if (has_input_popup(m->cap)) return TRUE;
     modal_request_close(m->cap, m->x11_win);
     return TRUE;
 }
@@ -1452,15 +1460,30 @@ bool xw_bridge_swell_on_button_event_escape()
     return any;
 }
 
+static bool capture_owned_by(const Capture *c, HWND hwnd)
+{
+    HWND owner = c->hwnd;
+    while (owner && owner != hwnd) owner = owner->m_parent ? owner->m_parent : owner->m_owner;
+    return owner != nullptr;
+}
+
+bool xw_bridge_popup_blocks_close(HWND hwnd)
+{
+    for (auto &kv : g_captures) {
+        Capture *c = kv.second;
+        if (kv.first != c->parent_win) continue;
+        if (capture_owned_by(c, hwnd) && has_input_popup(c)) return true;
+    }
+    return false;
+}
+
 bool xw_bridge_swell_on_gdk_delete_release(HWND hwnd)
 {
     bool any = false;
     for (auto &kv : g_captures) {
         Capture *c = kv.second;
         if (!c || kv.first != c->parent_win) continue;
-        HWND owner = c->hwnd;
-        while (owner && owner != hwnd) owner = owner->m_parent ? owner->m_parent : owner->m_owner;
-        if (!owner) continue;
+        if (!capture_owned_by(c, hwnd)) continue;
         if (!c->popups.empty()) {
             any = true;
             // Tell the plugin to close its menu FIRST, while we still have the popup
@@ -1522,11 +1545,38 @@ static void xw_fixed_get_preferred_size(GtkWidget *, gint *minimum, gint *natura
     if (natural) *natural = 1;
 }
 
+static void xw_fixed_size_allocate(GtkWidget *widget, GtkAllocation *allocation)
+{
+    gtk_widget_set_allocation(widget, allocation);
+    GList *children = gtk_container_get_children(GTK_CONTAINER(widget));
+    for (GList *p = children; p; p = p->next) {
+        GtkWidget *child = GTK_WIDGET(p->data);
+        if (!gtk_widget_get_visible(child)) continue;
+        GtkAllocation rect;
+        gtk_container_child_get(GTK_CONTAINER(widget), child, "x", &rect.x, "y", &rect.y, nullptr);
+        rect.width = allocation->width - rect.x;
+        rect.height = allocation->height - rect.y;
+        gtk_widget_set_child_visible(child, rect.width > 0 && rect.height > 0);
+        if (rect.width <= 0 || rect.height <= 0) continue;
+        if (!GTK_IS_FIXED(child)) {
+            GtkRequisition size;
+            gtk_widget_get_preferred_size(child, &size, nullptr);
+            rect.width = min(rect.width, size.width);
+            rect.height = min(rect.height, size.height);
+        }
+        rect.x += allocation->x;
+        rect.y += allocation->y;
+        gtk_widget_size_allocate(child, &rect);
+    }
+    g_list_free(children);
+}
+
 static void xw_fixed_class_init(XwFixedClass *klass)
 {
     GtkWidgetClass *widget_class = GTK_WIDGET_CLASS(klass);
     widget_class->get_preferred_width = xw_fixed_get_preferred_size;
     widget_class->get_preferred_height = xw_fixed_get_preferred_size;
+    widget_class->size_allocate = xw_fixed_size_allocate;
 }
 
 static void xw_fixed_init(XwFixed *)
@@ -1566,7 +1616,7 @@ static GtkWidget* xw_ensure_embed_widget(HWND h)
     // No size request on these intermediate fixeds: it was only refreshed when a
     // bridge xw_size ran, so after REAPER resized h it went stale -- and GTK won't
     // let a toplevel shrink below its content's request, so a host window could
-    // never get smaller than its previous plugin. Sized by their children instead.
+    // never get smaller than its previous plugin. Sized by their parent instead.
     GtkWidget *parent_widget = xw_ensure_embed_widget(h->m_parent);
     if (!parent_widget || !GTK_IS_FIXED(parent_widget)) return nullptr;
     const int scale = swell_gdk_widget_scale(parent_widget);
@@ -1585,7 +1635,7 @@ static GtkWidget* xw_ensure_embed_widget(HWND h)
         gtk_widget_destroy(existing);
     }
 
-    GtkWidget *fixed = gtk_fixed_new();
+    GtkWidget *fixed = GTK_WIDGET(g_object_new(xw_fixed_get_type(), NULL));
     gtk_fixed_put(GTK_FIXED(parent_widget), fixed, x, y);
     gtk_widget_show(fixed);
 
