@@ -193,7 +193,6 @@ struct bridgeState {
     bool     placed = false;
     RECT     last_size_pos = {0,0,0,0};
     bool     has_last_size_pos = false;
-    GtkWidget *embed_container = nullptr;
 };
 
 static bool update_pixmap(Capture *c)
@@ -1545,10 +1544,7 @@ static bool try_create_plugin(HWND hwnd)
     if (!hwnd || !hwnd->m_private_data) return true;
     bridgeState *bs = (bridgeState*)hwnd->m_private_data;
 
-    if (!bs->placed) {
-        bs->embed_container = xw_ensure_embed_widget(hwnd->m_parent);
-        xw_size(hwnd);
-    }
+    if (!bs->placed) xw_size(hwnd);
 
     if (!bs->cap && bs->connection && bs->parent) {
         xcb_window_t plugin = first_child(bs->connection, bs->parent);
@@ -1615,19 +1611,12 @@ void xw_size(HWND hwnd)
 {
     if (!hwnd || !hwnd->m_private_data || !hwnd->m_oswidget) return;
     bridgeState *bs = (bridgeState*)hwnd->m_private_data;
- 
-    {
-        GtkWidget *fresh = xw_ensure_embed_widget(hwnd->m_parent);
-        if (fresh != bs->embed_container || gtk_widget_get_parent(hwnd->m_oswidget) != fresh) {
-            DEBUG_PRINT("[REPARENT] embed container %p -> %p, re-placing\n",
-                        (void*)bs->embed_container, (void*)fresh);
-            bs->embed_container = fresh;
-            bs->placed = false;
-        }
-    }
 
-    GtkWidget *container = bs->embed_container;
-    if (!container || !GTK_IS_FIXED(container)) return;
+    GtkWidget *container = xw_ensure_embed_widget(hwnd->m_parent);
+    if (!container || !GTK_IS_FIXED(container)) {
+        bs->placed = false;
+        return;
+    }
     const int scale = swell_gdk_widget_scale(container);
 
     RECT r = hwnd->m_position;
@@ -1656,35 +1645,16 @@ void xw_size(HWND hwnd)
     w = swell_gdk_ceil(w, scale);
     h = swell_gdk_ceil(h, scale);
 
-    if (!bs->placed) {
-        {
-            GtkWidget *oldp = gtk_widget_get_parent((GtkWidget*)hwnd->m_oswidget);
-            if (oldp && oldp != container && GTK_IS_CONTAINER(oldp)) {
-                g_object_ref(hwnd->m_oswidget);
-                gtk_container_remove(GTK_CONTAINER(oldp), (GtkWidget*)hwnd->m_oswidget);
-                gtk_fixed_put(GTK_FIXED(container), (GtkWidget*)hwnd->m_oswidget, pos_x, pos_y);
-                g_object_unref(hwnd->m_oswidget);
-                gtk_widget_set_size_request((GtkWidget*)hwnd->m_oswidget, w, h);
-                gtk_widget_show((GtkWidget*)hwnd->m_oswidget);
-                bs->placed = true;
-                GtkWidget *tl2 = gtk_widget_get_toplevel((GtkWidget*)hwnd->m_oswidget);
-                if (!(tl2 && GTK_IS_WINDOW(tl2))) bs->placed = false;
-                if (size_changed) { bs->last_size_pos = r; bs->has_last_size_pos = true; }
-                if (bs->cap) { connect_toplevel(bs->cap); refresh_gtk_offset(bs->cap); }
-                return;
-            }
-        }
+    GtkWidget *old_parent = gtk_widget_get_parent(hwnd->m_oswidget);
+    if (old_parent != container) {
+        if (old_parent) gtk_container_remove(GTK_CONTAINER(old_parent), hwnd->m_oswidget);
         gtk_fixed_put(GTK_FIXED(container), hwnd->m_oswidget, pos_x, pos_y);
-        gtk_widget_set_size_request(hwnd->m_oswidget, w, h);
         gtk_widget_show(hwnd->m_oswidget);
-        bs->placed = true;
-
-        GtkWidget *tl = gtk_widget_get_toplevel(hwnd->m_oswidget);
-        if (!(tl && GTK_IS_WINDOW(tl))) bs->placed = false;
     } else {
         gtk_fixed_move(GTK_FIXED(container), hwnd->m_oswidget, pos_x, pos_y);
-        gtk_widget_set_size_request(hwnd->m_oswidget, w, h);
     }
+    gtk_widget_set_size_request(hwnd->m_oswidget, w, h);
+    bs->placed = GTK_IS_WINDOW(gtk_widget_get_toplevel(hwnd->m_oswidget));
 
     if (size_changed) {
         bs->last_size_pos = r;
