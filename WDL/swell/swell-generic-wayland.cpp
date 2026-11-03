@@ -1558,11 +1558,6 @@ static void end_modal(HWND hwnd)
     gtk_window_set_modal(GTK_WINDOW(hwnd->m_oswidget), FALSE);
 }
 
-static bool can_run_timers()
-{
-  return !xw_bridge_foreign_popup_open();
-}
-
 const SWELL_GdkBackend swell_gdk_wayland = {
   event_handler, mouse_event, run_events, get_cursor_pos, get_async_key_state,
   update_window, invalidate, get_window_rect, resize_window, set_size_hints,
@@ -1570,7 +1565,7 @@ const SWELL_GdkBackend swell_gdk_wayland = {
   close_window, focus_window, set_decorations, set_cursor, create_bridge, invalidate_focus, true,
   get_viewport, monitor_geometry, scaling_init,
   clipboard_open, req_wayland_clipboard, NULL, publish_wayland_clipboard, clipboard_text, drag_files,
-  swell_wayland_begin_drag, window_from_point, can_run_timers, false, end_modal
+  swell_wayland_begin_drag, window_from_point, false, end_modal
 };
 
 #endif

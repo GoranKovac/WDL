@@ -1033,7 +1033,6 @@ SWELL_OSWINDOW swell_oswindow_from_hwnd(HWND hwnd);
 void swell_oswindow_focus(HWND hwnd);
 void swell_oswindow_begin_drag(HWND source);
 bool swell_oswindow_from_point(POINT point, HWND *window);
-bool swell_oswindow_can_run_timers();
 bool swell_oswindow_reuse_popup();
 void swell_oswindow_end_modal(HWND hwnd);
 void swell_oswindow_update_style(HWND hwnd, LONG oldstyle);

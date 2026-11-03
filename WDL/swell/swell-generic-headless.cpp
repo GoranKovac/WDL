@@ -101,7 +101,6 @@ void swell_oswindow_manage(HWND hwnd, bool wantfocus)
 
 void swell_oswindow_begin_drag(HWND) { }
 bool swell_oswindow_from_point(POINT, HWND *) { return false; }
-bool swell_oswindow_can_run_timers() { return true; }
 bool swell_oswindow_reuse_popup() { return true; }
 
 void swell_oswindow_end_modal(HWND) { }

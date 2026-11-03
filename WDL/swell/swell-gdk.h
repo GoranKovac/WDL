@@ -49,7 +49,6 @@ struct SWELL_GdkBackend
   void (*drag_files)(HWND hwnd, const SWELL_GdkDrag &data);
   void (*begin_drag)(HWND source);
   HWND (*window_from_point)(POINT point);
-  bool (*can_run_timers)();
   bool reuse_popup;
   void (*end_modal)(HWND hwnd);
 };

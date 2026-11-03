@@ -905,8 +905,6 @@ void SWELL_RunMessageLoop()
   SWELL_MessageQueue_Flush();
   SWELL_RunEvents();
 
-  if (!swell_oswindow_can_run_timers()) return;
-
   const DWORD now = GetTickCount();
   WDL_MutexLock lock(&m_timermutex);
   TimerInfoRec *rec = m_timer_list;

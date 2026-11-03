@@ -1795,7 +1795,7 @@ const SWELL_GdkBackend swell_gdk_x11 = {
   close_window, focus_window, swell_gdk_set_decorations, set_cursor, swell_x11_create_bridge, NULL, false,
   NULL, swell_gdk_monitor_geometry, scaling_init,
   NULL, read_clipboard, claim_clipboard, NULL, NULL, drag_files,
-  NULL, NULL, NULL, true, NULL
+  NULL, NULL, true, NULL
 };
 
 #endif

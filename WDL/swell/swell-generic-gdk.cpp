@@ -1639,11 +1639,6 @@ bool swell_oswindow_from_point(POINT point, HWND *window)
   return true;
 }
 
-bool swell_oswindow_can_run_timers()
-{
-  return !swell_gdk_backend->can_run_timers || swell_gdk_backend->can_run_timers();
-}
-
 bool swell_oswindow_reuse_popup()
 {
   return swell_gdk_backend->reuse_popup;
