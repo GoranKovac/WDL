@@ -750,7 +750,7 @@ static void swell_wayland_drag_set_destination(HWND hwnd)
 
 static bool swell_wayland_drag_target(POINT p, HWND *target)
 {
-  if (!s_wayland_drag_source) return false;
+  if (!s_wayland_drag_source && !s_wayland_drag_destination) return false;
   *target = s_wayland_drag_destination;
   if (*target && !IsWindow(*target)) *target = NULL;
   if (*target)
@@ -772,11 +772,8 @@ static void swell_wayland_drag_mouse(UINT msg)
                          s_wayland_drag_position.x, s_wayland_drag_position.y);
 }
 
-static bool swell_wayland_drag_update(GtkWidget *widget, GdkDragContext *context,
-                                      gint x, gint y, HWND hwnd)
+static void swell_wayland_drag_update(GtkWidget *widget, gint x, gint y, HWND hwnd)
 {
-  if (!s_wayland_drag_source || gtk_drag_get_source_widget(context) != s_wayland_drag_widget)
-    return false;
   swell_wayland_drag_set_destination(hwnd);
   if (hwnd && hwnd->m_oswindow) s_last_hover_oswindow = hwnd->m_oswindow;
   double px = x, py = y, rx = 0, ry = 0;
@@ -784,33 +781,44 @@ static bool swell_wayland_drag_update(GtkWidget *widget, GdkDragContext *context
   s_wayland_drag_position.x = (int)rx;
   s_wayland_drag_position.y = (int)ry;
   swell_lastMessagePos = MAKELONG((int)rx, (int)ry);
-  return true;
 }
 
 static gboolean swell_wayland_drag_motion(GtkWidget *widget, GdkDragContext *context,
                                           gint x, gint y, guint time, gpointer data)
 {
-  if (!swell_wayland_drag_update(widget, context, x, y, (HWND)data)) return FALSE;
+  const bool internal = s_wayland_drag_source &&
+                        gtk_drag_get_source_widget(context) == s_wayland_drag_widget;
+  if (!internal && gtk_drag_dest_find_target(widget, context, NULL) != swell_gdk_urilist_atom())
+    return FALSE;
+  const bool entering = s_wayland_drag_destination != (HWND)data;
+  swell_wayland_drag_update(widget, x, y, (HWND)data);
   gdk_drag_status(context, GDK_ACTION_COPY, time);
-  swell_wayland_drag_mouse(WM_MOUSEMOVE);
+  if (internal) swell_wayland_drag_mouse(WM_MOUSEMOVE);
+  else
+  {
+    if (entering) swell_gdk_drag_enter(s_wayland_drag_position.x, s_wayland_drag_position.y);
+    if (SWELL_DDrop_onDragOver) SWELL_DDrop_onDragOver(s_wayland_drag_position);
+  }
   return TRUE;
 }
 
 static gboolean swell_wayland_drag_drop(GtkWidget *widget, GdkDragContext *context,
                                         gint x, gint y, guint time, gpointer data)
 {
-  if (!swell_wayland_drag_update(widget, context, x, y, (HWND)data)) return FALSE;
+  if (!s_wayland_drag_source || gtk_drag_get_source_widget(context) != s_wayland_drag_widget)
+    return FALSE;
+  swell_wayland_drag_update(widget, x, y, (HWND)data);
   s_wayland_drag_released = true;
   swell_wayland_drag_mouse(WM_LBUTTONUP);
   gtk_drag_finish(context, TRUE, FALSE, time);
   return TRUE;
 }
 
-static void swell_wayland_drag_leave(GtkWidget *, GdkDragContext *context, guint, gpointer data)
+static void swell_wayland_drag_leave(GtkWidget *, GdkDragContext *, guint, gpointer data)
 {
-  if (!s_wayland_drag_source || s_wayland_drag_destination != (HWND)data ||
-      gtk_drag_get_source_widget(context) != s_wayland_drag_widget) return;
+  if (!s_wayland_drag_destination || s_wayland_drag_destination != (HWND)data) return;
   swell_wayland_drag_set_destination(NULL);
+  if (!s_wayland_drag_source && SWELL_DDrop_onDragLeave) SWELL_DDrop_onDragLeave();
 }
 
 static gboolean swell_wayland_drag_failed(GtkWidget *, GdkDragContext *, GtkDragResult result, gpointer)
@@ -1046,7 +1054,7 @@ static void run_events()
 
 static void get_cursor_pos(POINT *pt)
 {
-  if (s_wayland_drag_source)
+  if (s_wayland_drag_source || s_wayland_drag_destination)
   {
     *pt = s_wayland_drag_position;
     return;
@@ -1178,12 +1186,14 @@ static void show_window(HWND hwnd, bool, bool modal, guint32)
 
 static void hide_window(HWND hwnd)
 {
+  swell_wayland_drag_leave(NULL, NULL, 0, hwnd);
   if (hwnd->m_oswidget) hide_tooltip(hwnd->m_oswidget);
   gdk_window_hide(hwnd->m_oswindow);
 }
 
 static void destroy_window(HWND hwnd)
 {
+  swell_wayland_drag_leave(NULL, NULL, 0, hwnd);
   GtkWidget *widget = hwnd->m_oswidget;
   if (widget)
   {
@@ -1499,6 +1509,7 @@ static void drag_files(HWND hwnd, const SWELL_GdkDrag &data)
     SWELL_RunMessageLoop();
     Sleep(10);
   }
+  swell_wayland_drag_leave(NULL, NULL, 0, s_wayland_drag_destination);
   swell_gdk_drag_source = NULL;
   DestroyWindow(h);
 }
