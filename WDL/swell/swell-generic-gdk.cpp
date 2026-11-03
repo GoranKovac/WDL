@@ -1416,6 +1416,7 @@ static void deactivateTimer(HWND hwnd, UINT uMsg, UINT_PTR tm, DWORD dwt)
   GdkWindow *window = gdk_screen_get_active_window(gdk_screen_get_default());
   if (!is_our_oswindow(window))
     on_deactivate();
+  if (window) g_object_unref(window);
 
   update_menubar_activations();
 }
@@ -2158,9 +2159,10 @@ BOOL GetMonitorInfo(HMONITOR hmon, void *inf)
   if (a->cbSize > sizeof(MONITORINFO))
   {
     const int maxlen = (int) (a->cbSize - sizeof(MONITORINFO));
-    const char *s = gdk_screen_get_monitor_plug_name(defscr,monidx);
+    char *s = gdk_screen_get_monitor_plug_name(defscr,monidx);
     if (!s) return FALSE;
     lstrcpyn_safe(a->szDevice,s,maxlen);
+    g_free(s);
   }
 
   return TRUE;
