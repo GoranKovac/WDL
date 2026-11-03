@@ -2548,7 +2548,7 @@ static void on_popup_unmapped(xcb_window_t w)
     }
 }
 
-static bool on_popup_configured(xcb_window_t w, int cw, int ch)
+static void on_window_configured(xcb_window_t w, int cw, int ch)
 {
     for (auto &kv : g_captures) {
         Capture *c = kv.second;
@@ -2557,7 +2557,7 @@ static bool on_popup_configured(xcb_window_t w, int cw, int ch)
             if (p.x11_win != w) continue;
             int x, y;
             if (!swell_xcb_translate(c->connection, w, swell_xcb_screen(c->connection)->root,
-                                       0, 0, &x, &y)) return true;
+                                       0, 0, &x, &y)) return;
             refresh_gtk_offset(c);
             int old_x = p.x, old_y = p.y, old_w = p.w, old_h = p.h;
             p.x = x + c->gtk_x;
@@ -2582,10 +2582,23 @@ static bool on_popup_configured(xcb_window_t w, int cw, int ch)
                     gtk_widget_queue_draw(c->canvas_draw);
                 }
             }
-            return true;
+            return;
+        }
+        for (auto &m : c->modals) {
+            if (m.x11_win != w) continue;
+            const int scale = swell_gdk_widget_scale(m.draw);
+            const int width = swell_gdk_ceil(cw, scale), height = swell_gdk_ceil(ch, scale);
+            int old_width, old_height;
+            gtk_widget_get_size_request(m.draw, &old_width, &old_height);
+            if (old_width != width || old_height != height || m.pixmap.width != cw || m.pixmap.height != ch) {
+                gtk_widget_set_size_request(m.draw, width, height);
+                gtk_window_resize(GTK_WINDOW(m.gtk_win), width, height);
+                m.pixmap_dirty = true;
+                gtk_widget_queue_draw(m.draw);
+            }
+            return;
         }
     }
-    return false;
 }
 
 static void handle_damage_notify(xcb_damage_notify_event_t *de)
@@ -2703,7 +2716,7 @@ static void bridge_handle_event(xcb_generic_event_t *ev)
             on_popup_unmapped(((xcb_unmap_notify_event_t*)ev)->window);
             break;
         case XCB_CONFIGURE_NOTIFY:
-            on_popup_configured(((xcb_configure_notify_event_t*)ev)->window,
+            on_window_configured(((xcb_configure_notify_event_t*)ev)->window,
                                 ((xcb_configure_notify_event_t*)ev)->width, ((xcb_configure_notify_event_t*)ev)->height);
             break;
         default:
