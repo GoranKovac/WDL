@@ -1607,7 +1607,7 @@ static cairo_surface_t *read_pixels(Capture *c, CapturePixmap &pixmap, CaptureIm
     return surface;
 }
 
-static bool on_draw(GtkWidget *widget, cairo_t *cr, gpointer data)
+static gboolean on_draw(GtkWidget *widget, cairo_t *cr, gpointer data)
 {
     Capture *c = (Capture*)data;
     if (!gtk_cairo_should_draw_window(cr, gtk_widget_get_window(widget))) return FALSE;
@@ -1755,7 +1755,7 @@ bool xw_bridge_raise_modals()
     return any;
 }
 
-static bool on_button_press(GtkWidget *widget, GdkEventButton *e, gpointer data)
+static gboolean on_button_press(GtkWidget *widget, GdkEventButton *e, gpointer data)
 {
     DEBUG_PRINT("[DNDX] widget button PRESS btn=%d\n", e->button);
     Capture *c = (Capture*)data;
@@ -1769,7 +1769,7 @@ static bool on_button_press(GtkWidget *widget, GdkEventButton *e, gpointer data)
     return true;
 }
 
-static bool on_button_release(GtkWidget *, GdkEventButton *e, gpointer data)
+static gboolean on_button_release(GtkWidget *, GdkEventButton *e, gpointer data)
 {
     DEBUG_PRINT("[DNDX] widget button RELEASE btn=%d\n", e->button);
     Capture *c = (Capture*)data;
@@ -1780,7 +1780,7 @@ static bool on_button_release(GtkWidget *, GdkEventButton *e, gpointer data)
     return true;
 }
 
-static bool on_motion(GtkWidget *, GdkEventMotion *e, gpointer data)
+static gboolean on_motion(GtkWidget *, GdkEventMotion *e, gpointer data)
 {
     if (g_wm && g_wm->dnd_has_pending()) {
         static char path[8192];
@@ -1806,7 +1806,7 @@ static bool on_motion(GtkWidget *, GdkEventMotion *e, gpointer data)
     return true;
 }
 
-static bool on_scroll(GtkWidget *, GdkEventScroll *e, gpointer data)
+static gboolean on_scroll(GtkWidget *, GdkEventScroll *e, gpointer data)
 {
     Capture *c = (Capture*)data;
     if (!c || !c->connection) return false;
@@ -1973,7 +1973,7 @@ static void cleanup_capture(Capture *c)
     delete c;
 }
 
-static bool canvas_draw_cb(GtkWidget *widget, cairo_t *cr, gpointer data)
+static gboolean canvas_draw_cb(GtkWidget *widget, cairo_t *cr, gpointer data)
 {
     Capture *c = (Capture*)data;
     if (!c || !c->connection) return false;
@@ -2061,7 +2061,7 @@ static bool has_input_popup(const Capture *c)
 
 static void dismiss_popups(Capture *c);
 
-static bool canvas_button_press(GtkWidget *widget, GdkEventButton *e, gpointer data)
+static gboolean canvas_button_press(GtkWidget *widget, GdkEventButton *e, gpointer data)
 {
     Capture *c = (Capture*)data;
     if (!c || !c->connection) return false;
@@ -2094,7 +2094,7 @@ static bool canvas_button_press(GtkWidget *widget, GdkEventButton *e, gpointer d
     return false;
 }
 
-static bool canvas_button_release(GtkWidget *, GdkEventButton *e, gpointer data)
+static gboolean canvas_button_release(GtkWidget *, GdkEventButton *e, gpointer data)
 {
     Capture *c = (Capture*)data;
     if (!c || !c->connection) return false;
@@ -2103,7 +2103,7 @@ static bool canvas_button_release(GtkWidget *, GdkEventButton *e, gpointer data)
     return true;
 }
 
-static bool canvas_motion(GtkWidget *widget, GdkEventMotion *e, gpointer data)
+static gboolean canvas_motion(GtkWidget *widget, GdkEventMotion *e, gpointer data)
 {
     Capture *c = (Capture*)data;
     if (!c || !c->connection) return false;
@@ -2337,7 +2337,7 @@ static gboolean modal_delete_cb(GtkWidget *, GdkEvent *, gpointer data)
     return TRUE;
 }
 
-static bool modal_draw_cb(GtkWidget *widget, cairo_t *cr, gpointer data)
+static gboolean modal_draw_cb(GtkWidget *widget, cairo_t *cr, gpointer data)
 {
     ModalRender *m = (ModalRender*)data;
     if (!m || !m->cap || !m->cap->connection) return false;
@@ -2374,7 +2374,7 @@ static void modal_forward_motion(ModalRender *m, GtkWidget *widget, double wx, d
     fake_motion(m->cap->connection, rx, ry);
 }
 
-static bool modal_button_press(GtkWidget *widget, GdkEventButton *e, gpointer data)
+static gboolean modal_button_press(GtkWidget *widget, GdkEventButton *e, gpointer data)
 {
     ModalRender *m = (ModalRender*)data;
     if (!m || !m->cap->connection) return false;
@@ -2384,7 +2384,7 @@ static bool modal_button_press(GtkWidget *widget, GdkEventButton *e, gpointer da
     return true;
 }
 
-static bool modal_button_release(GtkWidget *widget, GdkEventButton *e, gpointer data)
+static gboolean modal_button_release(GtkWidget *widget, GdkEventButton *e, gpointer data)
 {
     ModalRender *m = (ModalRender*)data;
     if (!m || !m->cap->connection) return false;
@@ -2394,7 +2394,7 @@ static bool modal_button_release(GtkWidget *widget, GdkEventButton *e, gpointer 
     return true;
 }
 
-static bool modal_motion(GtkWidget *widget, GdkEventMotion *e, gpointer data)
+static gboolean modal_motion(GtkWidget *widget, GdkEventMotion *e, gpointer data)
 {
     ModalRender *m = (ModalRender*)data;
     if (!m || !m->cap->connection) return false;
@@ -2403,7 +2403,7 @@ static bool modal_motion(GtkWidget *widget, GdkEventMotion *e, gpointer data)
     return true;
 }
 
-static bool modal_key(GtkWidget *, GdkEventKey *e, gpointer data)
+static gboolean modal_key(GtkWidget *, GdkEventKey *e, gpointer data)
 {
     ModalRender *m = (ModalRender*)data;
     if (!m || !m->cap->connection) return false;
