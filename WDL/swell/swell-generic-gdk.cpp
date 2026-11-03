@@ -39,14 +39,12 @@ extern "C" {
 
 #include "swell-internal.h"
 #include <limits.h>
-#include <gdk/gdkx.h>
+#include <gdk/gdkkeysyms.h>
 #include "swell-x11.h"
 #include "swell-gdk.h"
 #include "swell-dlggen.h"
 #include "../wdlcstring.h"
 #include "../wdlutf8.h"
-
-
 
 
 #ifdef SWELL_SUPPORT_GTK
@@ -55,7 +53,6 @@ extern HWND swell_ime_target;
 extern GtkIMContext *swell_ime_context;
 #endif
 
-static void (*_gdk_drag_drop_done)(GdkDragContext *, gboolean); // may not always be available
 
 // for m_oswindow_private
 #define PRIVATE_NEEDSHOW 1 
@@ -70,8 +67,6 @@ GdkEvent *swell_gdk_current_event;
 const SWELL_GdkBackend *swell_gdk_backend = &swell_gdk_x11;
 static GList *s_program_icon_list;
 
-static SWELL_OSWINDOW swell_dragsrc_osw;
-static DWORD swell_dragsrc_timeout_start;
 HWND swell_gdk_drag_source;
 DWORD swell_lastMessagePos;
 static const char *swell_dragsrc_fn;
@@ -87,9 +82,6 @@ static int gdk_options;
 #define OPTION_FULLSCREEN_DYNAMIC 64
 #define OPTION_IS_WAYLAND 0x20000000
 #define OPTIONS_READ 0x40000000
-
-static HWND s_ddrop_hwnd;
-static POINT s_ddrop_pt;
 
 
 static SWELL_CursorResourceIndex *SWELL_curmodule_cursorresource_head;
@@ -107,27 +99,6 @@ static bool g_swell_mouse_relmode;
 static int g_swell_mouse_relmode_curpos_x;
 static int g_swell_mouse_relmode_curpos_y;
 
-
-//// clipboard state
-static HANDLE s_clipboard_getstate; // currently retrieving data/format via req_clipboard() (either GetClipboardData() or EnumClipboardFormats(0))
-static GdkAtom s_clipboard_getstate_fmt;
-
-static WDL_PtrSet<UINT> s_clipboard_enumstate; // populated on first EnumClipboardFormats() call, or by SetClipboardData()
-
-struct clip_fmt {
-  const char *str;
-  GdkAtom atom;
-};
-static WDL_TypedBuf<clip_fmt> s_clip_fmts; // mapping of UINT clipboard types, offset by 1 (s_clip_fmts.Get()[0] is CF_TEXT=1, etc)
-
-static HWND s_clip_hwnd;
-static GdkWindow *s_clipboard_window;
-
-// clipboard data added by SetClipboardData():
-static WDL_TypedBuf<GdkAtom> s_clipboard_setstate; // stored as separate lists so we can easily pass to properties
-static WDL_TypedBuf<HANDLE> s_clipboard_setstate_data;
-
-static bool s_clipboard_written; // has clipboard data been written-to since opening
 
 static void swell_gdkEventHandler(GdkEvent *event, gpointer data);
 
@@ -395,11 +366,10 @@ void SWELL_initargs(int *argc, char ***argv)
 {
   if (!SWELL_gdk_active) 
   {
-    XInitThreads();
+    swell_x11_init();
 #if SWELL_TARGET_GDK == 3
     void (*_gdk_set_allowed_backends)(const char *);
 
-    *(void **)&_gdk_drag_drop_done = dlsym(RTLD_DEFAULT,"gdk_drag_drop_done");
     *(void **)&_gdk_set_allowed_backends = dlsym(RTLD_DEFAULT,"gdk_set_allowed_backends");
 
 #ifdef SWELL_TARGET_WAYLAND
@@ -865,162 +835,6 @@ static guint swell_gdkConvertKey(guint key, bool *extended)
 }
 
 
-static int hex_parse(char c)
-{
-  if (c >= '0' && c <= '9') return c-'0';
-  if (c >= 'A' && c <= 'F') return 10+c-'A';
-  if (c >= 'a' && c <= 'f') return 10+c-'a';
-  return -1;
-}
-
-static GdkAtom utf8atom() 
-{
-  static GdkAtom tmp;
-  if (!tmp) tmp = gdk_atom_intern_static_string("UTF8_STRING");
-  return tmp;
-}
-static GdkAtom tgtatom() 
-{
-  static GdkAtom tmp;
-  if (!tmp) tmp = gdk_atom_intern_static_string("TARGETS");
-  return tmp;
-}
-static GdkAtom atomatom()
-{
-  static GdkAtom tmp;
-  if (!tmp) tmp = gdk_atom_intern_static_string("ATOM");
-  return tmp;
-}
-static GdkAtom urilistatom() 
-{
-  static GdkAtom tmp;
-  if (!tmp) tmp = gdk_atom_intern_static_string("text/uri-list");
-  return tmp;
-}
-
-static bool atom_from_clipboard_type(int type, GdkAtom *atom)
-{
-  type--;
-  if (type < 0 || type >= s_clip_fmts.GetSize()) return false;
-  *atom = s_clip_fmts.Get()[type].atom;
-  return true;
-}
-
-static UINT clipboard_type_from_atom(GdkAtom atom)
-{
-#ifdef SWELL_TARGET_WAYLAND
-  if (gtk_targets_include_text(&atom, 1)) return CF_TEXT;
-#endif
-  for (int x = 0; x < s_clip_fmts.GetSize(); x++)
-    if (s_clip_fmts.Get()[x].atom == atom) return x+1;
-  return 0;
-}
-
-static HANDLE *find_clipboard_setstate(GdkAtom a)
-{
-  for (int x = 0; x < s_clipboard_setstate.GetSize(); x ++)
-    if (s_clipboard_setstate.Get()[x] == a)
-      return s_clipboard_setstate_data.Get() + x;
-  return NULL;
-}
-
-
-static void encode_uri(WDL_FastString *s, const char *rd);
-
-static void format_clipboard_data(GdkAtom format, HANDLE handle, WDL_FastString &str)
-{
-  const char *data = (const char*)handle;
-  const int len = GlobalSize(handle);
-  if (format == utf8atom())
-  {
-    for (int i = 0; i < len && data[i]; ++i)
-    {
-      if (data[i] == '\r' && i + 1 < len && data[i+1] == '\n') continue;
-      str.Append(data + i, 1);
-    }
-  }
-  else if (format == urilistatom())
-  {
-    if (len <= (int)sizeof(DROPFILES)) return;
-    const DROPFILES *hdr = (const DROPFILES*)data;
-    if (hdr->fWide || hdr->pFiles >= (DWORD)len) return; // todo deal with UTF-16
-    for (const char *file = data + hdr->pFiles; file < data + len && *file; )
-    {
-      const char *end = (const char*)memchr(file, 0, data + len - file);
-      if (!end) break;
-      str.Append("file://");
-      encode_uri(&str, file);
-      str.Append("\r\n");
-      file = end + 1;
-    }
-  }
-  else str.SetRaw(data, len);
-}
-
-static void OnSelectionRequestEvent(GdkEventSelection *b)
-{
-  if (b->window != swell_dragsrc_osw && b->window != s_clipboard_window) return;
-  //printf("got sel req %s\n",gdk_atom_name(b->target));
-  GdkAtom prop=GDK_NONE;
-
-  if (swell_dragsrc_osw && b->window == swell_dragsrc_osw)
-  {
-    if (swell_gdk_drag_source)
-    {
-      if (b->target == tgtatom())
-      {
-        prop = b->property;
-        GdkAtom list[] = { urilistatom() };
-#if SWELL_TARGET_GDK == 2
-        GdkWindow *pw = gdk_window_lookup(b->requestor);
-        if (!pw) pw = gdk_window_foreign_new(b->requestor);
-#else
-        GdkWindow *pw = b->requestor;
-#endif
-        if (pw)
-          gdk_property_change(pw,prop,GDK_SELECTION_TYPE_ATOM,32, GDK_PROP_MODE_REPLACE,(guchar*)list,(int) (sizeof(list)/sizeof(list[0])));
-      }
-      SendMessage(swell_gdk_drag_source,WM_USER+100,(WPARAM)b,(LPARAM)&prop);
-    }
-  }
-  else if (s_clipboard_setstate.GetSize())
-  {
-    if (b->target == tgtatom())
-    {
-      prop = b->property;
-#if SWELL_TARGET_GDK == 2
-      GdkWindow *pw = gdk_window_lookup(b->requestor);
-      if (!pw) pw = gdk_window_foreign_new(b->requestor);
-#else
-      GdkWindow *pw = b->requestor;
-#endif
-      if (pw)
-        gdk_property_change(pw,prop,GDK_SELECTION_TYPE_ATOM,32, GDK_PROP_MODE_REPLACE,(guchar*)s_clipboard_setstate.Get(), (int) s_clipboard_setstate.GetSize());
-    }
-    else 
-    {
-      const GdkAtom sf = b->target == GDK_TARGET_STRING ? utf8atom() : b->target;
-      HANDLE *state = find_clipboard_setstate(sf);
-
-      if (state)
-      {
-        prop = b->property;
-        WDL_FastString str;
-        format_clipboard_data(sf, *state, str);
-#if SWELL_TARGET_GDK == 2
-        GdkWindow *pw = gdk_window_lookup(b->requestor);
-        if (!pw) pw = gdk_window_foreign_new(b->requestor);
-#else
-        GdkWindow *pw = b->requestor;
-#endif
-        if (pw)
-          gdk_property_change(pw,prop,b->target,8, GDK_PROP_MODE_REPLACE,(const guchar*)str.Get(),str.GetLength());
-      }
-    }
-  }
-  gdk_selection_send_notify(b->requestor,b->selection,b->target,prop,GDK_CURRENT_TIME);
-}
-
 cairo_surface_t *swell_gdk_surface(HWND hwnd)
 {
 #ifdef SWELL_LICE_GDI
@@ -1122,7 +936,7 @@ static void OnWindowStateEvent(GdkEventWindowState *evt)
 }
 
 #ifndef GDK_KEY_dead_greek
-#define GDK_KEY_dead_greek XK_dead_greek
+#define GDK_KEY_dead_greek 0xfe8c
 #endif
 #define IS_DEAD_KEY(x) ((x) >= DEF_GKY(dead_grave) && (x) <= GDK_KEY_dead_greek)
 
@@ -1583,163 +1397,6 @@ void swell_gdk_button_event(GdkEventButton *b)
 }
 
 
-HANDLE swell_gdk_urilist_to_dropfiles(const POINT *pt, const guchar *gptr, gint sz)
-{
-  if (sz < 0 || sz > INT_MAX - (int)sizeof(DROPFILES) - 2) return NULL;
-  HANDLE gobj=GlobalAlloc(0,sz+sizeof(DROPFILES)+2);
-  if (!gobj) return NULL;
-
-  DROPFILES *df=(DROPFILES*)gobj;
-  df->pFiles = sizeof(DROPFILES);
-  if (pt) df->pt = *pt;
-  else df->pt.x = df->pt.y = 0;
-
-  df->fNC=FALSE;
-  df->fWide=FALSE;
-  guchar *pout = (guchar *)(df+1);
-  const guchar *rd = gptr;
-  const guchar *rd_end = rd + sz;
-  for (;;)
-  {
-    while (rd < rd_end && *rd && isspace_safe(*rd)) rd++;
-    if (rd >= rd_end) break;
-
-    if (rd_end-rd > 7 && !strnicmp((const char *)rd,"file://",7))
-    {
-      rd += 7;
-      int c=0;
-      while (rd < rd_end && *rd && !isspace_safe(*rd))
-      {
-        int v1,v2;
-        if (*rd == '%' && rd_end-rd > 2 && (v1=hex_parse(rd[1]))>=0 && (v2=hex_parse(rd[2]))>=0)
-        {
-          *pout++ = (v1<<4) | v2;
-          rd+=3;
-        }
-        else
-        {
-          *pout++ = *rd++;
-        }
-        c++;
-      }
-      if (c) *pout++=0;
-    }
-    else
-    {
-      while (rd < rd_end && *rd && !isspace_safe(*rd)) rd++;
-    }
-  }
-  *pout++=0;
-  *pout++=0;
-
-  return gobj;
-}
-
-static void OnSelectionNotifyEvent(GdkEventSelection *b)
-{
-  HWND hwnd = swell_oswindow_to_hwnd(b->window);
-  if (!hwnd) return;
-
-  if (hwnd == s_ddrop_hwnd && b->target == urilistatom())
-  {
-    POINT p = s_ddrop_pt;
-    HWND cw=hwnd;
-    RECT r;
-    GetWindowContentViewRect(hwnd,&r);
-    if (PtInRect(&r,p))
-    {
-      p.x -= r.left;
-      p.y -= r.top;
-      cw = ChildWindowFromPoint(hwnd,p);
-    }
-    if (!cw) cw=hwnd;
-
-    guchar *gptr=NULL;
-    GdkAtom fmt;
-    gint unitsz=0;
-    gint sz=gdk_selection_property_get(b->window,&gptr,&fmt,&unitsz);
-
-    if (sz>0 && gptr)
-    {
-      POINT pt2 = s_ddrop_pt;
-      ScreenToClient(cw,&pt2);
-      HANDLE gobj = swell_gdk_urilist_to_dropfiles(&pt2,gptr,sz);
-      if (gobj)
-      {
-        SendMessage(cw,WM_DROPFILES,(WPARAM)gobj,0);
-        GlobalFree(gobj);
-      }
-    }
-
-    if (gptr) g_free(gptr);
-    s_ddrop_hwnd=NULL;
-    return;
-  }
-
-  s_ddrop_hwnd=NULL;
-
-  GlobalFree(s_clipboard_getstate);
-  s_clipboard_getstate=NULL;
-  guchar *gptr=NULL;
-  GdkAtom fmt;
-  gint unitsz=0;
-  gint sz=gdk_selection_property_get(b->window,&gptr,&fmt,&unitsz);
-  if (sz>0 && gptr && (unitsz == 8 || unitsz == 16 || unitsz == 32))
-  {
-    WDL_FastString str;
-    guchar *ptr = gptr;
-    if (fmt == urilistatom())
-    {
-      s_clipboard_getstate = swell_gdk_urilist_to_dropfiles(NULL,gptr,sz);
-      if (s_clipboard_getstate)
-        s_clipboard_getstate_fmt = fmt;
-    }
-    else
-    {
-      if (fmt == GDK_TARGET_STRING || fmt == utf8atom())
-      {
-        int lastc=0;
-        while (sz >= unitsz/8)
-        {
-          sz -= unitsz/8;
-          int c;
-          if (unitsz==32) { c = *(unsigned int *)ptr; ptr+=4; }
-          else if (unitsz==16)  { c = *(unsigned short *)ptr; ptr+=2; }
-          else c = *ptr++;
-
-          if (!c) break;
-
-          if (c == '\n' && lastc != '\r') str.Append("\r",1);
-
-          char bv[8];
-          if (fmt != GDK_TARGET_STRING)
-          {
-            bv[0] = (char) ((unsigned char)c);
-            str.Append(bv,1);
-          }
-          else
-          {
-            WDL_MakeUTFChar(bv,c,sizeof(bv));
-            str.Append(bv);
-          }
-
-          lastc=c;
-        }
-        ptr = (guchar*)str.Get();
-        sz=str.GetLength()+1;
-      }
-
-      s_clipboard_getstate = GlobalAlloc(0,sz);
-      if (s_clipboard_getstate)
-      {
-        memcpy(s_clipboard_getstate,ptr,sz);
-        s_clipboard_getstate_fmt = fmt;
-      }
-    }
-  }
-  if (gptr) g_free(gptr);
-}
-
 static bool is_our_oswindow(GdkWindow *w)
 {
   while (w)
@@ -1790,21 +1447,6 @@ void swell_gdk_drag_enter(int xpos, int ypos)
     POINT pt = {xpos, ypos};
     SWELL_DDrop_onDragEnter(h,pt);
     GlobalFree(h);
-  }
-}
-
-void swell_gdk_receive_drop(HWND hwnd, GdkEventDND *e)
-{
-  GdkDragContext *ctx = e->context;
-  if (ctx)
-  {
-    s_ddrop_hwnd = hwnd;
-    s_ddrop_pt.x = (int)e->x_root;
-    s_ddrop_pt.y = (int)e->y_root;
-
-    GdkAtom srca = gdk_drag_get_selection(ctx);
-    gdk_selection_convert(e->window,srca,urilistatom(),e->time);
-    gdk_drop_finish(ctx,TRUE,e->time);
   }
 }
 
@@ -1862,9 +1504,6 @@ void swell_gdk_dispatch_event(GdkEvent *evt)
           if (do_menus)
             update_menubar_activations();
         }
-    break;
-    case GDK_SELECTION_REQUEST:
-        OnSelectionRequestEvent((GdkEventSelection *)evt);
     break;
 
     case GDK_DELETE:
@@ -1969,9 +1608,6 @@ void swell_gdk_dispatch_event(GdkEvent *evt)
     case GDK_BUTTON_RELEASE:
       swell_dlg_destroyspare();
       swell_gdk_backend->mouse_event(evt);
-    break;
-    case GDK_SELECTION_NOTIFY:
-      OnSelectionNotifyEvent((GdkEventSelection *)evt);
     break;
     default:
           //printf("msg: %d\n",evt->type);
@@ -2203,347 +1839,6 @@ void swell_oswindow_invalidate(HWND hwnd, const RECT *rect)
 }
 
 
-#ifdef SWELL_TARGET_WAYLAND
-static GtkClipboard *gtk_clipboard;
-static bool clipboard_requested;
-static guint clipboard_generation;
-static void publish_wayland_clipboard();
- 
-static GtkClipboard *get_clipboard(void)
-{
-    if (!gtk_clipboard)
-        gtk_clipboard = gtk_clipboard_get(GDK_SELECTION_CLIPBOARD);
-    return gtk_clipboard;
-}
-#endif
-
-bool OpenClipboard(HWND hwndDlg) 
-{
-  RegisterClipboardFormat(NULL);
-  s_clip_hwnd=hwndDlg ? hwndDlg : SWELL_topwindows; 
-  s_clipboard_written = false;
-#ifdef SWELL_TARGET_WAYLAND
-  ++clipboard_generation;
-  clipboard_requested = false;
-#endif
-
-  GlobalFree(s_clipboard_getstate);
-  s_clipboard_getstate = NULL;
-  s_clipboard_getstate_fmt = NULL;
-
-  s_clipboard_enumstate.DeleteAll();
-
-  return true; 
-}
-
-#ifdef SWELL_TARGET_WAYLAND
-static void clipboard_received_func(GtkClipboard *, GtkSelectionData *data, gpointer user_data)
-{
-  if (GPOINTER_TO_UINT(user_data) != clipboard_generation) return;
-  clipboard_requested = false;
-  if (!data) return;
-
-  s_clipboard_getstate_fmt = gtk_selection_data_get_target(data);
-  const int len = gtk_selection_data_get_length(data);
-  const guchar *bytes = gtk_selection_data_get_data(data);
-  if (!bytes || len < 0) return;
-  if (s_clipboard_getstate_fmt == urilistatom())
-    s_clipboard_getstate = swell_gdk_urilist_to_dropfiles(NULL, bytes, len);
-  else
-  {
-    s_clipboard_getstate = GlobalAlloc(GMEM_MOVEABLE, len);
-    if (s_clipboard_getstate) memcpy(s_clipboard_getstate, bytes, len);
-  }
-}
-
-static void clipboard_received_text(GtkClipboard *, const gchar *text, gpointer user_data)
-{
-  if (GPOINTER_TO_UINT(user_data) != clipboard_generation) return;
-  clipboard_requested = false;
-  s_clipboard_getstate_fmt = utf8atom();
-  if (!text) return;
-  WDL_FastString str;
-  for (const char *p = text; *p; ++p)
-  {
-    if (*p == '\n' && (p == text || p[-1] != '\r')) str.Append("\r", 1);
-    str.Append(p, 1);
-  }
-  const size_t len = str.GetLength() + 1;
-  s_clipboard_getstate = GlobalAlloc(GMEM_MOVEABLE, len);
-  if (s_clipboard_getstate) memcpy(s_clipboard_getstate, str.Get(), len);
-}
-
-static HANDLE req_wayland_clipboard(GdkAtom type)
-{
-  if (s_clipboard_getstate_fmt == type) return s_clipboard_getstate;
-  if (type == tgtatom() && s_clipboard_getstate_fmt == atomatom()) return s_clipboard_getstate;
-
-  GlobalFree(s_clipboard_getstate);
-  s_clipboard_getstate = NULL;
-  s_clipboard_getstate_fmt = NULL;
-  const guint request = ++clipboard_generation;
-  clipboard_requested = true;
-  if (type == utf8atom())
-    gtk_clipboard_request_text(get_clipboard(), clipboard_received_text, GUINT_TO_POINTER(request));
-  else
-    gtk_clipboard_request_contents(get_clipboard(), type, clipboard_received_func, GUINT_TO_POINTER(request));
-
-  const gint64 deadline = g_get_monotonic_time() + 500000;
-  GMainContext *ctx = g_main_context_default();
-  while (clipboard_generation == request && clipboard_requested && g_get_monotonic_time() < deadline)
-    if (!g_main_context_iteration(ctx, FALSE)) g_usleep(1000);
-  if (clipboard_generation != request) return NULL;
-  if (clipboard_requested)
-  {
-    ++clipboard_generation;
-    clipboard_requested = false;
-    return NULL;
-  }
-  return s_clipboard_getstate;
-}
-#endif
-
-static HANDLE req_clipboard(GdkAtom type)
-{
-#ifdef SWELL_TARGET_WAYLAND
-  if (swell_is_wayland())
-    return req_wayland_clipboard(type);
-#endif
-  if (s_clipboard_getstate_fmt == type) return s_clipboard_getstate;
-  if (type == tgtatom() && s_clipboard_getstate_fmt == atomatom())
-    return s_clipboard_getstate;
- 
-  HWND h = s_clip_hwnd;
-  while (h && !h->m_oswindow) h = h->m_parent;
-
-  if (h && SWELL_gdk_active > 0)
-  {
-    GlobalFree(s_clipboard_getstate);
-    s_clipboard_getstate=NULL;
-
-    GdkDisplay *disp = gdk_window_get_display(h->m_oswindow);
-    if (WDL_NORMALLY(disp) &&
-        !swell_x11_has_selection_owner(disp, GDK_SELECTION_CLIPBOARD))
-    {
-      return NULL;
-    }
-
-    gdk_selection_convert(h->m_oswindow,GDK_SELECTION_CLIPBOARD,type,GDK_CURRENT_TIME);
- 
-    GMainContext *ctx=g_main_context_default();
-    DWORD startt = GetTickCount();
-    for (;;)
-    {
-      while (!s_clipboard_getstate && GetTickCount()-startt < 500 && g_main_context_iteration(ctx,FALSE)) {}
-
-      if (s_clipboard_getstate) 
-      {
-        if (s_clipboard_getstate_fmt == type) return s_clipboard_getstate;
-        if (type == tgtatom() && s_clipboard_getstate_fmt == atomatom())
-          return s_clipboard_getstate;
-        return NULL;
-      }
-
-      if ((GetTickCount()-startt) > 500) break;
-      Sleep(10);
-    }
-  }
-  return NULL;
-}
-
-void CloseClipboard() 
-{ 
-#ifdef SWELL_TARGET_WAYLAND
-  if (s_clipboard_written && swell_is_wayland())
-    publish_wayland_clipboard();
-#endif
-  s_clipboard_written = false;
-  s_clipboard_enumstate.DeleteAll();
-  s_clip_hwnd=NULL; 
-}
-
-UINT EnumClipboardFormats(UINT lastfmt)
-{
-  if (lastfmt == 0 && !s_clipboard_written && !s_clipboard_enumstate.GetSize())
-  {
-    HANDLE h = req_clipboard(tgtatom());
-    if (!h) return 0;
-    int sz = GlobalSize(h) / (int)sizeof(GdkAtom);
-    const char *l = (const char *)h;
-    for (int x = 0; x < sz; x ++)
-    {
-      GdkAtom a;
-      memcpy(&a,l + x*sizeof(GdkAtom), sizeof(a));
-      UINT c = clipboard_type_from_atom(a);
-      if (c) s_clipboard_enumstate.Insert(c);
-    }
-  }
-
-  int x = 0;
-  UINT fmt;
-  if (lastfmt) while (s_clipboard_enumstate.Enumerate(x++,&fmt) && fmt != lastfmt);
-  return s_clipboard_enumstate.Enumerate(x,&fmt) ? fmt : 0;
-}
-
-HANDLE GetClipboardData(UINT type)
-{
-  RegisterClipboardFormat(NULL);
-
-  GdkAtom a;
-  if (atom_from_clipboard_type(type,&a))
-  {
-#ifdef SWELL_TARGET_WAYLAND
-    if (s_clipboard_written && swell_is_wayland())
-    {
-      HANDLE *state = find_clipboard_setstate(a);
-      return state ? *state : NULL;
-    }
-#endif
-    return req_clipboard(a);
-  }
-
-  return NULL;
-}
-
-void EmptyClipboard()
-{
-  for (int x = 0; x < s_clipboard_setstate_data.GetSize(); x ++)
-    GlobalFree(s_clipboard_setstate_data.Get()[x]);
-  s_clipboard_setstate.Resize(0);
-  s_clipboard_setstate_data.Resize(0);
-#ifdef SWELL_TARGET_WAYLAND
-  if (swell_is_wayland())
-  {
-    s_clipboard_written = true;
-    s_clipboard_enumstate.DeleteAll();
-  }
-#endif
-}
-
-#ifdef SWELL_TARGET_WAYLAND
-static void clipboard_get_func(GtkClipboard *, GtkSelectionData *data, guint, gpointer)
-{
-  GdkAtom target = gtk_selection_data_get_target(data);
-  const bool text = gtk_targets_include_text(&target, 1);
-  HANDLE *handle = find_clipboard_setstate(text ? utf8atom() : target);
-  if (!handle) return;
-  WDL_FastString str;
-  format_clipboard_data(text ? utf8atom() : target, *handle, str);
-  if (text) gtk_selection_data_set_text(data, str.Get(), str.GetLength());
-  else gtk_selection_data_set(data, target, 8, (const guchar*)str.Get(), str.GetLength());
-}
-
-static void publish_wayland_clipboard()
-{
-  GtkTargetList *list = gtk_target_list_new(NULL, 0);
-  for (int i = 0; i < s_clipboard_setstate.GetSize(); ++i)
-  {
-    GdkAtom target = s_clipboard_setstate.Get()[i];
-    if (target == utf8atom()) gtk_target_list_add_text_targets(list, 0);
-    else gtk_target_list_add(list, target, 0, 0);
-  }
-  gint count;
-  GtkTargetEntry empty = {};
-  GtkTargetEntry *targets = gtk_target_table_new_from_list(list, &count);
-  gtk_clipboard_set_with_data(get_clipboard(), targets ? targets : &empty, count, clipboard_get_func, NULL, NULL);
-  gtk_target_table_free(targets, count);
-  gtk_target_list_unref(list);
-}
-
-static void set_wayland_clipboard_data(UINT type, HANDLE h)
-{
-  RegisterClipboardFormat(NULL);
-  GdkAtom a;
-  if (atom_from_clipboard_type(type,&a))
-  {
-    HANDLE *state = find_clipboard_setstate(a);
-    if (!state)
-    {
-      s_clipboard_setstate.Add(a);
-      s_clipboard_setstate_data.Add(h);
-    }
-    else if (*state != h)
-    {
-      GlobalFree(*state);
-      *state = h;
-    }
-
-    if (!s_clipboard_written) s_clipboard_enumstate.DeleteAll();
-    s_clipboard_written = true;
-    if (WDL_NORMALLY(type != 0))
-      s_clipboard_enumstate.Insert(type);
-  }
-}
-#endif
-
-void SetClipboardData(UINT type, HANDLE h)
-{
-#ifdef SWELL_TARGET_WAYLAND
-  if (swell_is_wayland())
-    return set_wayland_clipboard_data(type, h);
-#endif
-  RegisterClipboardFormat(NULL);
-  GdkAtom a;
-  if (atom_from_clipboard_type(type,&a))
-  {
-    HANDLE *state = find_clipboard_setstate(a);
-    if (!state)
-    {
-      s_clipboard_setstate.Add(a);
-      s_clipboard_setstate_data.Add(h);
-    }
-    else if (*state != h)
-    {
-      GlobalFree(*state);
-      *state = h;
-    }
-
-    if (!s_clipboard_window)
-    {
-      GdkWindowAttr attr={0,};
-      attr.title = (char *)"swell clipboard";
-      attr.event_mask = GDK_ALL_EVENTS_MASK;
-      attr.wclass = GDK_INPUT_ONLY;
-      attr.window_type = GDK_WINDOW_TOPLEVEL;
-      s_clipboard_window = gdk_window_new(NULL,&attr,0);
-    }
-    if (s_clipboard_window && !s_clipboard_written)
-    {
-      s_clipboard_written = true;
-      s_clipboard_enumstate.DeleteAll();
-      gdk_selection_owner_set(s_clipboard_window,GDK_SELECTION_CLIPBOARD,GDK_CURRENT_TIME,TRUE);
-    }
-    if (WDL_NORMALLY(type != 0))
-      s_clipboard_enumstate.Insert(type);
-  }
-}
-
-UINT RegisterClipboardFormat(const char *desc)
-{
-  if (!s_clip_fmts.GetSize())
-  {
-    clip_fmt c[2] = {
-      { "SWELL__CF_TEXT", utf8atom() },
-      { "SWELL__CF_HDROP", urilistatom() },
-    };
-    s_clip_fmts.Add(c,sizeof(c)/sizeof(c[0]));
-  }
-
-  if (!desc || !*desc) return 0;
-
-  for (int x = 0; x < s_clip_fmts.GetSize(); x++)
-    if (!strcmp(s_clip_fmts.Get()[x].str,desc)) return x + 1;
-
-  char tmp[512];
-  snprintf(tmp,sizeof(tmp),"application/swell-%s",desc);
-
-  clip_fmt c1 = { strdup(desc), gdk_atom_intern(tmp, 0) };
-  s_clip_fmts.Add(c1);
-
-  return s_clip_fmts.GetSize();
-}
-
-
 void GetCursorPos(POINT *pt)
 {
   pt->x = pt->y = 0;
@@ -2594,300 +1889,34 @@ HWND SWELL_CreateXBridgeWindow(HWND parent, void **window, const RECT *rect)
   return swell_gdk_backend->create_bridge(parent, window, rect);
 }
 
-struct dropSourceInfo {
-  dropSourceInfo()
-  {
-    srclist=NULL; srccount=0; srcfn=NULL; callback=NULL;
-    state=0;
-    dragctx=NULL;
-#ifdef SWELL_TARGET_WAYLAND
-    widget=NULL;
-    finished=false;
-#endif
-  }
-  ~dropSourceInfo()
-  {
-    free(srcfn);
-#ifdef SWELL_TARGET_WAYLAND
-    if (widget)
-    {
-      g_signal_handlers_disconnect_by_data(widget, this);
-      if (dragctx) gtk_drag_cancel(dragctx);
-      g_object_unref(widget);
-    }
-#endif
-    if (dragctx)
-    {
-#ifdef SWELL_TARGET_WAYLAND
-      if (!widget)
-#endif
-      if (_gdk_drag_drop_done) _gdk_drag_drop_done(dragctx,state!=0);
-      g_object_unref(dragctx);
-    }
-  }
 
-  const char **srclist;
-  int srccount;
-  // or
-  void (*callback)(const char *);
-  char *srcfn;
-
-  int state;
-
-  GdkDragContext *dragctx;
-#ifdef SWELL_TARGET_WAYLAND
-  GtkWidget *widget;
-  bool finished;
-#endif
-};
-
-static void encode_uri(WDL_FastString *s, const char *rd)
-{
-  while (*rd)
-  {
-    // unsure if UTF-8 chars should be urlencoded or allowed?
-    if (*rd < 0 || (!isalnum_safe(*rd) && *rd != '-' && *rd != '_' && *rd != '.' && *rd != '/'))
-    {
-      char buf[8];
-      snprintf(buf,sizeof(buf),"%%%02x",(int)(unsigned char)*rd);
-      s->Append(buf);
-    }
-    else s->Append(rd,1);
-
-    rd++;
-  }
-}
-
-#ifdef SWELL_TARGET_WAYLAND
-static void on_drag_source_data_get(GtkWidget *widget, GdkDragContext *context, GtkSelectionData *data, guint info, guint time, gpointer user_data)
-{
-  dropSourceInfo *inf = (dropSourceInfo*)user_data;
-  WDL_FastString str;
-
-  if (inf->srclist && inf->srccount)
-  {
-    for (int x = 0; x < inf->srccount; x++)
-    {
-      str.Append("file://");
-      encode_uri(&str, inf->srclist[x]);
-      str.Append("\r\n");
-    }
-  }
-  else if (inf->callback && inf->srcfn)
-  {
-    if (!inf->state) inf->callback(inf->srcfn);
-    inf->state = 1;
-    str.Append("file://");
-    encode_uri(&str, inf->srcfn);
-    str.Append("\r\n");
-  }
-  gtk_selection_data_set(data, urilistatom(), 8, (const guchar*)str.Get(), str.GetLength());
-}
-
-static void on_drag_source_end(GtkWidget *, GdkDragContext *, gpointer data)
-{
-  ((dropSourceInfo*)data)->finished = true;
-  if (GetCapture() == swell_gdk_drag_source) ReleaseCapture();
-}
-#endif
-
-static LRESULT WINAPI dropSourceWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
-{
-  dropSourceInfo *inf = (dropSourceInfo*)hwnd->m_private_data;
-  switch (msg)
-  {
-    case WM_CREATE:
-#ifdef SWELL_TARGET_WAYLAND
-      if (swell_is_wayland())
-      {
-        GtkWidget *widget = swell_gdk_current_event ? gtk_get_event_widget(swell_gdk_current_event) : NULL;
-        if (!widget) break;
-        inf->widget = (GtkWidget*)g_object_ref(gtk_widget_get_toplevel(widget));
-        g_signal_connect(inf->widget, "drag-data-get", G_CALLBACK(on_drag_source_data_get), inf);
-        g_signal_connect(inf->widget, "drag-end", G_CALLBACK(on_drag_source_end), inf);
-        GtkTargetList *target_list = gtk_target_list_new(NULL, 0);
-        gtk_target_list_add_uri_targets(target_list, 0);
-        inf->dragctx = gtk_drag_begin_with_coordinates(inf->widget, target_list, GDK_ACTION_COPY, 1, swell_gdk_current_event, -1, -1);
-        gtk_target_list_unref(target_list);
-        if (inf->dragctx)
-        {
-          g_object_ref(inf->dragctx);
-          if (!inf->finished) SetCapture(hwnd);
-        }
-      }
-      else
-#endif
-      {
-        if (!swell_dragsrc_osw)
-        {
-          GdkWindowAttr attr={0,};
-          attr.title = (char *)"swell drag source";
-          attr.event_mask = GDK_ALL_EVENTS_MASK;
-          attr.wclass = GDK_INPUT_ONLY;
-          attr.window_type = GDK_WINDOW_TOPLEVEL;
-          swell_dragsrc_osw = gdk_window_new(NULL,&attr,0);
-        }
-        if (swell_dragsrc_osw)
-        {
-          GList *targets = g_list_append(NULL, urilistatom());
-          inf->dragctx = gdk_drag_begin(swell_dragsrc_osw, targets);
-          g_list_free(targets);
-        }
-        SetCapture(hwnd);
-      }
-    break;
-    case WM_MOUSEMOVE:
-#ifdef SWELL_TARGET_WAYLAND
-      if (inf->widget) break;
-#endif
-      if (inf->dragctx)
-      {
-        POINT p;
-        GetCursorPos(&p);
-        GdkWindow *w = NULL;
-        GdkDragProtocol proto;
-        gdk_drag_find_window_for_screen(inf->dragctx,NULL,gdk_screen_get_default(),p.x,p.y,&w,&proto);
-        // todo: need to update gdk_drag_context_get_drag_window()
-        // (or just SetCursor() a drag and drop cursor)
-        if (w) 
-        {
-          gdk_drag_motion(inf->dragctx,w,proto,p.x,p.y,GDK_ACTION_COPY,GDK_ACTION_COPY,GDK_CURRENT_TIME);
-        }
-      }
-    break;
-    case WM_LBUTTONUP:
-#ifdef SWELL_TARGET_WAYLAND
-      if (inf->widget) break;
-#endif
-      if (inf->dragctx && !inf->state)
-      {
-        inf->state=1;
-        GdkAtom sel = gdk_drag_get_selection(inf->dragctx);
-        if (sel) gdk_selection_owner_set(swell_dragsrc_osw,sel,GDK_CURRENT_TIME,TRUE);
-        gdk_drag_drop(inf->dragctx,GDK_CURRENT_TIME);
-        if (!sel)
-        {
-          sel = gdk_drag_get_selection(inf->dragctx);
-          if (sel) gdk_selection_owner_set(swell_dragsrc_osw,sel,GDK_CURRENT_TIME,TRUE);
-        }
-        swell_dragsrc_timeout_start = GetTickCount();
-        return 0;
-      }
-      ReleaseCapture();
-    break;
-    case WM_USER+100:
-    if (wParam && lParam) 
-    {
-      GdkAtom *aOut = (GdkAtom *)lParam;
-      GdkEventSelection *evt = (GdkEventSelection*)wParam;
-
-      if (evt->target == urilistatom())
-      {
-        WDL_FastString s;
-        if (inf->srclist && inf->srccount)
-        {
-          for (int x=0;x<inf->srccount;x++)
-          {
-            if (x) s.Append("\n");
-            s.Append("file://");
-            encode_uri(&s,inf->srclist[x]);
-          }
-        }
-        else if (inf->callback && inf->srcfn && inf->state)
-        {
-          inf->callback(inf->srcfn);
-          s.Append("file://");
-          encode_uri(&s,inf->srcfn);
-        }
-
-        if (s.GetLength())
-        {
-          *aOut = evt->property;
-#if SWELL_TARGET_GDK == 2
-          GdkWindow *pw = gdk_window_lookup(evt->requestor);
-          if (!pw) pw = gdk_window_foreign_new(evt->requestor);
-#else
-          GdkWindow *pw = evt->requestor;
-#endif
-          if (pw)
-            gdk_property_change(pw,*aOut,evt->target,8, GDK_PROP_MODE_REPLACE,(guchar*)s.Get(),s.GetLength());
-        }
-        if (inf->state) ReleaseCapture();
-      }
-       
-    }
-    break;
-
-  }
-  return DefWindowProc(hwnd,msg,wParam,lParam);
-}
-
-
-void SWELL_InitiateDragDrop(HWND hwnd, RECT* srcrect, const char* srcfn, void (*callback)(const char* dropfn))
+static void initiate_drag(HWND hwnd, const SWELL_GdkDrag &data)
 {
   if (hwnd) hwnd->Retain();
   const bool is_osw_cursor = s_last_setcursor_oswnd && swell_oswindow_from_hwnd(hwnd) == s_last_setcursor_oswnd;
-  swell_dragsrc_fn = srcfn;
-  dropSourceInfo info;
-  info.srcfn = strdup(srcfn);
-  info.callback = callback;
-  RECT r={0,};
-  HWND__ *h = new HWND__(NULL,0,&r,NULL,false,NULL,dropSourceWndProc, NULL);
-  swell_dragsrc_timeout_start = 0;
-  swell_gdk_drag_source=h;
-  h->m_private_data = (INT_PTR) &info;
-  dropSourceWndProc(h,WM_CREATE,0,0);
-  while (GetCapture()==h && (!hwnd || !hwnd->m_hashaddestroy))
-  {
-    SWELL_RunMessageLoop();
-    Sleep(10);
-    if (swell_dragsrc_timeout_start && (GetTickCount()-swell_dragsrc_timeout_start) > 500) ReleaseCapture();
-  }
-  
-  swell_gdk_drag_source=NULL;
-  DestroyWindow(h);
-
+  swell_dragsrc_fn = data.count > 0 ? data.files[0] : data.filename;
+  swell_gdk_backend->drag_files(hwnd, data);
   if (is_osw_cursor && hwnd && !hwnd->m_hashaddestroy && GetFocus() != hwnd)
   {
-    SWELL_OSWINDOW osw = swell_oswindow_from_hwnd(hwnd);
-    if (osw) gdk_window_set_cursor(osw,NULL);
+    GdkWindow *window = swell_oswindow_from_hwnd(hwnd);
+    if (window) gdk_window_set_cursor(window, NULL);
   }
   swell_dragsrc_fn = NULL;
   if (hwnd) hwnd->Release();
+}
+
+void SWELL_InitiateDragDrop(HWND hwnd, RECT *srcrect, const char *srcfn, void (*callback)(const char *))
+{
+  WDL_String filename(srcfn);
+  SWELL_GdkDrag data = { NULL, 0, filename.Get(), callback };
+  initiate_drag(hwnd, data);
 }
 
 // owner owns srclist, make copies here etc
 void SWELL_InitiateDragDropOfFileList(HWND hwnd, RECT *srcrect, const char **srclist, int srccount, HICON icon)
 {
-  swell_dragsrc_fn = srccount>0 ? srclist[0] : NULL;
-  if (hwnd) hwnd->Retain();
-  const bool is_osw_cursor = s_last_setcursor_oswnd && swell_oswindow_from_hwnd(hwnd) == s_last_setcursor_oswnd;
-  dropSourceInfo info;
-  info.srclist = srclist;
-  info.srccount = srccount;
-  RECT r={0,};
-  HWND__ *h = new HWND__(NULL,0,&r,NULL,false,NULL,dropSourceWndProc, NULL);
-  swell_dragsrc_timeout_start = 0;
-  swell_gdk_drag_source=h;
-  h->m_private_data = (INT_PTR) &info;
-  dropSourceWndProc(h,WM_CREATE,0,0);
-  while (GetCapture()==h && (!hwnd || !hwnd->m_hashaddestroy))
-  {
-    SWELL_RunMessageLoop();
-    Sleep(10);
-    if (swell_dragsrc_timeout_start && (GetTickCount()-swell_dragsrc_timeout_start) > 500) ReleaseCapture();
-  }
-  
-  swell_gdk_drag_source=NULL;
-  DestroyWindow(h);
-
-  if (is_osw_cursor && hwnd && !hwnd->m_hashaddestroy && GetFocus() != hwnd)
-  {
-    SWELL_OSWINDOW osw = swell_oswindow_from_hwnd(hwnd);
-    if (osw) gdk_window_set_cursor(osw,NULL);
-  }
-  swell_dragsrc_fn = NULL;
-  if (hwnd) hwnd->Release();
+  SWELL_GdkDrag data = { srclist, srccount, NULL, NULL };
+  initiate_drag(hwnd, data);
 }
 
 void SWELL_FinishDragDrop() { }

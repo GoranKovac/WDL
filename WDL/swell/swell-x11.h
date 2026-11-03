@@ -3,6 +3,7 @@
 #include "swell.h"
 #include <gdk/gdk.h>
 
+void swell_x11_init();
 HWND swell_x11_create_bridge(HWND parent, void **window, const RECT *rect);
 bool swell_x11_drag_event(GdkEvent *event);
 void swell_x11_drag_check_timeout();

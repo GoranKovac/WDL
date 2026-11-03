@@ -2,6 +2,10 @@
 
 #include "swell.h"
 #include <gdk/gdk.h>
+#include "../heapbuf.h"
+
+class WDL_FastString;
+struct SWELL_GdkDrag;
 
 cairo_surface_t *swell_gdk_paint(HWND hwnd, const GdkRectangle &area);
 cairo_surface_t *swell_gdk_surface(HWND hwnd);
@@ -38,6 +42,12 @@ struct SWELL_GdkBackend
   bool (*get_viewport)(RECT *rect);
   void (*monitor_geometry)(int index, bool work, GdkRectangle *rect);
   void (*scaling_init)(bool no_auto_hidpi);
+  void (*clipboard_open)();
+  HANDLE (*clipboard_read)(GdkAtom type);
+  bool (*clipboard_claim)();
+  void (*clipboard_publish)();
+  bool (*clipboard_text)(GdkAtom atom);
+  void (*drag_files)(HWND hwnd, const SWELL_GdkDrag &data);
 };
 
 extern const SWELL_GdkBackend swell_gdk_x11;
@@ -68,3 +78,30 @@ void swell_gdk_set_decorations(HWND hwnd);
 void swell_gdk_monitor_geometry(int index, bool work, GdkRectangle *rect);
 
 bool SWELL_load_gtk();
+
+struct SWELL_GdkClipboard
+{
+  HWND owner;
+  HANDLE read_data; // currently retrieving data/format via clipboard_read() (GetClipboardData() or EnumClipboardFormats(0))
+  GdkAtom read_type;
+  // clipboard data added by SetClipboardData():
+  WDL_TypedBuf<GdkAtom> formats; // stored as separate lists so we can easily pass to properties
+  WDL_TypedBuf<HANDLE> contents;
+};
+
+extern SWELL_GdkClipboard swell_gdk_clipboard;
+GdkAtom swell_gdk_utf8_atom();
+GdkAtom swell_gdk_targets_atom();
+GdkAtom swell_gdk_atom_atom();
+GdkAtom swell_gdk_urilist_atom();
+HANDLE *swell_gdk_clipboard_find(GdkAtom atom);
+void swell_gdk_clipboard_format(GdkAtom format, HANDLE handle, WDL_FastString &str);
+void swell_gdk_encode_uri(WDL_FastString *str, const char *path);
+
+struct SWELL_GdkDrag
+{
+  const char **files;
+  int count;
+  const char *filename;
+  void (*callback)(const char *);
+};

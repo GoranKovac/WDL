@@ -1309,12 +1309,220 @@ static void scaling_init(bool no_auto_hidpi)
   }
 }
 
+static GtkClipboard *gtk_clipboard;
+static bool clipboard_requested;
+static guint clipboard_generation;
+static void publish_wayland_clipboard();
+
+static GtkClipboard *get_clipboard(void)
+{
+    if (!gtk_clipboard)
+        gtk_clipboard = gtk_clipboard_get(GDK_SELECTION_CLIPBOARD);
+    return gtk_clipboard;
+}
+static void clipboard_received_func(GtkClipboard *, GtkSelectionData *data, gpointer user_data)
+{
+  if (GPOINTER_TO_UINT(user_data) != clipboard_generation) return;
+  clipboard_requested = false;
+  if (!data) return;
+
+  swell_gdk_clipboard.read_type = gtk_selection_data_get_target(data);
+  const int len = gtk_selection_data_get_length(data);
+  const guchar *bytes = gtk_selection_data_get_data(data);
+  if (!bytes || len < 0) return;
+  if (swell_gdk_clipboard.read_type == swell_gdk_urilist_atom())
+    swell_gdk_clipboard.read_data = swell_gdk_urilist_to_dropfiles(NULL, bytes, len);
+  else
+  {
+    swell_gdk_clipboard.read_data = GlobalAlloc(GMEM_MOVEABLE, len);
+    if (swell_gdk_clipboard.read_data) memcpy(swell_gdk_clipboard.read_data, bytes, len);
+  }
+}
+
+static void clipboard_received_text(GtkClipboard *, const gchar *text, gpointer user_data)
+{
+  if (GPOINTER_TO_UINT(user_data) != clipboard_generation) return;
+  clipboard_requested = false;
+  swell_gdk_clipboard.read_type = swell_gdk_utf8_atom();
+  if (!text) return;
+  WDL_FastString str;
+  for (const char *p = text; *p; ++p)
+  {
+    if (*p == '\n' && (p == text || p[-1] != '\r')) str.Append("\r", 1);
+    str.Append(p, 1);
+  }
+  const size_t len = str.GetLength() + 1;
+  swell_gdk_clipboard.read_data = GlobalAlloc(GMEM_MOVEABLE, len);
+  if (swell_gdk_clipboard.read_data) memcpy(swell_gdk_clipboard.read_data, str.Get(), len);
+}
+
+static HANDLE req_wayland_clipboard(GdkAtom type)
+{
+  if (swell_gdk_clipboard.read_type == type) return swell_gdk_clipboard.read_data;
+  if (type == swell_gdk_targets_atom() && swell_gdk_clipboard.read_type == swell_gdk_atom_atom()) return swell_gdk_clipboard.read_data;
+
+  GlobalFree(swell_gdk_clipboard.read_data);
+  swell_gdk_clipboard.read_data = NULL;
+  swell_gdk_clipboard.read_type = NULL;
+  const guint request = ++clipboard_generation;
+  clipboard_requested = true;
+  if (type == swell_gdk_utf8_atom())
+    gtk_clipboard_request_text(get_clipboard(), clipboard_received_text, GUINT_TO_POINTER(request));
+  else
+    gtk_clipboard_request_contents(get_clipboard(), type, clipboard_received_func, GUINT_TO_POINTER(request));
+
+  const gint64 deadline = g_get_monotonic_time() + 500000;
+  GMainContext *ctx = g_main_context_default();
+  while (clipboard_generation == request && clipboard_requested && g_get_monotonic_time() < deadline)
+    if (!g_main_context_iteration(ctx, FALSE)) g_usleep(1000);
+  if (clipboard_generation != request) return NULL;
+  if (clipboard_requested)
+  {
+    ++clipboard_generation;
+    clipboard_requested = false;
+    return NULL;
+  }
+  return swell_gdk_clipboard.read_data;
+}
+
+static void clipboard_get_func(GtkClipboard *, GtkSelectionData *data, guint, gpointer)
+{
+  GdkAtom target = gtk_selection_data_get_target(data);
+  const bool text = gtk_targets_include_text(&target, 1);
+  HANDLE *handle = swell_gdk_clipboard_find(text ? swell_gdk_utf8_atom() : target);
+  if (!handle) return;
+  WDL_FastString str;
+  swell_gdk_clipboard_format(text ? swell_gdk_utf8_atom() : target, *handle, str);
+  if (text) gtk_selection_data_set_text(data, str.Get(), str.GetLength());
+  else gtk_selection_data_set(data, target, 8, (const guchar*)str.Get(), str.GetLength());
+}
+
+static void publish_wayland_clipboard()
+{
+  GtkTargetList *list = gtk_target_list_new(NULL, 0);
+  for (int i = 0; i < swell_gdk_clipboard.formats.GetSize(); ++i)
+  {
+    GdkAtom target = swell_gdk_clipboard.formats.Get()[i];
+    if (target == swell_gdk_utf8_atom()) gtk_target_list_add_text_targets(list, 0);
+    else gtk_target_list_add(list, target, 0, 0);
+  }
+  gint count;
+  GtkTargetEntry empty = {};
+  GtkTargetEntry *targets = gtk_target_table_new_from_list(list, &count);
+  gtk_clipboard_set_with_data(get_clipboard(), targets ? targets : &empty, count, clipboard_get_func, NULL, NULL);
+  gtk_target_table_free(targets, count);
+  gtk_target_list_unref(list);
+}
+
+static void clipboard_open()
+{
+  ++clipboard_generation;
+  clipboard_requested = false;
+}
+
+static bool clipboard_text(GdkAtom atom)
+{
+  return gtk_targets_include_text(&atom, 1);
+}
+
+struct dropSourceInfo
+{
+  dropSourceInfo(const SWELL_GdkDrag &d) : data(d), state(0), dragctx(NULL), widget(NULL), finished(false) { }
+  ~dropSourceInfo()
+  {
+    if (widget)
+    {
+      g_signal_handlers_disconnect_by_data(widget, this);
+      if (dragctx) gtk_drag_cancel(dragctx);
+      g_object_unref(widget);
+    }
+    if (dragctx) g_object_unref(dragctx);
+  }
+  const SWELL_GdkDrag &data;
+  int state;
+  GdkDragContext *dragctx;
+  GtkWidget *widget;
+  bool finished;
+};
+
+static void on_drag_source_data_get(GtkWidget *widget, GdkDragContext *context, GtkSelectionData *data, guint info, guint time, gpointer user_data)
+{
+  dropSourceInfo *inf = (dropSourceInfo*)user_data;
+  WDL_FastString str;
+
+  if (inf->data.files && inf->data.count)
+  {
+    for (int x = 0; x < inf->data.count; x++)
+    {
+      str.Append("file://");
+      swell_gdk_encode_uri(&str, inf->data.files[x]);
+      str.Append("\r\n");
+    }
+  }
+  else if (inf->data.callback && inf->data.filename)
+  {
+    if (!inf->state) inf->data.callback(inf->data.filename);
+    inf->state = 1;
+    str.Append("file://");
+    swell_gdk_encode_uri(&str, inf->data.filename);
+    str.Append("\r\n");
+  }
+  gtk_selection_data_set(data, swell_gdk_urilist_atom(), 8, (const guchar*)str.Get(), str.GetLength());
+}
+
+static void on_drag_source_end(GtkWidget *, GdkDragContext *, gpointer data)
+{
+  ((dropSourceInfo*)data)->finished = true;
+  if (GetCapture() == swell_gdk_drag_source) ReleaseCapture();
+}
+
+static LRESULT WINAPI dropSourceWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
+{
+  dropSourceInfo *inf = (dropSourceInfo*)hwnd->m_private_data;
+  if (msg == WM_CREATE)
+  {
+    GtkWidget *widget = swell_gdk_current_event ? gtk_get_event_widget(swell_gdk_current_event) : NULL;
+    if (!widget) return 0;
+    inf->widget = (GtkWidget*)g_object_ref(gtk_widget_get_toplevel(widget));
+    g_signal_connect(inf->widget, "drag-data-get", G_CALLBACK(on_drag_source_data_get), inf);
+    g_signal_connect(inf->widget, "drag-end", G_CALLBACK(on_drag_source_end), inf);
+    GtkTargetList *target_list = gtk_target_list_new(NULL, 0);
+    gtk_target_list_add_uri_targets(target_list, 0);
+    inf->dragctx = gtk_drag_begin_with_coordinates(inf->widget, target_list, GDK_ACTION_COPY, 1, swell_gdk_current_event, -1, -1);
+    gtk_target_list_unref(target_list);
+    if (inf->dragctx)
+    {
+      g_object_ref(inf->dragctx);
+      if (!inf->finished) SetCapture(hwnd);
+    }
+  }
+  return DefWindowProc(hwnd, msg, wParam, lParam);
+}
+
+static void drag_files(HWND hwnd, const SWELL_GdkDrag &data)
+{
+  dropSourceInfo info(data);
+  RECT r = {};
+  HWND h = new HWND__(NULL, 0, &r, NULL, false, NULL, dropSourceWndProc, NULL);
+  swell_gdk_drag_source = h;
+  h->m_private_data = (INT_PTR)&info;
+  dropSourceWndProc(h, WM_CREATE, 0, 0);
+  while (GetCapture() == h && (!hwnd || !hwnd->m_hashaddestroy))
+  {
+    SWELL_RunMessageLoop();
+    Sleep(10);
+  }
+  swell_gdk_drag_source = NULL;
+  DestroyWindow(h);
+}
+
 const SWELL_GdkBackend swell_gdk_wayland = {
   event_handler, mouse_event, run_events, get_cursor_pos, get_async_key_state,
   update_window, invalidate, get_window_rect, resize_window, set_size_hints,
   activate, window_manager_name, swell_wayland_create_window, show_window, destroy_window,
   close_window, focus_window, set_decorations, set_cursor, create_bridge, invalidate_focus, true,
-  get_viewport, monitor_geometry, scaling_init
+  get_viewport, monitor_geometry, scaling_init,
+  clipboard_open, req_wayland_clipboard, NULL, publish_wayland_clipboard, clipboard_text, drag_files
 };
 
 #endif
