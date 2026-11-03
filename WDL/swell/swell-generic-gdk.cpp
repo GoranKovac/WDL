@@ -2393,6 +2393,8 @@ static void swell_gdkEventHandler(GdkEvent *evt, gpointer data)
 {
 #ifdef SWELL_TARGET_WAYLAND
   if (evt->type == GDK_EXPOSE && xw_bridge_draw(evt->any.window)) return;
+  if ((evt->type == GDK_KEY_PRESS || evt->type == GDK_KEY_RELEASE) &&
+      xw_bridge_key_event((GdkEventKey *)evt)) return;
 #endif
   GdkEvent *oldEvt = s_cur_evt;
   s_cur_evt = evt;

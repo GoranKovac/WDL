@@ -522,6 +522,8 @@ static void connect_widget(Capture *c)
                           GDK_LEAVE_NOTIFY_MASK |
                           GDK_BUTTON_PRESS_MASK |
                           GDK_BUTTON_RELEASE_MASK |
+                          GDK_KEY_PRESS_MASK |
+                          GDK_KEY_RELEASE_MASK |
                           GDK_SCROLL_MASK);
 
     {
@@ -799,6 +801,7 @@ static void create_popup_canvas(Capture *c)
     GtkWidget *win = gtk_window_new(GTK_WINDOW_POPUP);
     gtk_window_set_decorated(GTK_WINDOW(win), FALSE);
     gtk_window_set_type_hint(GTK_WINDOW(win), GDK_WINDOW_TYPE_HINT_POPUP_MENU);
+    gtk_widget_add_events(win, GDK_KEY_PRESS_MASK | GDK_KEY_RELEASE_MASK);
 
     GdkScreen *screen = gdk_screen_get_default();
     GdkVisual *visual = gdk_screen_get_rgba_visual(screen);
@@ -1838,4 +1841,17 @@ bool xw_bridge_forward_key(HWND hwnd, int keycode, int state, bool is_press)
 
     forward_key(c->connection, target, keycode, state, is_press);
     return true;
+}
+
+bool xw_bridge_key_event(GdkEventKey *e)
+{
+    for (const auto &kv : g_captures) {
+        Capture *c = kv.second;
+        if (kv.first != c->parent_win) continue;
+        if ((c->widget && gtk_widget_get_window(c->widget) == e->window) ||
+            (c->popup_canvas && gtk_widget_get_window(c->popup_canvas) == e->window))
+            return xw_bridge_forward_key(c->hwnd, e->hardware_keycode,
+                                         e->state, e->type == GDK_KEY_PRESS);
+    }
+    return false;
 }
