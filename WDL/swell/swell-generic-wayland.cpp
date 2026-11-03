@@ -246,6 +246,8 @@ static void hide_tooltip(GtkWidget *parent)
 }
 
 static SWELL_OSWINDOW s_armed_drag_oswindow;
+static SWELL_OSWINDOW s_titlebar_button_oswindow;
+static int s_titlebar_button;
 static guint s_armed_drag_button;
 static gint s_armed_drag_root_x, s_armed_drag_root_y;
 static guint32 s_armed_drag_time;
@@ -614,7 +616,26 @@ static void swell_wayland_motion_event(const GdkEventMotion *m)
 static bool swell_wayland_button_event(HWND hwnd, const GdkEventButton *b)
 {
   if (b->type == GDK_BUTTON_RELEASE)
+  {
     s_armed_drag_oswindow = NULL;
+    if (b->button == 1 && s_titlebar_button_oswindow)
+    {
+      const bool activate = s_titlebar_button_oswindow == hwnd->m_oswindow &&
+        swell_wayland_needs_manual_titlebar(hwnd) &&
+        b->x >= 0 && b->x < gdk_window_get_width(hwnd->m_oswindow) &&
+        swell_wayland_titlebar_hittest(hwnd, (int)b->x, (int)b->y) == s_titlebar_button;
+      s_titlebar_button_oswindow = NULL;
+      if (activate)
+      {
+        if (s_titlebar_button == 1) swell_gdk_close(hwnd);
+        else if (s_titlebar_button == 3) swell_oswindow_maximize(hwnd, !swell_wayland_is_maximized(hwnd));
+        else if (s_titlebar_button == 4) gdk_window_iconify(hwnd->m_oswindow);
+      }
+      return true;
+    }
+  }
+  if (b->type == GDK_BUTTON_PRESS && b->button == 1)
+    s_titlebar_button_oswindow = NULL;
 
   if (swell_wayland_needs_manual_titlebar(hwnd) && b->button == 1 &&
       (b->type == GDK_BUTTON_PRESS || b->type == GDK_2BUTTON_PRESS))
@@ -638,19 +659,10 @@ static bool swell_wayland_button_event(HWND hwnd, const GdkEventButton *b)
         swell_oswindow_maximize(hwnd, !swell_wayland_is_maximized(hwnd));
       if (hit) return true;
     }
-    if (hit == 1)
+    if (hit == 1 || hit == 3 || hit == 4)
     {
-      swell_gdk_close(hwnd);
-      return true;
-    }
-    else if (hit == 3)
-    {
-      swell_oswindow_maximize(hwnd, !swell_wayland_is_maximized(hwnd));
-      return true;
-    }
-    else if (hit == 4)
-    {
-      if (hwnd->m_oswindow) gdk_window_iconify(hwnd->m_oswindow);
+      s_titlebar_button_oswindow = hwnd->m_oswindow;
+      s_titlebar_button = hit;
       return true;
     }
     else if (hit == 2)
@@ -673,6 +685,7 @@ static void swell_wayland_forget_window(HWND hwnd)
 {
   if (s_wayland_active_tooltip == hwnd) s_wayland_active_tooltip = NULL;
   if (s_armed_drag_oswindow == hwnd->m_oswindow) s_armed_drag_oswindow = NULL;
+  if (s_titlebar_button_oswindow == hwnd->m_oswindow) s_titlebar_button_oswindow = NULL;
   if (s_last_hover_oswindow && s_last_hover_oswindow == hwnd->m_oswindow)
     s_last_hover_oswindow = NULL;
   if (g_wayland_hovered_hwnd == hwnd) g_wayland_hovered_hwnd = NULL;
@@ -967,6 +980,8 @@ static void mouse_event(GdkEvent *event)
 
 static void event_handler(GdkEvent *event)
 {
+  if (event->type == GDK_GRAB_BROKEN && !event->grab_broken.keyboard)
+    s_titlebar_button_oswindow = NULL;
   if (event->type == GDK_EXPOSE && xw_bridge_draw(event->any.window)) return;
   if (event->type == GDK_KEY_PRESS || event->type == GDK_KEY_RELEASE)
   {
