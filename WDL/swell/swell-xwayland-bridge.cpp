@@ -2178,14 +2178,15 @@ static void create_popup_canvas(Capture *c)
     }
     gtk_widget_set_app_paintable(win, TRUE);
 
-    GtkWidget *top = c->widget ? gtk_widget_get_toplevel(c->widget) : nullptr;
+    GtkWidget *widget = c->modals.empty() ? c->widget : c->modals.back().draw;
+    GtkWidget *top = widget ? gtk_widget_get_toplevel(widget) : nullptr;
     if (top && GTK_IS_WINDOW(top))
         gtk_window_set_transient_for(GTK_WINDOW(win), GTK_WINDOW(top));
 
     gtk_window_set_keep_above(GTK_WINDOW(win), TRUE);
 
-    const GdkRectangle bounds = c->monitor_bounds;
-    const int scale = swell_gdk_widget_scale(c->widget);
+    const GdkRectangle bounds = c->modals.empty() ? c->monitor_bounds : capture_monitor(c->connection, widget);
+    const int scale = swell_gdk_widget_scale(widget);
     c->canvas_x = swell_gdk_floor(bounds.x + c->gtk_x, scale) * scale;
     c->canvas_y = swell_gdk_floor(bounds.y + c->gtk_y, scale) * scale;
 
@@ -2209,17 +2210,17 @@ static void create_popup_canvas(Capture *c)
                            (GdkAnchorHints)0, c->canvas_x / scale, c->canvas_y / scale);
 }
 
-static void refresh_gtk_offset(Capture *c, int *out_px = nullptr, int *out_py = nullptr)
+static void refresh_gtk_offset(Capture *c)
 {
     if (!c || !c->connection || !c->widget) return;
 
+    GtkWidget *widget = c->modals.empty() ? c->widget : c->modals.back().draw;
+    xcb_window_t origin = c->modals.empty() ? c->parent_win : c->modals.back().x11_win;
     int px = 0, py = 0;
-    swell_xcb_translate(c->connection, c->parent_win,
+    swell_xcb_translate(c->connection, origin,
                           swell_xcb_screen(c->connection)->root, 0, 0, &px, &py);
-    if (out_px) *out_px = px;
-    if (out_py) *out_py = py;
 
-    GdkWindow *ww = gtk_widget_get_window(c->widget);
+    GdkWindow *ww = gtk_widget_get_window(widget);
     if (!ww) return;
 
     int wox = 0, woy = 0;
@@ -2470,6 +2471,8 @@ static void modal_remove(Capture *c, xcb_window_t win)
         if (it->x11_win == win) {
             xcb_damage_damage_t dmg = it->damage;
             GtkWidget *w   = it->gtk_win;
+            if (c->popup_canvas && gtk_window_get_transient_for(GTK_WINDOW(c->popup_canvas)) == GTK_WINDOW(w))
+                while (!c->popups.empty()) canvas_remove_popup(c, c->popups.back().x11_win);
             c->modals.erase(it);
             if (dmg && wm_connection())       xcb_damage_destroy(wm_connection(), dmg);
             if (w && GTK_IS_WIDGET(w)) gtk_widget_destroy(w);
