@@ -42,11 +42,6 @@
 
 #include "swell-dlggen.h"
 
-#ifdef SWELL_TARGET_WAYLAND
-extern SWELL_OSWINDOW s_last_hover_oswindow;
-bool xw_bridge_foreign_popup_open();
-#endif
-
 #define EDIT_CURSOR_BLINK_LEN 500
 #define EDIT_CURSOR_CYCLE_INTERVAL 3
 
@@ -910,9 +905,7 @@ void SWELL_RunMessageLoop()
   SWELL_MessageQueue_Flush();
   SWELL_RunEvents();
 
-#ifdef SWELL_TARGET_WAYLAND
-  if (xw_bridge_foreign_popup_open()) return;
-#endif
+  if (!swell_oswindow_can_run_timers()) return;
 
   const DWORD now = GetTickCount();
   WDL_MutexLock lock(&m_timermutex);
@@ -4664,9 +4657,7 @@ forceMouseMove:
                 NMLISTVIEW nm={{hwnd,hwnd->m_id,LVN_BEGINDRAG},lvs->m_capmode_data1,lvs->GetColumnIndex(lvs->m_capmode_data2)};
                 lvs->m_capmode_state=LISTVIEW_CAP_NONE;
                 SendMessage(GetParent(hwnd),WM_NOTIFY,hwnd->m_id,(LPARAM)&nm);
-#ifdef SWELL_TARGET_WAYLAND
-                swell_wayland_begin_drag(hwnd);
-#endif
+                swell_oswindow_begin_drag(hwnd);
               }
             }
           break;
@@ -5938,9 +5929,7 @@ forceMouseMove:
                 nm.itemNew.hItem = item;
                 nm.itemNew.lParam = item ? item->m_param : 0;
                 SendMessage(GetParent(hwnd),WM_NOTIFY,nm.hdr.idFrom,(LPARAM)&nm);
-#ifdef SWELL_TARGET_WAYLAND
-                swell_wayland_begin_drag(hwnd);
-#endif
+                swell_oswindow_begin_drag(hwnd);
               }
             }
           break;
@@ -7149,41 +7138,8 @@ static HWND recurseOwnedWindowHitTest(HWND h, POINT p, int maxdepth)
 
 HWND WindowFromPoint(POINT p)
 {
-#ifdef SWELL_TARGET_WAYLAND
-  if (swell_is_wayland())
-  {
-    HWND drag_target;
-    if (swell_wayland_drag_target(p, &drag_target)) return drag_target;
-    extern HWND g_wayland_hovered_hwnd;
-    bool hover_hwnd_still_valid = false;
-    if (g_wayland_hovered_hwnd)
-    {
-      HWND t = SWELL_topwindows;
-      while (t && t != g_wayland_hovered_hwnd) t = t->m_next;
-      if (t)
-        hover_hwnd_still_valid = true;
-      else
-        g_wayland_hovered_hwnd = NULL;
-    }
-    if (hover_hwnd_still_valid)
-    {
-      HWND child = ChildWindowFromPoint(g_wayland_hovered_hwnd, p);
-      return child ? child : g_wayland_hovered_hwnd;
-    }
-
-    SWELL_OSWINDOW hov = s_last_hover_oswindow;
-    if (hov)
-    {
-      HWND hovhwnd = swell_oswindow_to_hwnd(hov);
-      if (hovhwnd)
-      {
-        HWND child = ChildWindowFromPoint(hovhwnd, p);
-        return child ? child : hovhwnd;
-      }
-    }
-    return NULL;
-  }
-#endif
+  HWND window;
+  if (swell_oswindow_from_point(p, &window)) return window;
   HWND h = SWELL_topwindows;
   while (h)
   {

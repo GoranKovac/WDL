@@ -13,7 +13,6 @@ bool swell_gdk_size_hints(HWND hwnd, const RECT *fixed, GdkGeometry *hints);
 void swell_gdk_close(HWND hwnd);
 void swell_gdk_configure(GdkEventConfigure *event);
 void swell_gdk_drag_enter(int x, int y);
-void swell_gdk_receive_drop(HWND hwnd, GdkEventDND *event);
 
 struct SWELL_GdkBackend
 {
@@ -48,9 +47,15 @@ struct SWELL_GdkBackend
   void (*clipboard_publish)();
   bool (*clipboard_text)(GdkAtom atom);
   void (*drag_files)(HWND hwnd, const SWELL_GdkDrag &data);
+  void (*begin_drag)(HWND source);
+  HWND (*window_from_point)(POINT point);
+  bool (*can_run_timers)();
+  bool reuse_popup;
+  void (*end_modal)(HWND hwnd);
 };
 
 extern const SWELL_GdkBackend swell_gdk_x11;
+void swell_x11_init();
 #ifdef SWELL_TARGET_WAYLAND
 extern const SWELL_GdkBackend swell_gdk_wayland;
 bool swell_wayland_init_display();

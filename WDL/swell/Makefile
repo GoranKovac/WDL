@@ -195,7 +195,6 @@ swell-miscdlg-generic.o: $(SWELL_HEADERS)
 swell-modstub-generic.o: $(SWELL_HEADERS)
 swell-appstub-generic.o: $(SWELL_HEADERS)
 swell-generic-gdk.o xwayland-bridge.o swell-generic-x11.o swell-generic-wayland.o: $(SWELL_HEADERS)
-swell-generic-gdk.o swell-generic-x11.o: swell-x11.h
 swell-generic-x11.o: swell-xcb.h
 swell-generic-gdk.o swell-generic-x11.o swell-generic-wayland.o swell-gdk-clipboard.o: swell-gdk.h
 swell-gdk-clipboard.o: $(SWELL_HEADERS)

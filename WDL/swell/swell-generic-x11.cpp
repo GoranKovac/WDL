@@ -26,7 +26,6 @@
 #include "swell.h"
 #include "swell-internal.h"
 #include <gdk/gdkx.h>
-#include "swell-x11.h"
 #include "swell-gdk.h"
 #include <X11/extensions/XInput2.h>
 #include <X11/Xlib-xcb.h>
@@ -47,6 +46,8 @@ void swell_x11_init()
   *(void **)&_gdk_drag_drop_done = dlsym(RTLD_DEFAULT, "gdk_drag_drop_done");
 #endif
 }
+
+static void receive_drop(HWND hwnd, GdkEventDND *event);
 
 static HWND s_ddrop_forward_last_hwnd; // last top level window, which receives events from the drag source
 static Window s_ddrop_forward_last_target; // plug-in window we're sending XdndEnter etc to
@@ -486,7 +487,7 @@ static void run_drag_finish_abort()
   xcb_flush(connection);
 }
 
-bool swell_x11_drag_event(GdkEvent *evt)
+static bool swell_x11_drag_event(GdkEvent *evt)
 {
   // GDK sends drag events to the top level window
   // we need to check for bridged child windows and delegate the events to them
@@ -630,7 +631,7 @@ bool swell_x11_drag_event(GdkEvent *evt)
         }
         else
         {
-          swell_gdk_receive_drop(hwnd, e);
+          receive_drop(hwnd, e);
         }
         if (SWELL_DDrop_onDragLeave) SWELL_DDrop_onDragLeave();
       }
@@ -870,7 +871,7 @@ static GdkFilterReturn filterCreateShowProc(GdkXEvent *xev, GdkEvent *event, gpo
   return GDK_FILTER_CONTINUE;
 }
 
-HWND swell_x11_create_bridge(HWND viewpar, void **wref, const RECT *r)
+static HWND swell_x11_create_bridge(HWND viewpar, void **wref, const RECT *r)
 {
   HWND hwnd = NULL;
   *wref = NULL;
@@ -927,7 +928,7 @@ HWND swell_x11_create_bridge(HWND viewpar, void **wref, const RECT *r)
 }
 
 
-void swell_x11_drag_check_timeout()
+static void swell_x11_drag_check_timeout()
 {
     DWORD dt;
     if (s_ddrop_forward_last_has_dropped &&
@@ -1009,7 +1010,7 @@ bool SWELL_SetGLContextToView(HWND h)
   return true;
 }
 
-guint32 swell_x11_get_desktop(GdkWindow *window)
+static guint32 swell_x11_get_desktop(GdkWindow *window)
 {
   if (!window || !gdk_x11_screen_supports_net_wm_hint(gdk_window_get_screen(window),
       gdk_atom_intern_static_string("_NET_WM_DESKTOP"))) return 0;
@@ -1024,7 +1025,7 @@ guint32 swell_x11_get_desktop(GdkWindow *window)
   return desktop;
 }
 
-void swell_x11_move_to_desktop(GdkWindow *window, guint32 desktop)
+static void swell_x11_move_to_desktop(GdkWindow *window, guint32 desktop)
 {
   if (!window || !gdk_x11_screen_supports_net_wm_hint(gdk_window_get_screen(window),
       gdk_atom_intern_static_string("_NET_WM_DESKTOP"))) return;
@@ -1041,7 +1042,7 @@ void swell_x11_move_to_desktop(GdkWindow *window, guint32 desktop)
   xcb_flush(connection);
 }
 
-bool swell_x11_has_focus(GdkWindow *window)
+static bool swell_x11_has_focus(GdkWindow *window)
 {
   // verify we already have focus
   GdkDisplay *display = gdk_window_get_display(window);
@@ -1062,7 +1063,7 @@ bool swell_x11_has_focus(GdkWindow *window)
   return true;
 }
 
-void swell_x11_force_focus(GdkWindow *window)
+static void swell_x11_force_focus(GdkWindow *window)
 {
   xcb_connection_t *connection = XGetXCBConnection(GDK_WINDOW_XDISPLAY(window));
   xcb_discard_reply(connection, xcb_set_input_focus_checked(connection,
@@ -1070,7 +1071,7 @@ void swell_x11_force_focus(GdkWindow *window)
   xcb_flush(connection);
 }
 
-void swell_x11_set_grab_cursor(GdkWindow *window, GdkCursor *curs)
+static void swell_x11_set_grab_cursor(GdkWindow *window, GdkCursor *curs)
 {
   // workaround for a GDK behavior:
   // gdkwindow.c, gdk_window_set_cursor_internal() has a line:
@@ -1101,7 +1102,7 @@ void swell_x11_set_grab_cursor(GdkWindow *window, GdkCursor *curs)
   }
 }
 
-bool swell_x11_has_selection_owner(GdkDisplay *display, GdkAtom selection)
+static bool swell_x11_has_selection_owner(GdkDisplay *display, GdkAtom selection)
 {
   xcb_connection_t *connection = XGetXCBConnection(gdk_x11_display_get_xdisplay(display));
   xcb_get_selection_owner_reply_t *reply = xcb_get_selection_owner_reply(connection,
@@ -1313,7 +1314,7 @@ static void OnSelectionNotifyEvent(GdkEventSelection *b)
   if (gptr) g_free(gptr);
 }
 
-void swell_gdk_receive_drop(HWND hwnd, GdkEventDND *e)
+static void receive_drop(HWND hwnd, GdkEventDND *e)
 {
   GdkDragContext *ctx = e->context;
   if (ctx)
@@ -1793,7 +1794,8 @@ const SWELL_GdkBackend swell_gdk_x11 = {
   activate, window_manager_name, create_window, show_window, destroy_window,
   close_window, focus_window, swell_gdk_set_decorations, set_cursor, swell_x11_create_bridge, NULL, false,
   NULL, swell_gdk_monitor_geometry, scaling_init,
-  NULL, read_clipboard, claim_clipboard, NULL, NULL, drag_files
+  NULL, read_clipboard, claim_clipboard, NULL, NULL, drag_files,
+  NULL, NULL, NULL, true, NULL
 };
 
 #endif

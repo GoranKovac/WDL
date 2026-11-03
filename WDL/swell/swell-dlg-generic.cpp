@@ -255,10 +255,7 @@ int SWELL_DialogBox(SWELL_DialogResourceIndex *reshead, const char *resid, HWND 
       Sleep(10);
     }
     ret=r.ret;
-#ifdef SWELL_TARGET_WAYLAND
-    if (hwnd->m_oswidget && GTK_IS_WINDOW(hwnd->m_oswidget))
-      gtk_window_set_modal(GTK_WINDOW(hwnd->m_oswidget), FALSE);
-#endif
+    swell_oswindow_end_modal(hwnd);
     s_modalDialogs.DeletePtr(&r);
 
     a = SWELL_topwindows;

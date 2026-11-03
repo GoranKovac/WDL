@@ -40,7 +40,6 @@ extern "C" {
 #include "swell-internal.h"
 #include <limits.h>
 #include <gdk/gdkkeysyms.h>
-#include "swell-x11.h"
 #include "swell-gdk.h"
 #include "swell-dlggen.h"
 #include "../wdlcstring.h"
@@ -1627,6 +1626,33 @@ static void swell_gdkEventHandler(GdkEvent *evt, gpointer)
   swell_gdk_current_event = old;
 }
 
+
+void swell_oswindow_begin_drag(HWND source)
+{
+  if (swell_gdk_backend->begin_drag) swell_gdk_backend->begin_drag(source);
+}
+
+bool swell_oswindow_from_point(POINT point, HWND *window)
+{
+  if (!swell_gdk_backend->window_from_point) return false;
+  *window = swell_gdk_backend->window_from_point(point);
+  return true;
+}
+
+bool swell_oswindow_can_run_timers()
+{
+  return !swell_gdk_backend->can_run_timers || swell_gdk_backend->can_run_timers();
+}
+
+bool swell_oswindow_reuse_popup()
+{
+  return swell_gdk_backend->reuse_popup;
+}
+
+void swell_oswindow_end_modal(HWND hwnd)
+{
+  if (swell_gdk_backend->end_modal) swell_gdk_backend->end_modal(hwnd);
+}
 
 void SWELL_RunEvents()
 {

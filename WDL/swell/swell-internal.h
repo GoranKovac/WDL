@@ -1020,10 +1020,6 @@ HWND DialogBoxIsActive(void);
 bool DestroyPopupMenus(void);
 bool PopupMenuIsActive(void);
 HWND ChildWindowFromPoint(HWND h, POINT p);
-#ifdef SWELL_TARGET_WAYLAND
-void swell_wayland_begin_drag(HWND source);
-bool swell_wayland_drag_target(POINT p, HWND *target);
-#endif
 HWND GetFocusIncludeMenus();
 
 void SWELL_RunEvents();
@@ -1035,6 +1031,11 @@ void swell_on_toplevel_raise(SWELL_OSWINDOW wnd); // called by swell-generic-gdk
 HWND swell_oswindow_to_hwnd(SWELL_OSWINDOW w);
 SWELL_OSWINDOW swell_oswindow_from_hwnd(HWND hwnd);
 void swell_oswindow_focus(HWND hwnd);
+void swell_oswindow_begin_drag(HWND source);
+bool swell_oswindow_from_point(POINT point, HWND *window);
+bool swell_oswindow_can_run_timers();
+bool swell_oswindow_reuse_popup();
+void swell_oswindow_end_modal(HWND hwnd);
 void swell_oswindow_update_style(HWND hwnd, LONG oldstyle);
 void swell_oswindow_update_enable(HWND hwnd);
 void swell_oswindow_update_text(HWND hwnd);
