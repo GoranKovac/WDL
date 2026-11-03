@@ -32,8 +32,6 @@
 #include "swell-gdk-scale.h"
 #include "swell-xwayland-bridge.h"
 
-#define PRIVATE_SIZEPIN 2
-
 static void swell_wayland_set_geometry_hints(HWND hwnd, const GdkGeometry *hints);
 static void swell_wayland_paint_manual_titlebar(HWND hwnd, GdkWindow *window, cairo_t *cr);
 
@@ -1122,60 +1120,9 @@ static void get_window_rect(HWND hwnd, RECT *r)
   *r = hwnd->m_position;
 }
 
-static void swell_wl_sizepin_release(GdkFrameClock *clock, gpointer data)
-{
-  HWND hwnd = (HWND)data;
-  g_signal_handlers_disconnect_by_func(clock, (gpointer)swell_wl_sizepin_release, data);
-  hwnd->m_oswindow_private &= ~PRIVATE_SIZEPIN;
-  swell_recalcMinMaxInfo(hwnd);
-}
-
-static void swell_wayland_release_sizepin(HWND hwnd)
-{
-  if (hwnd && (hwnd->m_oswindow_private & PRIVATE_SIZEPIN))
-  {
-    hwnd->m_oswindow_private &= ~PRIVATE_SIZEPIN;
-    if (hwnd->m_oswindow)
-      g_signal_handlers_disconnect_by_func(gdk_window_get_frame_clock(hwnd->m_oswindow),
-                                           (gpointer)swell_wl_sizepin_release, hwnd);
-  }
-}
-
-static void pin_window_size(HWND hwnd, RECT f)
-{
-  const int scale = swell_gdk_window_scale(hwnd->m_oswindow);
-  int w = wdl_max(swell_gdk_ceil(f.right - f.left, scale), 1);
-  int h = wdl_max(swell_gdk_ceil(f.bottom - f.top, scale), 1);
-  if (swell_wayland_needs_manual_titlebar(hwnd))
-  {
-    w += SWELL_WAYLAND_BORDER_WIDTH*2;
-    h += g_swell_wayland_title_h + SWELL_WAYLAND_BORDER_WIDTH*2;
-  }
-
-  GdkGeometry gh;
-  memset(&gh,0,sizeof(gh));
-  gh.min_width = gh.max_width = w;
-  gh.min_height = gh.max_height = h;
-  swell_wayland_set_geometry_hints(hwnd, &gh);
-  gdk_window_set_geometry_hints(hwnd->m_oswindow, &gh,
-    (GdkWindowHints)(GDK_HINT_MIN_SIZE | GDK_HINT_MAX_SIZE));
-  if (!(hwnd->m_oswindow_private & PRIVATE_SIZEPIN))
-  {
-    hwnd->m_oswindow_private |= PRIVATE_SIZEPIN;
-    g_signal_connect(gdk_window_get_frame_clock(hwnd->m_oswindow), "after-paint",
-                     G_CALLBACK(swell_wl_sizepin_release), hwnd);
-  }
-}
-
 static void resize_window(GdkWindow *wnd, int reposflag, RECT f, bool mapped)
 {
   HWND hwnd = swell_oswindow_to_hwnd(wnd);
-  if (mapped && (reposflag & 2) && hwnd && hwnd->m_oswidget &&
-      gtk_window_get_type_hint(GTK_WINDOW(hwnd->m_oswidget)) != GDK_WINDOW_TYPE_HINT_TOOLTIP)
-  {
-    pin_window_size(hwnd, f);
-    return;
-  }
   const int scale = swell_gdk_window_scale(wnd);
   const int width = swell_gdk_ceil(f.right - f.left, scale);
   const int height = swell_gdk_ceil(f.bottom - f.top, scale);
@@ -1192,14 +1139,16 @@ static void resize_window(GdkWindow *wnd, int reposflag, RECT f, bool mapped)
     f.right = f.left + w + SWELL_WAYLAND_BORDER_WIDTH*2;
     f.bottom = f.top + h + g_swell_wayland_title_h + SWELL_WAYLAND_BORDER_WIDTH*2;
   }
-  if ((reposflag&3)==3) gdk_window_move_resize(wnd,f.left,f.top,f.right-f.left,f.bottom-f.top);
+  if (mapped && (reposflag & 2) && hwnd && hwnd->m_oswidget &&
+      gtk_window_get_type_hint(GTK_WINDOW(hwnd->m_oswidget)) != GDK_WINDOW_TYPE_HINT_TOOLTIP)
+    gtk_window_resize(GTK_WINDOW(hwnd->m_oswidget), wdl_max(f.right-f.left, 1), wdl_max(f.bottom-f.top, 1));
+  else if ((reposflag&3)==3) gdk_window_move_resize(wnd,f.left,f.top,f.right-f.left,f.bottom-f.top);
   else if (reposflag&2) gdk_window_resize(wnd,f.right-f.left,f.bottom-f.top);
   else if (reposflag&1) gdk_window_move(wnd,f.left,f.top);
 }
 
 static void set_size_hints(HWND hwnd, const RECT *fixed)
 {
-  if (!fixed && (hwnd->m_oswindow_private & PRIVATE_SIZEPIN)) return;
   GdkGeometry h;
   if (!swell_gdk_size_hints(hwnd, fixed, &h)) return;
   const int scale = swell_gdk_window_scale(hwnd->m_oswindow);
@@ -1242,7 +1191,6 @@ static void destroy_window(HWND hwnd)
     g_signal_handlers_disconnect_by_data(widget, hwnd);
     gtk_window_set_modal(GTK_WINDOW(widget), FALSE);
   }
-  swell_wayland_release_sizepin(hwnd);
   if (swell_captured_window && hwnd->m_classname && !strcmp(hwnd->m_classname, "__SWELL_MENU"))
   {
     SendMessage(swell_captured_window, WM_CAPTURECHANGED, 0, 0);
