@@ -299,10 +299,21 @@ static void resume_pointer()
     s_pointer_parked = false;
 }
 
+static void raise_window(xcb_window_t window)
+{
+    for (const auto &kv : g_captures) {
+        const Capture *c = kv.second;
+        if (kv.first != c->parent_win) continue;
+        for (const auto &p : c->popups)
+            if (p.visible) return;
+    }
+    swell_xcb_raise(wm_connection(), window);
+}
+
 static void forward_motion(Capture *c, double wx, double wy)
 {
     resume_pointer();
-    swell_xcb_raise(wm_connection(), c->parent_win);
+    raise_window(c->parent_win);
     const int scale = swell_gdk_widget_scale(c->widget);
     int rx = 0, ry = 0;
     swell_xcb_translate(wm_connection(), c->plugin_win, swell_xcb_screen(c->connection)->root,
@@ -348,7 +359,7 @@ void xw_raise_modals()
         for (auto &md : c->modals)
             if (md.gtk_win)
             {
-                swell_xcb_raise(wm_connection(), md.x11_win);
+                raise_window(md.x11_win);
                 gtk_window_present(GTK_WINDOW(md.gtk_win));
                 gtk_window_set_keep_above(GTK_WINDOW(md.gtk_win), TRUE);
             }
@@ -463,7 +474,7 @@ static void on_toplevel_active(GObject *obj, GParamSpec *, gpointer data)
             }
         }
         if (c->connection && c->parent_win) {
-            swell_xcb_raise(wm_connection(), c->parent_win);
+            raise_window(c->parent_win);
             xcb_flush(wm_connection());
         }
         xw_raise_modals();
@@ -983,7 +994,7 @@ static bool modal_draw_cb(GtkWidget *widget, cairo_t *cr, gpointer data)
 static void modal_forward_motion(ModalRender *m, GtkWidget *widget, double wx, double wy)
 {
     resume_pointer();
-    swell_xcb_raise(wm_connection(), m->x11_win);
+    raise_window(m->x11_win);
     const int scale = swell_gdk_widget_scale(widget);
     int rx = 0, ry = 0;
     swell_xcb_translate(wm_connection(), m->x11_win, swell_xcb_screen(m->cap->connection)->root,
