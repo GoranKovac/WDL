@@ -76,7 +76,7 @@ bool swell_wayland_init_display()
 
 static void swell_wayland_init_application_id()
 {
-  if (!g_swell_appname || !GDK_IS_WAYLAND_DISPLAY(gdk_display_get_default())) return;
+  if (!g_swell_appname) return;
 
   GList *apps = g_app_info_get_all();
   for (GList *p = apps; p; p = p->next)
@@ -96,17 +96,15 @@ static void swell_wayland_init_application_id()
   g_list_free(apps);
 }
 
-static void swell_wayland_init_titlebar_height()
-{
-  GdkDisplay *disp = gdk_display_get_default();
-  g_swell_wayland_title_h = GDK_IS_WAYLAND_DISPLAY(disp) && !gdk_wayland_display_prefers_ssd(disp) ? 28 : 0;
-}
-
-static void swell_wayland_suppress_csd_shadow_once()
+static void swell_wayland_init()
 {
   static bool done = false;
-  if (done || !g_swell_wayland_title_h) return;
+  if (done) return;
   done = true;
+
+  swell_wayland_init_application_id();
+  g_swell_wayland_title_h = gdk_wayland_display_prefers_ssd(gdk_display_get_default()) ? 0 : 28;
+  if (!g_swell_wayland_title_h) return;
 
   GtkCssProvider *provider = gtk_css_provider_new();
   const char *css =
@@ -127,13 +125,6 @@ static void swell_wayland_suppress_csd_shadow_once()
 bool swell_wayland_needs_manual_titlebar(HWND hwnd)
 {
   return hwnd && g_swell_wayland_title_h && (hwnd->m_style & WS_CAPTION);
-}
-
-static void swell_wayland_init()
-{
-  swell_wayland_init_application_id();
-  swell_wayland_init_titlebar_height();
-  swell_wayland_suppress_csd_shadow_once();
 }
 
 static void expose(GdkEventExpose *event, cairo_t *draw_ctx = NULL, bool background = false)
@@ -256,6 +247,7 @@ static gboolean swell_wayland_draw(GtkWidget *widget, cairo_t *cr, gpointer data
 
 static bool swell_wayland_create_window(HWND hwnd, GdkWindow *transient_for)
 {
+  swell_wayland_init();
   const RECT r = hwnd->m_position;
   bool is_popup_menu = (hwnd->m_classname && strcmp(hwnd->m_classname, "__SWELL_MENU") == 0);
   bool is_tooltip = (!hwnd->m_parent && !hwnd->m_owner && (hwnd->m_style & WS_CHILD) && (!hwnd->m_title.Get() || !hwnd->m_title.Get()[0]));
@@ -1184,12 +1176,6 @@ static void set_size_hints(HWND hwnd, const RECT *fixed)
 
 static void activate(bool) { }
 
-static const char *window_manager_name()
-{
-  swell_wayland_init();
-  return NULL;
-}
-
 static void show_window(HWND hwnd, bool, bool modal, guint32)
 {
   if (modal) gtk_window_set_modal(GTK_WINDOW(hwnd->m_oswidget), TRUE);
@@ -1546,7 +1532,7 @@ static void end_modal(HWND hwnd)
 const SWELL_GdkBackend swell_gdk_wayland = {
   event_handler, mouse_event, run_events, get_cursor_pos, get_async_key_state,
   update_window, invalidate, get_window_rect, resize_window, set_size_hints,
-  activate, window_manager_name, swell_wayland_create_window, show_window, destroy_window,
+  activate, NULL, swell_wayland_create_window, show_window, destroy_window,
   close_window, focus_window, set_decorations, set_cursor, create_bridge, invalidate_focus, true,
   get_viewport, monitor_geometry, scaling_init,
   clipboard_open, req_wayland_clipboard, NULL, publish_wayland_clipboard, clipboard_text, drag_files,

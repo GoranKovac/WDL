@@ -549,7 +549,8 @@ static void init_options()
       default: break;
     }
 
-    const char *wmname = swell_gdk_backend->window_manager_name();
+    const char *wmname = swell_gdk_backend->window_manager_name ?
+        swell_gdk_backend->window_manager_name() : NULL;
     switch (swell_gdk_option("gdk_fullscreen_for_owner_windows", "auto (default is 1 on kwin, otherwise 0)",-1))
     {
       case -1:
