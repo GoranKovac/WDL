@@ -1523,33 +1523,18 @@ static HWND window_from_point(POINT p)
 {
   HWND drag_target;
   if (swell_wayland_drag_target(p, &drag_target)) return drag_target;
-  bool hover_hwnd_still_valid = false;
-  if (g_wayland_hovered_hwnd)
+  HWND hwnd = g_wayland_hovered_hwnd;
+  if (hwnd)
   {
     HWND t = SWELL_topwindows;
-    while (t && t != g_wayland_hovered_hwnd) t = t->m_next;
-    if (t)
-      hover_hwnd_still_valid = true;
-    else
-      g_wayland_hovered_hwnd = NULL;
+    while (t && t != hwnd) t = t->m_next;
+    hwnd = g_wayland_hovered_hwnd = t;
   }
-  if (hover_hwnd_still_valid)
-  {
-    HWND child = ChildWindowFromPoint(g_wayland_hovered_hwnd, p);
-    return child ? child : g_wayland_hovered_hwnd;
-  }
-
-  SWELL_OSWINDOW hov = s_last_hover_oswindow;
-  if (hov)
-  {
-    HWND hovhwnd = swell_oswindow_to_hwnd(hov);
-    if (hovhwnd)
-    {
-      HWND child = ChildWindowFromPoint(hovhwnd, p);
-      return child ? child : hovhwnd;
-    }
-  }
-  return NULL;
+  if (!hwnd) hwnd = swell_oswindow_to_hwnd(s_last_hover_oswindow);
+  if (!hwnd || !PtInRect(&hwnd->m_position, p)) return NULL;
+  p.x -= hwnd->m_position.left;
+  p.y -= hwnd->m_position.top;
+  return ChildWindowFromPoint(hwnd, p);
 }
 
 static void end_modal(HWND hwnd)
