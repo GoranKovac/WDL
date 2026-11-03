@@ -1428,10 +1428,10 @@ static bool clipboard_text(GdkAtom atom)
   return gtk_targets_include_text(&atom, 1);
 }
 
-struct dropSourceInfo
+struct WaylandDragSource
 {
-  dropSourceInfo(const SWELL_GdkDrag &d) : data(d), state(0), dragctx(NULL), widget(NULL), finished(false) { }
-  ~dropSourceInfo()
+  WaylandDragSource(const SWELL_GdkDrag &d) : data(d), state(0), dragctx(NULL), widget(NULL), finished(false) { }
+  ~WaylandDragSource()
   {
     if (widget)
     {
@@ -1450,7 +1450,7 @@ struct dropSourceInfo
 
 static void on_drag_source_data_get(GtkWidget *widget, GdkDragContext *context, GtkSelectionData *data, guint info, guint time, gpointer user_data)
 {
-  dropSourceInfo *inf = (dropSourceInfo*)user_data;
+  WaylandDragSource *inf = (WaylandDragSource*)user_data;
   WDL_FastString str;
 
   if (inf->data.files && inf->data.count)
@@ -1475,13 +1475,13 @@ static void on_drag_source_data_get(GtkWidget *widget, GdkDragContext *context, 
 
 static void on_drag_source_end(GtkWidget *, GdkDragContext *, gpointer data)
 {
-  ((dropSourceInfo*)data)->finished = true;
+  ((WaylandDragSource*)data)->finished = true;
   if (GetCapture() == swell_gdk_drag_source) ReleaseCapture();
 }
 
 static LRESULT WINAPI dropSourceWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
 {
-  dropSourceInfo *inf = (dropSourceInfo*)hwnd->m_private_data;
+  WaylandDragSource *inf = (WaylandDragSource*)hwnd->m_private_data;
   if (msg == WM_CREATE)
   {
     GtkWidget *widget = swell_gdk_current_event ? gtk_get_event_widget(swell_gdk_current_event) : NULL;
@@ -1504,7 +1504,7 @@ static LRESULT WINAPI dropSourceWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPAR
 
 static void drag_files(HWND hwnd, const SWELL_GdkDrag &data)
 {
-  dropSourceInfo info(data);
+  WaylandDragSource info(data);
   RECT r = {};
   HWND h = new HWND__(NULL, 0, &r, NULL, false, NULL, dropSourceWndProc, NULL);
   swell_gdk_drag_source = h;

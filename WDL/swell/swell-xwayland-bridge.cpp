@@ -1571,7 +1571,7 @@ static void set_active_capture(Capture *c)
     if (g_wm) g_wm->set_active_window(c ? c->parent_win : XCB_NONE);
 }
 
-struct bridgeState {
+struct XWaylandBridge {
     xcb_connection_t *connection = nullptr;
     xcb_window_t parent = 0;
     Capture *cap    = nullptr;
@@ -2918,7 +2918,7 @@ static GdkRectangle place_container(xcb_connection_t *connection, xcb_window_t c
 static bool try_create_plugin(HWND hwnd)
 {
     if (!hwnd || !hwnd->m_private_data) return true;
-    bridgeState *bs = (bridgeState*)hwnd->m_private_data;
+    XWaylandBridge *bs = (XWaylandBridge*)hwnd->m_private_data;
 
     if (!bs->placed) xw_size(hwnd);
 
@@ -2954,7 +2954,7 @@ static bool try_create_plugin(HWND hwnd)
 static void xw_destroy(HWND hwnd)
 {
     if (!hwnd || !hwnd->m_private_data) return;
-    bridgeState *bs = (bridgeState*)hwnd->m_private_data;
+    XWaylandBridge *bs = (XWaylandBridge*)hwnd->m_private_data;
     hwnd->m_private_data = 0;
     KillTimer(hwnd, 1);
     if (bs->cap) cleanup_capture(bs->cap);
@@ -2986,7 +2986,7 @@ static void xw_destroy(HWND hwnd)
 static void xw_size(HWND hwnd)
 {
     if (!hwnd || !hwnd->m_private_data || !hwnd->m_oswidget) return;
-    bridgeState *bs = (bridgeState*)hwnd->m_private_data;
+    XWaylandBridge *bs = (XWaylandBridge*)hwnd->m_private_data;
 
     GtkWidget *container = xw_ensure_embed_widget(hwnd->m_parent);
     if (!container || !GTK_IS_FIXED(container)) {
@@ -3158,7 +3158,7 @@ HWND xw_bridge_create(HWND viewpar, void **wref, const RECT *r, const char *brid
     hwnd->m_classname = bridge_class_name;
     hwnd->m_oswidget  = draw_area;
 
-    bridgeState *bs = new bridgeState();
+    XWaylandBridge *bs = new XWaylandBridge();
     bs->connection   = connection;
     bs->parent = container;
     hwnd->m_private_data = (INT_PTR)bs;
@@ -3175,7 +3175,7 @@ HWND xw_bridge_create(HWND viewpar, void **wref, const RECT *r, const char *brid
 bool xw_bridge_forward_key(HWND hwnd, int keycode, int state, bool is_press)
 {
     if (!hwnd || !hwnd->m_private_data) return false;
-    bridgeState *bs = (bridgeState*)hwnd->m_private_data;
+    XWaylandBridge *bs = (XWaylandBridge*)hwnd->m_private_data;
     Capture *c = bs->cap;
     if (!c || !c->connection) return false;
 
