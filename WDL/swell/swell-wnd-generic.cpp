@@ -44,6 +44,7 @@
 
 #ifdef SWELL_TARGET_WAYLAND
 extern SWELL_OSWINDOW s_last_hover_oswindow;
+bool xw_bridge_foreign_popup_open();
 #endif
 
 #define EDIT_CURSOR_BLINK_LEN 500
@@ -912,6 +913,10 @@ void SWELL_RunMessageLoop()
 {
   SWELL_MessageQueue_Flush();
   SWELL_RunEvents();
+
+#ifdef SWELL_TARGET_WAYLAND
+  if (xw_bridge_foreign_popup_open()) return;
+#endif
 
   const DWORD now = GetTickCount();
   WDL_MutexLock lock(&m_timermutex);

@@ -56,6 +56,7 @@ struct Capture {
         bool pixmap_dirty;
         int x,y,w,h;
         bool visible;
+        bool foreign;
         xcb_damage_damage_t damage;
         std::vector<xcb_rectangle_t> shape;
         bool shape_dirty;
@@ -896,6 +897,14 @@ static void canvas_add_popup(Capture *c, xcb_window_t x11_win, xcb_get_geometry_
     if (!pp) {
         c->popups.emplace_back();
         pp = &c->popups.back();
+        uint32_t pid = 0;
+        xcb_get_property_reply_t *reply = xcb_get_property_reply(c->connection,
+            xcb_get_property(c->connection, false, x11_win, g_wm->atoms()._NET_WM_PID,
+                             XCB_ATOM_CARDINAL, 0, 1), nullptr);
+        if (reply && reply->format == 32 && xcb_get_property_value_length(reply) == sizeof(pid))
+            pid = *(const uint32_t *)xcb_get_property_value(reply);
+        free(reply);
+        pp->foreign = pid && pid != (uint32_t)getpid();
         if (wm_connection() && g_damage_event_base >= 0)
             pp->damage = create_damage(x11_win);
         if (wm_connection() && g_shape_event_base >= 0)
@@ -1393,6 +1402,17 @@ bool xw_bridge_popup_blocks_close(HWND hwnd)
         Capture *c = kv.second;
         if (kv.first != c->parent_win) continue;
         if (capture_owned_by(c, hwnd) && has_input_popup(c)) return true;
+    }
+    return false;
+}
+
+bool xw_bridge_foreign_popup_open()
+{
+    for (const auto &kv : g_captures) {
+        const Capture *c = kv.second;
+        if (kv.first != c->parent_win) continue;
+        for (const auto &p : c->popups)
+            if (p.foreign && p.visible && popup_accepts_input(c->connection, p.x11_win)) return true;
     }
     return false;
 }
