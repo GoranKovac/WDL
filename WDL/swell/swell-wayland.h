@@ -15,3 +15,6 @@ bool swell_wayland_button_event(HWND hwnd, const GdkEventButton *event);
 extern GdkWindow *s_last_hover_oswindow;
 extern int g_swell_wayland_title_h;
 extern int SWELL_WAYLAND_BORDER_WIDTH;
+
+void swell_wayland_setup_drag(HWND hwnd);
+bool swell_wayland_is_drag_widget(HWND hwnd);

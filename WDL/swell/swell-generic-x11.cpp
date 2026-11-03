@@ -1098,4 +1098,62 @@ bool swell_x11_has_selection_owner(GdkDisplay *display, GdkAtom selection)
   return owned;
 }
 
+
+static void mouse_event(GdkEvent *event)
+{
+  switch (event->type)
+  {
+    case GDK_MOTION_NOTIFY: swell_gdk_motion_event(&event->motion); break;
+    case GDK_SCROLL: swell_gdk_scroll_event(&event->scroll); break;
+    default: swell_gdk_button_event(&event->button); break;
+  }
+}
+
+static void event_handler(GdkEvent *event)
+{
+  switch (event->type)
+  {
+    case GDK_KEY_PRESS:
+    case GDK_KEY_RELEASE:
+      swell_gdk_prepare_key_event();
+      swell_gdk_key_event(&event->key);
+      break;
+    case GDK_DRAG_ENTER:
+    case GDK_DRAG_MOTION:
+    case GDK_DROP_START:
+    case GDK_DROP_FINISHED:
+    case GDK_DRAG_LEAVE:
+      if (swell_x11_drag_event(event)) return;
+      break;
+    default: break;
+  }
+  swell_gdk_dispatch_event(event);
+}
+
+static void run_events()
+{
+#if SWELL_TARGET_GDK == 2
+  gdk_window_process_all_updates();
+#endif
+  GMainContext *ctx = g_main_context_default();
+  while (g_main_context_iteration(ctx, FALSE)) { }
+  swell_x11_drag_check_timeout();
+}
+
+static void get_cursor_pos(POINT *pt)
+{
+//#if SWELL_TARGET_GDK == 3
+//    GdkDevice *dev=NULL;
+//    if (swell_gdk_current_event) dev = gdk_event_get_device(swell_gdk_current_event);
+//    if (!dev) dev = gdk_device_manager_get_client_pointer(gdk_display_get_device_manager(gdk_display_get_default()));
+//    if (dev) gdk_device_get_position(dev,NULL,&pt->x,&pt->y);
+//#else
+  gdk_display_get_pointer(gdk_display_get_default(),NULL,&pt->x,&pt->y,NULL);
+//#endif
+}
+
+const SWELL_GdkBackend swell_gdk_x11 = {
+  event_handler, mouse_event, run_events, get_cursor_pos, swell_gdk_get_async_key_state
+};
+
 #endif
