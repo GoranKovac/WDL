@@ -22,14 +22,8 @@
 
 
 #ifndef SWELL_PROVIDED_BY_APP
-#ifdef SWELL_TARGET_WAYLAND
-#include <gdk/gdkwayland.h>
-#include "swell-wayland.h"
-#include "xwayland-bridge.h"
-#endif
 #include "swell.h"
 
-//#define SWELL_GDK_IMPROVE_WINDOWRECT // does not work yet (gdk_window_get_frame_extents() does not seem to be sufficiently reliable)
 
 #ifdef SWELL_PRELOAD
 #define STR(x) #x
@@ -48,17 +42,11 @@ extern "C" {
 #include <gdk/gdkx.h>
 #include "swell-x11.h"
 #include "swell-gdk.h"
-#ifdef SWELL_TARGET_WAYLAND
-#include "swell-gdk-scale.h"
-#endif
 #include "swell-dlggen.h"
 #include "../wdlcstring.h"
 #include "../wdlutf8.h"
 
 
-#if !defined(SWELL_TARGET_GDK_NO_CURSOR_HACK)
-  #define SWELL_TARGET_GDK_CURSORHACK
-#endif
 
 
 #ifdef SWELL_SUPPORT_GTK
@@ -71,11 +59,7 @@ static void (*_gdk_drag_drop_done)(GdkDragContext *, gboolean); // may not alway
 
 // for m_oswindow_private
 #define PRIVATE_NEEDSHOW 1 
-#define PRIVATE_SIZEPIN 2
 
-#ifdef SWELL_TARGET_WAYLAND
-static void swell_wl_sizepin_release(GdkFrameClock *clock, gpointer data);
-#endif
 
 #ifndef SWELL_WINDOWSKEY_GDK_MASK
 #define  SWELL_WINDOWSKEY_GDK_MASK GDK_MOD4_MASK
@@ -147,7 +131,6 @@ static bool s_clipboard_written; // has clipboard data been written-to since ope
 
 static void swell_gdkEventHandler(GdkEvent *event, gpointer data);
 
-static int s_last_desktop;
 static UINT_PTR s_deactivate_timer;
 static guint32 s_force_window_time;
 static bool swell_app_is_inactive;
@@ -192,7 +175,7 @@ static void on_activate(guint32 ftime)
     PostMessage(h,WM_ACTIVATEAPP,1,0);
     h=h->m_next;
   }
-  s_last_desktop=0;
+  swell_gdk_backend->activate(true);
   s_force_window_time = 0;
 
   update_menubar_activations();
@@ -210,12 +193,7 @@ void swell_gdk_reactivate_app(void)
 static void on_deactivate()
 {
   swell_app_is_inactive=true;
-  HWND lf = swell_oswindow_to_hwnd(SWELL_focused_oswindow);
-  s_last_desktop = 0;
-#ifdef SWELL_TARGET_WAYLAND
-  if (!GDK_IS_WAYLAND_DISPLAY(gdk_display_get_default()))
-#endif
-    if (lf && lf->m_oswindow) s_last_desktop = swell_x11_get_desktop(lf->m_oswindow)+1;
+  swell_gdk_backend->activate(false);
 
   HWND h = SWELL_topwindows; 
   while (h)
@@ -236,57 +214,13 @@ static void on_deactivate()
 
 void swell_oswindow_destroy(HWND hwnd)
 {
-#ifdef SWELL_TARGET_WAYLAND
-  if (hwnd && hwnd->m_oswidget && GTK_IS_WINDOW(hwnd->m_oswidget))
-  {
-    g_signal_handlers_disconnect_by_data(hwnd->m_oswidget, hwnd);
-    gtk_window_set_modal(GTK_WINDOW(hwnd->m_oswidget), FALSE);
-  }
-
-  if (hwnd && (hwnd->m_oswindow_private & PRIVATE_SIZEPIN))
-  {
-    hwnd->m_oswindow_private &= ~PRIVATE_SIZEPIN;
-    if (hwnd->m_oswindow)
-      g_signal_handlers_disconnect_by_func(gdk_window_get_frame_clock(hwnd->m_oswindow),
-                                           (gpointer)swell_wl_sizepin_release, hwnd);
-  }
-#endif
   if (hwnd && hwnd->m_oswindow)
   {
     if (SWELL_focused_oswindow == hwnd->m_oswindow) SWELL_focused_oswindow = NULL;
-#ifdef SWELL_TARGET_WAYLAND
-    if (GDK_IS_WAYLAND_WINDOW(hwnd->m_oswindow) && swell_captured_window && hwnd->m_classname &&
-      !strcmp(hwnd->m_classname,"__SWELL_MENU"))
-    {
-      SendMessage(swell_captured_window,WM_CAPTURECHANGED,0,0);
-      swell_captured_window=0;
-    }
-#endif
-#ifdef SWELL_TARGET_WAYLAND
-    swell_wayland_forget_window(hwnd);
-#endif
     if (g_swell_touchptr && g_swell_touchptr_wnd == hwnd->m_oswindow)
       g_swell_touchptr = NULL;
-#ifdef SWELL_TARGET_WAYLAND
-    if (hwnd->m_oswidget && GTK_IS_WINDOW(hwnd->m_oswidget))
-    {
-      xw_bridge_detach_children(hwnd);
-      if (swell_wayland_is_drag_widget(hwnd))
-      {
-        g_signal_connect(hwnd->m_oswidget, "drag-end", G_CALLBACK(+[](GtkWidget *widget, GdkDragContext *, gpointer) {
-          gtk_widget_destroy(widget);
-        }), NULL);
-        gtk_widget_hide(hwnd->m_oswidget);
-      }
-      else gtk_widget_destroy(hwnd->m_oswidget);
-    }
-    else
-#endif
-      gdk_window_destroy(hwnd->m_oswindow);
+    swell_gdk_backend->destroy_window(hwnd);
     hwnd->m_oswindow=NULL;
-#ifdef SWELL_TARGET_WAYLAND
-    hwnd->m_oswidget=NULL;
-#endif
 #ifdef SWELL_LICE_GDI
     delete hwnd->m_backingstore;
     hwnd->m_backingstore=0;
@@ -325,57 +259,32 @@ void swell_oswindow_focus(HWND hwnd)
   while (hwnd && !hwnd->m_oswindow) hwnd=hwnd->m_parent;
   if (hwnd && !swell_app_is_inactive)
   {
-    bool force = false;
-    if (SWELL_focused_oswindow == hwnd->m_oswindow && !(gdk_options & OPTION_IS_WAYLAND))
-    {
-      force = !swell_x11_has_focus(hwnd->m_oswindow);
-    }
-
-    gdk_window_raise(hwnd->m_oswindow);
-
-    if (force || hwnd->m_oswindow != SWELL_focused_oswindow)
-    {
-      SWELL_focused_oswindow = hwnd->m_oswindow;
-      gdk_window_focus(hwnd->m_oswindow,GDK_CURRENT_TIME);
-
-      if (force || hwnd->m_style == WS_CHILD || (!(hwnd->m_style & WS_CAPTION) && (gdk_options&OPTION_BORDERLESS_OVERRIDEREDIRECT)))
-      {
-        // WS_CHILD is used by menus to force override redirect
-        // if override redirect, gdk_window_focus() uses_NET_ACTIVE_WINDOW, but xfce4/plasma do not set focus properly
-        if (!(gdk_options & OPTION_IS_WAYLAND) &&
-            gdk_x11_screen_supports_net_wm_hint(gdk_window_get_screen(hwnd->m_oswindow), gdk_atom_intern_static_string("_NET_ACTIVE_WINDOW")))
-        {
-          swell_x11_force_focus(hwnd->m_oswindow);
-        }
-      }
+    if (swell_gdk_backend->focus_window(hwnd, !(gdk_options & OPTION_IS_WAYLAND),
+                                       (gdk_options & OPTION_BORDERLESS_OVERRIDEREDIRECT) != 0))
       update_menubar_activations();
-    }
   }
 }
 
 void swell_gdk_close(HWND hwnd)
 {
   if (!hwnd) return;
-#ifdef SWELL_TARGET_WAYLAND
-  if (xw_bridge_popup_blocks_close(hwnd)) return;
-#endif
   hwnd->Retain();
-#ifdef SWELL_TARGET_WAYLAND
-  xw_bridge_swell_on_gdk_delete_release(hwnd);
-#endif
-  if (IsWindowEnabled(hwnd) &&
+  if (swell_gdk_backend->close_window(hwnd) && IsWindowEnabled(hwnd) &&
       !DestroyPopupMenus() && // ignore if a menu is open, instead just close the menu
       !SendMessage(hwnd,WM_CLOSE,0,0))
     SendMessage(hwnd,WM_COMMAND,IDCANCEL,0);
   hwnd->Release();
 }
 
-void swell_recalcMinMaxInfo(HWND hwnd)
+bool swell_gdk_size_hints(HWND hwnd, const RECT *fixed, GdkGeometry *hints)
 {
-  if (!hwnd || !hwnd->m_oswindow || !(hwnd->m_style & WS_CAPTION)) return;
-#ifdef SWELL_TARGET_WAYLAND
-  if (hwnd->m_oswindow_private & PRIVATE_SIZEPIN) return;
-#endif
+  if (fixed)
+  {
+    memset(hints, 0, sizeof(*hints));
+    hints->min_width = hints->max_width = fixed->right - fixed->left;
+    hints->min_height = hints->max_height = fixed->bottom - fixed->top;
+    return true;
+  }
   MINMAXINFO mmi;
   memset(&mmi,0,sizeof(mmi));
   if (hwnd->m_style & WS_THICKFRAME)
@@ -388,7 +297,7 @@ void swell_recalcMinMaxInfo(HWND hwnd)
     SendMessage(hwnd,WM_GETMINMAXINFO,0,(LPARAM)&mmi);
     const bool destroyed = hwnd->m_hashaddestroy != 0;
     hwnd->Release();
-    if (destroyed) return;
+    if (destroyed) return false;
   }
   else
   {
@@ -397,32 +306,19 @@ void swell_recalcMinMaxInfo(HWND hwnd)
     mmi.ptMinTrackSize.y = mmi.ptMaxSize.y = mmi.ptMaxTrackSize.y = r.bottom-r.top;
   }
 
-  GdkGeometry h;
+  GdkGeometry &h = *hints;
   memset(&h,0,sizeof(h));
   h.max_width= mmi.ptMaxSize.x;
   h.max_height= mmi.ptMaxSize.y;
   h.min_width= mmi.ptMinTrackSize.x;
   h.min_height= mmi.ptMinTrackSize.y;
-#ifdef SWELL_TARGET_WAYLAND
-  const int scale = swell_gdk_window_scale(hwnd->m_oswindow);
-  h.min_width = swell_gdk_ceil(h.min_width, scale);
-  h.min_height = swell_gdk_ceil(h.min_height, scale);
-  h.max_width = wdl_max(h.min_width, swell_gdk_floor(h.max_width, scale));
-  h.max_height = wdl_max(h.min_height, swell_gdk_floor(h.max_height, scale));
-  if (swell_wayland_needs_manual_titlebar(hwnd))
-  {
-    h.min_width += SWELL_WAYLAND_BORDER_WIDTH*2;
-    h.max_width += SWELL_WAYLAND_BORDER_WIDTH*2;
-    h.min_height += g_swell_wayland_title_h + SWELL_WAYLAND_BORDER_WIDTH*2;
-    h.max_height += g_swell_wayland_title_h + SWELL_WAYLAND_BORDER_WIDTH*2;
-  }
-  if (hwnd->m_oswidget)
-  {
-    swell_wayland_set_geometry_hints(hwnd, &h);
-    return;
-  }
-#endif
-  gdk_window_set_geometry_hints(hwnd->m_oswindow,&h,(GdkWindowHints) ((hwnd->m_has_had_position ? GDK_HINT_POS : 0) | GDK_HINT_MIN_SIZE | GDK_HINT_MAX_SIZE));
+  return true;
+}
+
+void swell_recalcMinMaxInfo(HWND hwnd)
+{
+  if (hwnd && hwnd->m_oswindow && (hwnd->m_style & WS_CAPTION))
+    swell_gdk_backend->set_size_hints(hwnd, NULL);
 }
 
 #ifdef SWELL_SUPPORT_GTK
@@ -520,17 +416,10 @@ void SWELL_initargs(int *argc, char ***argv)
     if (!SWELL_gdk_active)
       SWELL_gdk_active = gdk_init_check(argc,argv) ? 1 : -1;
 #ifdef SWELL_TARGET_WAYLAND
-    if (SWELL_gdk_active > 0 && GDK_IS_WAYLAND_DISPLAY(gdk_display_get_default()) && !SWELL_load_gtk())
-      SWELL_gdk_active = -1;
-    if (SWELL_gdk_active > 0 && GDK_IS_WAYLAND_DISPLAY(gdk_display_get_default()))
-      swell_gdk_backend = &swell_gdk_wayland;
+    if (SWELL_gdk_active > 0 && !swell_wayland_init_display()) SWELL_gdk_active = -1;
 #endif
     if (SWELL_gdk_active > 0)
     {
-#ifdef SWELL_TARGET_WAYLAND
-      if (GDK_IS_WAYLAND_DISPLAY(gdk_display_get_default()))
-        init_private_xwayland();
-#endif
       char buf[1024];
       GetModuleFileName(NULL,buf,sizeof(buf));
       WDL_remove_filepart(buf);
@@ -665,8 +554,7 @@ static void init_options()
     if (wayland_display && *wayland_display) gdk_options |= OPTION_IS_WAYLAND;
 
 #ifdef SWELL_TARGET_WAYLAND
-    if (GDK_IS_WAYLAND_DISPLAY(gdk_display_get_default())) gdk_options |= OPTION_IS_WAYLAND;
-    swell_wayland_init();
+    if (swell_is_wayland()) gdk_options |= OPTION_IS_WAYLAND;
 #endif
 
     if (swell_gdk_option("gdk_owned_windows_keep_above", "auto (default is 1)",1))
@@ -692,11 +580,7 @@ static void init_options()
       default: break;
     }
 
-    const char *wmname = NULL;
-#ifdef SWELL_TARGET_WAYLAND
-    if (!GDK_IS_WAYLAND_DISPLAY(gdk_display_get_default()))
-#endif
-      wmname = gdk_x11_screen_get_window_manager_name(gdk_screen_get_default());
+    const char *wmname = swell_gdk_backend->window_manager_name();
     switch (swell_gdk_option("gdk_fullscreen_for_owner_windows", "auto (default is 1 on kwin, otherwise 0)",-1))
     {
       case -1:
@@ -805,33 +689,8 @@ void swell_oswindow_manage(HWND hwnd, bool wantfocus)
         }
 
         RECT r = hwnd->m_position;
-#ifdef SWELL_TARGET_WAYLAND
-        GtkWidget *gtk_win = NULL;
-        if (GDK_IS_WAYLAND_DISPLAY(gdk_display_get_default()))
-        {
-          if (!swell_wayland_create_window(hwnd, transient_for)) return;
-          gtk_win = hwnd->m_oswidget;
-        }
-        else
-#endif
-        {
-          GdkWindowAttr attr={0,};
-          attr.title = (char *)hwnd->m_title.Get();
-          attr.event_mask = GDK_ALL_EVENTS_MASK|GDK_EXPOSURE_MASK;
-          attr.x = r.left;
-          attr.y = r.top;
-          attr.width = r.right-r.left;
-          attr.height = r.bottom-r.top;
-          attr.wclass = GDK_INPUT_OUTPUT;
-          const char *appname = g_swell_appname;
-          attr.wmclass_name = (gchar*)appname;
-          attr.wmclass_class = (gchar*)appname;
-          attr.window_type = GDK_WINDOW_TOPLEVEL;
-          if (GetProp(hwnd,"SWELLGdkAlphaChannel"))
-            attr.visual = gdk_screen_get_rgba_visual(gdk_screen_get_default());
-          hwnd->m_oswindow = gdk_window_new(NULL,&attr,GDK_WA_X|GDK_WA_Y|(appname?GDK_WA_WMCLASS:0)|(attr.visual ? GDK_WA_VISUAL : 0));
-        }
- 
+        if (!swell_gdk_backend->create_window(hwnd, transient_for)) return;
+
         if (hwnd->m_oswindow) 
         {
           bool override_redirect=false;
@@ -866,15 +725,6 @@ void swell_oswindow_manage(HWND hwnd, bool wantfocus)
             if (transient_for)
             {
               gdk_window_set_transient_for(hwnd->m_oswindow,transient_for);
-              if (modal)
-              {
-#ifdef SWELL_TARGET_WAYLAND
-                if (gtk_win)
-                  gtk_window_set_modal(GTK_WINDOW(gtk_win), TRUE);
-                else
-#endif
-                  gdk_window_set_modal_hint(hwnd->m_oswindow,true);
-              }
             }
 
             if (modal) type_hint = GDK_WINDOW_TYPE_HINT_DIALOG;
@@ -882,12 +732,6 @@ void swell_oswindow_manage(HWND hwnd, bool wantfocus)
             gdk_window_set_type_hint(hwnd->m_oswindow,type_hint);
             gdk_window_set_decorations(hwnd->m_oswindow,decor);
           }
-
-          if (s_force_window_time)
-#ifdef SWELL_TARGET_WAYLAND
-            if (!gtk_win)
-#endif
-            gdk_x11_window_set_user_time(hwnd->m_oswindow,s_force_window_time);
 
           if (!wantfocus || swell_app_is_inactive)
             gdk_window_set_focus_on_map(hwnd->m_oswindow,false);
@@ -914,29 +758,11 @@ void swell_oswindow_manage(HWND hwnd, bool wantfocus)
           if (hwnd->m_israised && !swell_app_is_inactive)
             gdk_window_set_keep_above(hwnd->m_oswindow,TRUE);
 
-          gdk_window_register_dnd(hwnd->m_oswindow);
-
-#ifdef SWELL_TARGET_WAYLAND
-          if (gtk_win) swell_wayland_setup_drag(hwnd);
-#endif
-
           if (hwnd->m_oswindow_fullscreen)
             gdk_window_fullscreen(hwnd->m_oswindow);
 
-#ifdef SWELL_TARGET_WAYLAND
-          if (gtk_win)
-            gtk_widget_show(gtk_win);
-          else
-#endif
-          {
-            if (!swell_app_is_inactive && !s_force_window_time)
-              gdk_window_show(hwnd->m_oswindow);
-            else
-              gdk_window_show_unraised(hwnd->m_oswindow);
-          }
-
-          if (s_last_desktop>0)
-            swell_x11_move_to_desktop(hwnd->m_oswindow,s_last_desktop-1);
+          swell_gdk_backend->show_window(hwnd, !swell_app_is_inactive && !s_force_window_time,
+              modal && transient_for && (hwnd->m_style & WS_CAPTION), s_force_window_time);
 
           if (!hwnd->m_oswindow_fullscreen)
           {
@@ -968,43 +794,7 @@ void swell_oswindow_maximize(HWND hwnd, bool wantmax) // false=restore
 
 void swell_oswindow_updatetoscreen(HWND hwnd, RECT *rect)
 {
-#ifdef SWELL_LICE_GDI
-  if (hwnd && hwnd->m_backingstore && hwnd->m_oswindow)
-  {
-    LICE_IBitmap *bm = hwnd->m_backingstore;
-    LICE_SubBitmap tmpbm(bm,rect->left,rect->top,rect->right-rect->left,rect->bottom-rect->top);
-
-    GdkRectangle rrr={rect->left,rect->top,rect->right-rect->left,rect->bottom-rect->top};
-#ifdef SWELL_TARGET_WAYLAND
-    if (GDK_IS_WAYLAND_WINDOW(hwnd->m_oswindow))
-    {
-      rrr = swell_gdk_logical_rect(rrr, swell_gdk_window_scale(hwnd->m_oswindow));
-      if (swell_wayland_needs_manual_titlebar(hwnd))
-      {
-        rrr.x += SWELL_WAYLAND_BORDER_WIDTH;
-        rrr.y += g_swell_wayland_title_h + SWELL_WAYLAND_BORDER_WIDTH;
-      }
-      if (hwnd->m_oswidget)
-        gtk_widget_queue_draw_area(GTK_WIDGET(hwnd->m_oswidget), rrr.x, rrr.y, rrr.width, rrr.height);
-      else
-        gdk_window_invalidate_rect(hwnd->m_oswindow, &rrr, FALSE);
-      return;
-    }
-#endif
-    gdk_window_begin_paint_rect(hwnd->m_oswindow, &rrr);
-
-    cairo_t * crc = gdk_cairo_create (hwnd->m_oswindow);
-    cairo_surface_t *temp_surface = (cairo_surface_t*)bm->Extended(0xca140,NULL);
-    if (temp_surface) cairo_set_source_surface(crc, temp_surface, 0,0);
-    cairo_paint(crc);
-    cairo_destroy(crc);
-
-    gdk_window_end_paint(hwnd->m_oswindow);
-
-    if (temp_surface) bm->Extended(0xca140,temp_surface); // release
-
-  }
-#endif
+  swell_gdk_backend->update_window(hwnd, rect);
 }
 
 #if SWELL_TARGET_GDK == 2
@@ -1231,34 +1021,26 @@ static void OnSelectionRequestEvent(GdkEventSelection *b)
   gdk_selection_send_notify(b->requestor,b->selection,b->target,prop,GDK_CURRENT_TIME);
 }
 
-void swell_gdk_expose(GdkEventExpose *exp, cairo_t *draw_ctx, bool background)
+cairo_surface_t *swell_gdk_surface(HWND hwnd)
 {
-  HWND hwnd = swell_oswindow_to_hwnd(exp->window);
-  if (!hwnd) return;
-
-#ifdef SWELL_TARGET_WAYLAND
-  const bool use_background = hwnd->m_oswidget && gtk_widget_get_opacity(hwnd->m_oswidget) == 1.0;
-  if (draw_ctx && use_background && swell_gdk_current_event && swell_gdk_current_event->type == GDK_EXPOSE &&
-      swell_gdk_current_event->any.window == exp->window && gdk_cairo_get_drawing_context(draw_ctx))
+#ifdef SWELL_LICE_GDI
+  LICE_IBitmap *bm = hwnd->m_backingstore;
+  if (bm)
   {
-    if (swell_wayland_needs_manual_titlebar(hwnd))
-      swell_wayland_paint_manual_titlebar(hwnd, exp->window, draw_ctx);
-    return;
+    cairo_surface_t *surface = (cairo_surface_t*)bm->Extended(0xca140, NULL);
+    if (surface)
+    {
+      cairo_surface_reference(surface);
+      bm->Extended(0xca140, surface);
+      return surface;
+    }
   }
-  if (background)
-  {
-    gdk_window_set_background_pattern(exp->window, NULL);
-    if (!use_background) return;
-  }
-  const int scale = swell_gdk_window_scale(exp->window);
-  GdkEventExpose pixel_event = *exp;
-  pixel_event.area.x *= scale;
-  pixel_event.area.y *= scale;
-  pixel_event.area.width *= scale;
-  pixel_event.area.height *= scale;
-  exp = &pixel_event;
 #endif
+  return NULL;
+}
 
+cairo_surface_t *swell_gdk_paint(HWND hwnd, const GdkRectangle &area)
+{
 #ifdef SWELL_LICE_GDI
   RECT r,cr;
 
@@ -1268,15 +1050,10 @@ void swell_gdk_expose(GdkEventExpose *exp, cairo_t *draw_ctx, bool background)
   cr.right = hwnd->m_position.right - hwnd->m_position.left;
   cr.bottom = hwnd->m_position.bottom - hwnd->m_position.top;
 
-  int title_h = 0, bw = 0;
-#ifdef SWELL_TARGET_WAYLAND
-  if (swell_wayland_needs_manual_titlebar(hwnd)) { title_h = g_swell_wayland_title_h * scale; bw = SWELL_WAYLAND_BORDER_WIDTH * scale; }
-#endif
-
-  r.left = exp->area.x - bw; 
-  r.top = exp->area.y - (title_h + bw); 
-  r.bottom=r.top+exp->area.height;
-  r.right=r.left+exp->area.width;
+  r.left = area.x;
+  r.top = area.y;
+  r.bottom=r.top+area.height;
+  r.right=r.left+area.width;
   if (r.left < cr.left) r.left = cr.left;
   if (r.right > cr.right) r.right = cr.right;
   if (r.top < cr.top) r.top = cr.top;
@@ -1289,64 +1066,16 @@ void swell_gdk_expose(GdkEventExpose *exp, cairo_t *draw_ctx, bool background)
 
   LICE_SubBitmap tmpbm(hwnd->m_backingstore,r.left,r.top,r.right-r.left,r.bottom-r.top);
 
-  GdkRectangle rrr=exp->area;
-#ifdef SWELL_TARGET_WAYLAND
-  rrr = swell_gdk_logical_rect(rrr, scale);
-#endif
-  if (!draw_ctx && !background) gdk_window_begin_paint_rect(exp->window, &rrr);
-
-  if (tmpbm.getWidth()>0 && tmpbm.getHeight()>0) 
-  {
-    void SWELL_internalLICEpaint(HWND hwnd, LICE_IBitmap *bmout, int bmout_xpos, int bmout_ypos, bool forceref);
-    hwnd->Retain();
-    SWELL_internalLICEpaint(hwnd, &tmpbm, r.left, r.top, forceref);
-    const bool destroyed = hwnd->m_hashaddestroy != 0;
-    hwnd->Release();
-    if (destroyed)
-    {
-      if (!draw_ctx && !background) gdk_window_end_paint(exp->window);
-      return;
-    }
-
-    LICE_IBitmap *bm = hwnd->m_backingstore;
-    cairo_surface_t *temp_surface = (cairo_surface_t*)bm->Extended(0xca140,NULL);
-#ifdef SWELL_TARGET_WAYLAND
-    if (background && temp_surface)
-    {
-      cairo_surface_mark_dirty(temp_surface);
-      cairo_pattern_t *pattern = cairo_pattern_create_for_surface(temp_surface);
-      cairo_matrix_t matrix;
-      cairo_matrix_init(&matrix, scale, 0, 0, scale, -bw, -(title_h + bw));
-      cairo_pattern_set_matrix(pattern, &matrix);
-      gdk_window_set_background_pattern(exp->window, pattern);
-      cairo_pattern_destroy(pattern);
-    }
-    else
-#endif
-    {
-      cairo_t *crc = draw_ctx ? draw_ctx : gdk_cairo_create(exp->window);
-      cairo_save(crc);
-#ifdef SWELL_TARGET_WAYLAND
-      cairo_scale(crc, 1.0 / scale, 1.0 / scale);
-#endif
-      if (temp_surface) cairo_set_source_surface(crc, temp_surface, bw, title_h + bw);
-      cairo_paint(crc);
-      cairo_restore(crc);
-      if (!draw_ctx) cairo_destroy(crc);
-    }
-    if (temp_surface) bm->Extended(0xca140,temp_surface); // release
-  }
-
-#ifdef SWELL_TARGET_WAYLAND
-    if (!background && swell_wayland_needs_manual_titlebar(hwnd))
-    {
-      cairo_t *crc = draw_ctx ? draw_ctx : gdk_cairo_create(exp->window);
-      swell_wayland_paint_manual_titlebar(hwnd, exp->window, crc);
-      if (!draw_ctx) cairo_destroy(crc);
-    }
-#endif
-
-    if (!draw_ctx && !background) gdk_window_end_paint(exp->window);
+  if (tmpbm.getWidth() <= 0 || tmpbm.getHeight() <= 0) return NULL;
+  void SWELL_internalLICEpaint(HWND, LICE_IBitmap *, int, int, bool);
+  hwnd->Retain();
+  SWELL_internalLICEpaint(hwnd, &tmpbm, r.left, r.top, forceref);
+  const bool destroyed = hwnd->m_hashaddestroy != 0;
+  hwnd->Release();
+  if (destroyed) return NULL;
+  return swell_gdk_surface(hwnd);
+#else
+  return NULL;
 #endif
 }
 
@@ -1354,29 +1083,8 @@ void swell_gdk_configure(GdkEventConfigure *cfg)
 {
   HWND hwnd = swell_oswindow_to_hwnd(cfg->window);
   if (!hwnd) return;
-#ifdef SWELL_TARGET_WAYLAND
-  if (GDK_IS_WAYLAND_WINDOW(cfg->window) &&
-      (cfg->width != gdk_window_get_width(cfg->window) || cfg->height != gdk_window_get_height(cfg->window))) return;
-  const int scale = swell_gdk_window_scale(cfg->window);
-  GdkEventConfigure pixel_event = *cfg;
-  pixel_event.x *= scale;
-  pixel_event.y *= scale;
-  pixel_event.width *= scale;
-  pixel_event.height *= scale;
-  cfg = &pixel_event;
-#endif
-  int title_h = 0, bw = 0;
-#ifdef SWELL_TARGET_WAYLAND
-  if (swell_wayland_needs_manual_titlebar(hwnd))
-  {
-    title_h = g_swell_wayland_title_h * scale;
-    bw = SWELL_WAYLAND_BORDER_WIDTH * scale;
-  }
-#endif
-  int cfg_x = cfg->x + bw;
-  int cfg_y = cfg->y + title_h + bw;
-  int cfg_width = cfg->width - bw*2;
-  int cfg_height = cfg->height - title_h - bw*2;
+  int cfg_x = cfg->x, cfg_y = cfg->y;
+  int cfg_width = cfg->width, cfg_height = cfg->height;
   int flag=0;
   if (cfg_x != hwnd->m_position.left || 
       cfg_y != hwnd->m_position.top || 
@@ -2134,11 +1842,9 @@ void swell_gdk_dispatch_event(GdkEvent *evt)
             if (swell_ignore_focus_oswindow != fc->window ||
                 (GetTickCount()-swell_ignore_focus_oswindow_until) < 0x10000000)
             {
-#ifdef SWELL_TARGET_WAYLAND
-              SWELL_OSWINDOW old_focus = SWELL_focused_oswindow;
-              if (old_focus && old_focus != fc->window && GDK_IS_WAYLAND_WINDOW(old_focus))
-                gdk_window_invalidate_rect(old_focus, NULL, FALSE);
-#endif
+              if (SWELL_focused_oswindow && SWELL_focused_oswindow != fc->window &&
+                  swell_gdk_backend->invalidate_focus)
+                swell_gdk_backend->invalidate_focus(SWELL_focused_oswindow);
               SWELL_focused_oswindow = fc->window;
               update_menubar_activations();
             }
@@ -2166,19 +1872,6 @@ void swell_gdk_dispatch_event(GdkEvent *evt)
        HWND hwnd = swell_oswindow_to_hwnd(((GdkEventAny*)evt)->window);
        swell_gdk_close(hwnd);
      }
-    break;
-    case GDK_EXPOSE: // paint! GdkEventExpose...
-#ifdef SWELL_TARGET_WAYLAND
-      if (GDK_IS_WAYLAND_WINDOW(evt->any.window))
-      {
-        swell_gdk_expose((GdkEventExpose *)evt, NULL, true);
-        break;
-      }
-#endif
-      swell_gdk_expose((GdkEventExpose *)evt);
-    break;
-    case GDK_CONFIGURE: // size/move, GdkEventConfigure
-      swell_gdk_configure((GdkEventConfigure*)evt);
     break;
     case GDK_WINDOW_STATE: /// GdkEventWindowState for min/max
       OnWindowStateEvent((GdkEventWindowState*)evt);
@@ -2332,6 +2025,21 @@ bool swell_gdk_set_fullscreen(HWND hwnd, int fs) // fs=2 if window might have ow
   return false;
 }
 
+void swell_gdk_set_decorations(HWND hwnd)
+{
+  if (hwnd->m_style & WS_CAPTION)
+  {
+    if (hwnd->m_style & WS_THICKFRAME)
+      gdk_window_set_decorations(hwnd->m_oswindow,(GdkWMDecoration) (GDK_DECOR_ALL | GDK_DECOR_MENU));
+    else
+      gdk_window_set_decorations(hwnd->m_oswindow,(GdkWMDecoration) (GDK_DECOR_BORDER|GDK_DECOR_TITLE|GDK_DECOR_MINIMIZE));
+  }
+  else
+  {
+    gdk_window_set_decorations(hwnd->m_oswindow,(GdkWMDecoration) 0);
+  }
+}
+
 void swell_oswindow_update_style(HWND hwnd, LONG oldstyle)
 {
   const LONG val = hwnd->m_style, ret = oldstyle;
@@ -2340,28 +2048,7 @@ void swell_oswindow_update_style(HWND hwnd, LONG oldstyle)
     swell_hide_owned_windows_transient(hwnd);
 
     gdk_window_hide(hwnd->m_oswindow);
-#ifdef SWELL_TARGET_WAYLAND
-    if (hwnd->m_oswidget)
-      gtk_window_set_decorated(GTK_WINDOW(hwnd->m_oswidget), (val & WS_CAPTION) != 0);
-    if (GDK_IS_WAYLAND_WINDOW(hwnd->m_oswindow))
-    {
-      if (!(val & WS_CAPTION) || g_swell_wayland_title_h)
-        gdk_wayland_window_announce_csd(hwnd->m_oswindow);
-      else
-        gdk_wayland_window_announce_ssd(hwnd->m_oswindow);
-    }
-#endif
-    if (val & WS_CAPTION)
-    {
-      if (val & WS_THICKFRAME)
-        gdk_window_set_decorations(hwnd->m_oswindow,(GdkWMDecoration) (GDK_DECOR_ALL | GDK_DECOR_MENU));
-      else
-        gdk_window_set_decorations(hwnd->m_oswindow,(GdkWMDecoration) (GDK_DECOR_BORDER|GDK_DECOR_TITLE|GDK_DECOR_MINIMIZE));
-    }
-    else
-    {
-      gdk_window_set_decorations(hwnd->m_oswindow,(GdkWMDecoration) 0);
-    }
+    swell_gdk_backend->set_decorations(hwnd);
     hwnd->m_oswindow_private |= PRIVATE_NEEDSHOW;
   }
 }
@@ -2384,6 +2071,16 @@ int SWELL_SetWindowLevel(HWND hwnd, int newlevel)
   return rv;
 }
 
+void swell_gdk_monitor_geometry(int index, bool work, GdkRectangle *rect)
+{
+  GdkScreen *screen = gdk_screen_get_default();
+#if SWELL_TARGET_GDK != 2
+  if (work) gdk_screen_get_monitor_workarea(screen, index, rect);
+  else
+#endif
+    gdk_screen_get_monitor_geometry(screen, index, rect);
+}
+
 void SWELL_GetViewPort(RECT *r, const RECT *sourcerect, bool wantWork)
 {
   r->left=r->top=0;
@@ -2399,47 +2096,13 @@ void SWELL_GetViewPort(RECT *r, const RECT *sourcerect, bool wantWork)
   double best_score = -1e20;
   RECT sr;
   if (sourcerect) sr = *sourcerect;
-#ifdef SWELL_TARGET_WAYLAND
-  if (GDK_IS_WAYLAND_DISPLAY(gdk_display_get_default()))
-  {
-    GdkDisplay *disp = gdk_display_get_default();
-    GdkMonitor *mon = SWELL_focused_oswindow ?
-      gdk_display_get_monitor_at_window(disp, SWELL_focused_oswindow) : NULL;
-    if (mon)
-    {
-      GdkRectangle rc = {0,};
-      gdk_monitor_get_geometry(mon, &rc);
-      r->left = 0;
-      r->top = 0;
-      const int scale = swell_gdk_window_scale(SWELL_focused_oswindow);
-      r->right = rc.width * scale;
-      r->bottom = rc.height * scale;
-      return;
-    }
-  }
-#endif
+  if (swell_gdk_backend->get_viewport && swell_gdk_backend->get_viewport(r)) return;
   for (gint idx = 0; idx < n; idx ++)
   {
     GdkRectangle rc={0,0,1024,1024};
     if (!sourcerect && prim>0) idx = prim;
 
-#if SWELL_TARGET_GDK != 2
-    if (wantWork)
-      gdk_screen_get_monitor_workarea(defscr,idx,&rc);
-    else
-#endif
-      gdk_screen_get_monitor_geometry(defscr,idx,&rc);
-
-#ifdef SWELL_TARGET_WAYLAND
-    if (GDK_IS_WAYLAND_DISPLAY(gdk_screen_get_display(defscr)))
-    {
-      const int scale = gdk_screen_get_monitor_scale_factor(defscr, idx);
-      rc.x *= scale;
-      rc.y *= scale;
-      rc.width *= scale;
-      rc.height *= scale;
-    }
-#endif
+    swell_gdk_backend->monitor_geometry(idx, wantWork, &rc);
     RECT tmp;
     tmp.left=rc.x;
     tmp.top = rc.y;
@@ -2481,36 +2144,7 @@ bool GetWindowRect(HWND hwnd, RECT *r)
   if (!hwnd) return false;
   if (hwnd->m_oswindow)
   {
-#ifdef SWELL_TARGET_WAYLAND
-    if (GDK_IS_WAYLAND_WINDOW(hwnd->m_oswindow))
-    {
-      *r = hwnd->m_position;
-      return true;
-    }
-#endif
-#ifdef SWELL_GDK_IMPROVE_WINDOWRECT
-    GdkRectangle gr;
-    gdk_window_get_frame_extents(hwnd->m_oswindow,&gr);
-
-    r->left=gr.x;
-    r->top=gr.y;
-    r->right=gr.x + gr.width;
-    r->bottom = gr.y + gr.height;
-#else
-    // this is wrong (returns client rect in screen coordinates), but gdk_window_get_frame_extents() doesn't seem to work 
-    gint x=hwnd->m_position.left,y=hwnd->m_position.top;
-    gdk_window_get_root_origin(hwnd->m_oswindow,&x,&y);
-#ifdef SWELL_TARGET_WAYLAND
-    const int scale = swell_gdk_window_scale(hwnd->m_oswindow);
-    x *= scale;
-    y *= scale;
-#endif
-    r->left=x;
-    r->top=y;
-    r->right=x + hwnd->m_position.right - hwnd->m_position.left;
-    r->bottom = y + hwnd->m_position.bottom - hwnd->m_position.top;
-#endif
-
+    swell_gdk_backend->get_window_rect(hwnd, r);
     return true;
   }
 
@@ -2523,95 +2157,16 @@ bool GetWindowRect(HWND hwnd, RECT *r)
 
 void swell_oswindow_begin_resize(SWELL_OSWINDOW wnd)
 {
-#ifdef SWELL_TARGET_WAYLAND
-  GdkGeometry geom = {0};
-  gdk_window_set_geometry_hints(wnd,&geom,(GdkWindowHints) 0);
-#else
   // make sure window is resizable (hints will be re-set on upcoming CONFIGURE event)
-  gdk_window_set_geometry_hints(wnd,NULL,(GdkWindowHints) 0); 
-#endif
+  GdkGeometry geom = {0};
+  gdk_window_set_geometry_hints(wnd, &geom, (GdkWindowHints)0);
 }
 
-void swell_oswindow_resize(SWELL_OSWINDOW wnd, int reposflag, RECT f)
+void swell_oswindow_resize(SWELL_OSWINDOW wnd, int reposflag, RECT rect, bool mapped)
 {
-#ifdef SWELL_TARGET_WAYLAND
-  const int scale = swell_gdk_window_scale(wnd);
-  const int width = swell_gdk_ceil(f.right - f.left, scale);
-  const int height = swell_gdk_ceil(f.bottom - f.top, scale);
-  f.left = swell_gdk_floor(f.left, scale);
-  f.top = swell_gdk_floor(f.top, scale);
-  f.right = f.left + width;
-  f.bottom = f.top + height;
-  if (swell_wayland_needs_manual_titlebar(swell_oswindow_to_hwnd(wnd)))
-  {
-    const int w = f.right - f.left;
-    const int h = f.bottom - f.top;
-    f.left -= SWELL_WAYLAND_BORDER_WIDTH;
-    f.top -= g_swell_wayland_title_h + SWELL_WAYLAND_BORDER_WIDTH;
-    f.right = f.left + w + SWELL_WAYLAND_BORDER_WIDTH*2;
-    f.bottom = f.top + h + g_swell_wayland_title_h + SWELL_WAYLAND_BORDER_WIDTH*2;
-  }
-#endif
-#ifdef SWELL_GDK_IMPROVE_WINDOWRECT
-  if (reposflag & 2)
-  {
-    // increase size to include titlebars etc
-    GdkRectangle gr;
-    gdk_window_get_frame_extents(wnd,&gr);
-    gint cw=gr.width, ch=gr.height;
-    gdk_window_get_geometry(wnd,NULL,NULL,&cw,&ch);
-    // when it matters, this seems to always make gr.height=ch, which is pointless
-    f.right -= gr.width - cw;
-    f.bottom -= gr.height - ch;
-  }
-#endif
-  if ((reposflag&3)==3) gdk_window_move_resize(wnd,f.left,f.top,f.right-f.left,f.bottom-f.top);
-  else if (reposflag&2) gdk_window_resize(wnd,f.right-f.left,f.bottom-f.top);
-  else if (reposflag&1) gdk_window_move(wnd,f.left,f.top);
+  swell_gdk_backend->resize_window(wnd, reposflag, rect, mapped);
 }
 
-#ifdef SWELL_TARGET_WAYLAND
-static void swell_wl_sizepin_release(GdkFrameClock *clock, gpointer data)
-{
-  HWND hwnd = (HWND)data;
-  g_signal_handlers_disconnect_by_func(clock, (gpointer)swell_wl_sizepin_release, data);
-  hwnd->m_oswindow_private &= ~PRIVATE_SIZEPIN;
-  swell_recalcMinMaxInfo(hwnd);
-}
-
-void swell_oswindow_resize_mapped(HWND hwnd, int reposflag, RECT f)
-{
-  if (!(reposflag&2) || !hwnd->m_oswidget || !GTK_IS_WINDOW(hwnd->m_oswidget) ||
-      gtk_window_get_type_hint(GTK_WINDOW(hwnd->m_oswidget)) == GDK_WINDOW_TYPE_HINT_TOOLTIP)
-  {
-    swell_oswindow_resize(hwnd->m_oswindow,reposflag,f);
-    return;
-  }
-
-  const int scale = swell_gdk_window_scale(hwnd->m_oswindow);
-  int w = wdl_max(swell_gdk_ceil(f.right - f.left, scale), 1);
-  int h = wdl_max(swell_gdk_ceil(f.bottom - f.top, scale), 1);
-  if (swell_wayland_needs_manual_titlebar(hwnd))
-  {
-    w += SWELL_WAYLAND_BORDER_WIDTH*2;
-    h += g_swell_wayland_title_h + SWELL_WAYLAND_BORDER_WIDTH*2;
-  }
-
-  GdkGeometry gh;
-  memset(&gh,0,sizeof(gh));
-  gh.min_width = gh.max_width = w;
-  gh.min_height = gh.max_height = h;
-  swell_wayland_set_geometry_hints(hwnd, &gh);
-  gdk_window_set_geometry_hints(hwnd->m_oswindow, &gh,
-    (GdkWindowHints)(GDK_HINT_MIN_SIZE | GDK_HINT_MAX_SIZE));
-  if (!(hwnd->m_oswindow_private & PRIVATE_SIZEPIN))
-  {
-    hwnd->m_oswindow_private |= PRIVATE_SIZEPIN;
-    g_signal_connect(gdk_window_get_frame_clock(hwnd->m_oswindow), "after-paint",
-                     G_CALLBACK(swell_wl_sizepin_release), hwnd);
-  }
-}
-#endif
 
 void swell_oswindow_postresize(HWND hwnd, RECT f) 
 { 
@@ -2627,26 +2182,7 @@ void swell_oswindow_postresize(HWND hwnd, RECT f)
   if (hwnd->m_oswindow && !(hwnd->m_style&WS_THICKFRAME))
   {
     // kwin requires this for non-sizeable windows (doing it in the configure event is too late, apparently)
-    GdkGeometry h;
-    memset(&h,0,sizeof(h));
-    h.max_width = h.min_width = f.right - f.left;
-    h.max_height = h.min_height = f.bottom - f.top;
-#ifdef SWELL_TARGET_WAYLAND
-    const int scale = swell_gdk_window_scale(hwnd->m_oswindow);
-    h.max_width = h.min_width = swell_gdk_ceil(h.min_width, scale);
-    h.max_height = h.min_height = swell_gdk_ceil(h.min_height, scale);
-    if (swell_wayland_needs_manual_titlebar(hwnd))
-    {
-      h.max_width = h.min_width += SWELL_WAYLAND_BORDER_WIDTH*2;
-      h.max_height = h.min_height += g_swell_wayland_title_h + SWELL_WAYLAND_BORDER_WIDTH*2;
-    }
-    if (hwnd->m_oswidget)
-    {
-      swell_wayland_set_geometry_hints(hwnd, &h);
-      return;
-    }
-#endif
-    gdk_window_set_geometry_hints(hwnd->m_oswindow,&h,(GdkWindowHints) ((hwnd->m_has_had_position ? GDK_HINT_POS : 0) | GDK_HINT_MIN_SIZE | GDK_HINT_MAX_SIZE));
+    swell_gdk_backend->set_size_hints(hwnd, &f);
   }
 }
 
@@ -2661,26 +2197,9 @@ void UpdateWindow(HWND hwnd)
 #endif
 }
 
-void swell_oswindow_invalidate(HWND hwnd, const RECT *r) 
-{ 
-  GdkRectangle gdkr;
-  if (r)
-  {
-    gdkr.x = r->left;
-    gdkr.y = r->top;
-    gdkr.width = r->right-r->left;
-    gdkr.height = r->bottom-r->top;
-#ifdef SWELL_TARGET_WAYLAND
-    gdkr = swell_gdk_logical_rect(gdkr, swell_gdk_window_scale(hwnd->m_oswindow));
-    if (swell_wayland_needs_manual_titlebar(hwnd))
-    {
-      gdkr.x += SWELL_WAYLAND_BORDER_WIDTH;
-      gdkr.y += g_swell_wayland_title_h + SWELL_WAYLAND_BORDER_WIDTH;
-    }
-#endif
-  }
-
-  gdk_window_invalidate_rect(hwnd->m_oswindow,r ? &gdkr : NULL,true);
+void swell_oswindow_invalidate(HWND hwnd, const RECT *rect)
+{
+  swell_gdk_backend->invalidate(hwnd, rect);
 }
 
 
@@ -2787,7 +2306,7 @@ static HANDLE req_wayland_clipboard(GdkAtom type)
 static HANDLE req_clipboard(GdkAtom type)
 {
 #ifdef SWELL_TARGET_WAYLAND
-  if (GDK_IS_WAYLAND_DISPLAY(gdk_display_get_default()))
+  if (swell_is_wayland())
     return req_wayland_clipboard(type);
 #endif
   if (s_clipboard_getstate_fmt == type) return s_clipboard_getstate;
@@ -2835,7 +2354,7 @@ static HANDLE req_clipboard(GdkAtom type)
 void CloseClipboard() 
 { 
 #ifdef SWELL_TARGET_WAYLAND
-  if (s_clipboard_written && GDK_IS_WAYLAND_DISPLAY(gdk_display_get_default()))
+  if (s_clipboard_written && swell_is_wayland())
     publish_wayland_clipboard();
 #endif
   s_clipboard_written = false;
@@ -2874,7 +2393,7 @@ HANDLE GetClipboardData(UINT type)
   if (atom_from_clipboard_type(type,&a))
   {
 #ifdef SWELL_TARGET_WAYLAND
-    if (s_clipboard_written && GDK_IS_WAYLAND_DISPLAY(gdk_display_get_default()))
+    if (s_clipboard_written && swell_is_wayland())
     {
       HANDLE *state = find_clipboard_setstate(a);
       return state ? *state : NULL;
@@ -2893,7 +2412,7 @@ void EmptyClipboard()
   s_clipboard_setstate.Resize(0);
   s_clipboard_setstate_data.Resize(0);
 #ifdef SWELL_TARGET_WAYLAND
-  if (GDK_IS_WAYLAND_DISPLAY(gdk_display_get_default()))
+  if (swell_is_wayland())
   {
     s_clipboard_written = true;
     s_clipboard_enumstate.DeleteAll();
@@ -2960,7 +2479,7 @@ static void set_wayland_clipboard_data(UINT type, HANDLE h)
 void SetClipboardData(UINT type, HANDLE h)
 {
 #ifdef SWELL_TARGET_WAYLAND
-  if (GDK_IS_WAYLAND_DISPLAY(gdk_display_get_default()))
+  if (swell_is_wayland())
     return set_wayland_clipboard_data(type, h);
 #endif
   RegisterClipboardFormat(NULL);
@@ -3072,11 +2591,7 @@ DWORD GetMessagePos()
 
 HWND SWELL_CreateXBridgeWindow(HWND parent, void **window, const RECT *rect)
 {
-#ifdef SWELL_TARGET_WAYLAND
-  if (GDK_IS_WAYLAND_DISPLAY(gdk_display_get_default()))
-    return xw_bridge_create(parent, window, rect, "REAPERXBridge");
-#endif
-  return swell_x11_create_bridge(parent, window, rect);
+  return swell_gdk_backend->create_bridge(parent, window, rect);
 }
 
 struct dropSourceInfo {
@@ -3183,7 +2698,7 @@ static LRESULT WINAPI dropSourceWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPAR
   {
     case WM_CREATE:
 #ifdef SWELL_TARGET_WAYLAND
-      if (GDK_IS_WAYLAND_DISPLAY(gdk_display_get_default()))
+      if (swell_is_wayland())
       {
         GtkWidget *widget = swell_gdk_current_event ? gtk_get_event_widget(swell_gdk_current_event) : NULL;
         if (!widget) break;
@@ -3392,13 +2907,8 @@ void SWELL_SetCursor(HCURSOR curs)
   s_last_setcursor_oswnd = SWELL_focused_oswindow;
   if (SWELL_focused_oswindow)
   {
-    gdk_window_set_cursor(SWELL_focused_oswindow,(GdkCursor *)curs);
-#ifdef SWELL_TARGET_GDK_CURSORHACK
-    if (GetCapture() && !(gdk_options & OPTION_IS_WAYLAND))
-    {
-      swell_x11_set_grab_cursor(SWELL_focused_oswindow, (GdkCursor*)curs);
-    }
-#endif // SWELL_TARGET_GDK_CURSORHACK
+    swell_gdk_backend->set_cursor(SWELL_focused_oswindow, (GdkCursor*)curs,
+                                  GetCapture() && !(gdk_options & OPTION_IS_WAYLAND));
   }
 }
 
@@ -3427,11 +2937,7 @@ int SWELL_ShowCursor(BOOL bShow)
     g_swell_mouse_relmode_curpos_y = y1;
     s_last_cursor = GetCursor();
     SetCursor((HCURSOR)gdk_cursor_new_for_display(gdk_display_get_default(),GDK_BLANK_CURSOR));
-#ifdef SWELL_TARGET_WAYLAND
-    if (GDK_IS_WAYLAND_DISPLAY(gdk_display_get_default())) g_swell_mouse_relmode=true;
-#else
-    //g_swell_mouse_relmode=true;
-#endif
+    g_swell_mouse_relmode = swell_gdk_backend->relative_mouse;
   }
   if (s_cursor_vis_cnt==0 && bShow) 
   {
@@ -3558,45 +3064,7 @@ int SWELL_KeyToASCII(int wParam, int lParam, int *newflags)
 
 void swell_scaling_init(bool no_auto_hidpi)
 {
-  #if SWELL_TARGET_GDK == 3
-
-  if (!no_auto_hidpi && g_swell_ui_scale == 256)
-  {
-    int (*gsf)(void*);
-    void * (*gpm)(GdkDisplay *);
-    *(void **)&gsf = dlsym(RTLD_DEFAULT,"gdk_monitor_get_scale_factor");
-    *(void **)&gpm = dlsym(RTLD_DEFAULT,"gdk_display_get_primary_monitor");
-
-    if (gpm && gsf)
-    {
-      GdkDisplay *gdkdisp = gdk_display_get_default();
-      if (gdkdisp)
-      {
-        void *m = gpm(gdkdisp);
-#ifdef SWELL_TARGET_WAYLAND
-        if (!m && gdk_display_get_n_monitors(gdkdisp)) m = gdk_display_get_monitor(gdkdisp, 0);
-#endif
-        if (m)
-        {
-          int sf = gsf(m);
-          if (sf > 1 && sf < 8)
-            g_swell_ui_scale = sf*256;
-        }
-      }
-    }
-  }
-
-  if (g_swell_ui_scale != 256)
-  {
-    GdkDisplay *gdkdisp = gdk_display_get_default();
-    if (gdkdisp)
-    {
-      void (*p)(GdkDisplay*, gint);
-      *(void **)&p = dlsym(RTLD_DEFAULT,"gdk_x11_display_set_window_scale");
-      if (p && GDK_IS_X11_DISPLAY(gdkdisp)) p(gdkdisp,1);
-    }
-  }
-  #endif
+  swell_gdk_backend->scaling_init(no_auto_hidpi);
 }
 
 BOOL EnumDisplayMonitors(HDC hdc,const LPRECT r,MONITORENUMPROC proc,LPARAM lParam)
@@ -3606,14 +3074,7 @@ BOOL EnumDisplayMonitors(HDC hdc,const LPRECT r,MONITORENUMPROC proc,LPARAM lPar
   for (int x = 0; x < nmon; x ++)
   {
     GdkRectangle rc={0,0,1024,1024};
-    gdk_screen_get_monitor_geometry(defscr,x,&rc);
-#ifdef SWELL_TARGET_WAYLAND
-    if (GDK_IS_WAYLAND_DISPLAY(gdk_screen_get_display(defscr)))
-    {
-      const int scale = gdk_screen_get_monitor_scale_factor(defscr, x);
-      rc.x *= scale; rc.y *= scale; rc.width *= scale; rc.height *= scale;
-    }
-#endif
+    swell_gdk_backend->monitor_geometry(x, false, &rc);
     RECT screen_rect, tmp = { rc.x, rc.y,rc.x+rc.width , rc.y+rc.height };
     if (r)
     {
@@ -3640,14 +3101,7 @@ BOOL GetMonitorInfo(HMONITOR hmon, void *inf)
   if (a->cbSize < sizeof(MONITORINFO)) return FALSE;
   a->dwFlags = 0;
   GdkRectangle rc={0,0,1024,1024};
-  gdk_screen_get_monitor_geometry(defscr,monidx,&rc);
-#ifdef SWELL_TARGET_WAYLAND
-  if (GDK_IS_WAYLAND_DISPLAY(gdk_screen_get_display(defscr)))
-  {
-    const int scale = gdk_screen_get_monitor_scale_factor(defscr, monidx);
-    rc.x *= scale; rc.y *= scale; rc.width *= scale; rc.height *= scale;
-  }
-#endif
+  swell_gdk_backend->monitor_geometry(monidx, false, &rc);
   RECT tmp = { rc.x, rc.y,rc.x+rc.width , rc.y+rc.height };
   a->rcMonitor = a->rcWork = tmp;
 

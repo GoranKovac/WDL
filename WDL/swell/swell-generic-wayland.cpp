@@ -32,6 +32,8 @@
 #include "swell-gdk-scale.h"
 #include "xwayland-bridge.h"
 
+#define PRIVATE_SIZEPIN 2
+
 HWND g_wayland_hovered_hwnd = NULL;
 
 gboolean swell_wayland_handle_hover_enter(GtkWidget *widget, GdkEventCrossing *event, gpointer user_data)
@@ -58,6 +60,15 @@ int SWELL_WAYLAND_BORDER_WIDTH = 2;
 bool swell_is_wayland()
 {
   return GDK_IS_WAYLAND_DISPLAY(gdk_display_get_default());
+}
+
+bool swell_wayland_init_display()
+{
+  if (!swell_is_wayland()) return true;
+  if (!SWELL_load_gtk()) return false;
+  swell_gdk_backend = &swell_gdk_wayland;
+  init_private_xwayland();
+  return true;
 }
 
 static void swell_wayland_init_application_id()
@@ -115,11 +126,88 @@ bool swell_wayland_needs_manual_titlebar(HWND hwnd)
   return hwnd && g_swell_wayland_title_h && (hwnd->m_style & WS_CAPTION);
 }
 
-void swell_wayland_init()
+static void swell_wayland_init()
 {
   swell_wayland_init_application_id();
   swell_wayland_init_titlebar_height();
   swell_wayland_suppress_csd_shadow_once();
+}
+
+static void expose(GdkEventExpose *event, cairo_t *draw_ctx = NULL, bool background = false)
+{
+  HWND hwnd = swell_oswindow_to_hwnd(event->window);
+  if (!hwnd) return;
+  const bool use_background = hwnd->m_oswidget && gtk_widget_get_opacity(hwnd->m_oswidget) == 1.0;
+  if (draw_ctx && use_background && swell_gdk_current_event &&
+      swell_gdk_current_event->type == GDK_EXPOSE &&
+      swell_gdk_current_event->any.window == event->window && gdk_cairo_get_drawing_context(draw_ctx))
+  {
+    if (swell_wayland_needs_manual_titlebar(hwnd))
+      swell_wayland_paint_manual_titlebar(hwnd, event->window, draw_ctx);
+    return;
+  }
+  if (background)
+  {
+    gdk_window_set_background_pattern(event->window, NULL);
+    if (!use_background) return;
+  }
+
+  const int scale = swell_gdk_window_scale(event->window);
+  const bool titlebar = swell_wayland_needs_manual_titlebar(hwnd);
+  const int bw = titlebar ? SWELL_WAYLAND_BORDER_WIDTH * scale : 0;
+  const int title_h = titlebar ? g_swell_wayland_title_h * scale : 0;
+  GdkRectangle area = { event->area.x * scale - bw, event->area.y * scale - title_h - bw,
+                        event->area.width * scale, event->area.height * scale };
+  hwnd->Retain();
+  cairo_surface_t *surface = swell_gdk_paint(hwnd, area);
+  if (surface)
+  {
+    if (background)
+    {
+      cairo_surface_mark_dirty(surface);
+      cairo_pattern_t *pattern = cairo_pattern_create_for_surface(surface);
+      cairo_matrix_t matrix;
+      cairo_matrix_init(&matrix, scale, 0, 0, scale, -bw, -(title_h + bw));
+      cairo_pattern_set_matrix(pattern, &matrix);
+      gdk_window_set_background_pattern(event->window, pattern);
+      cairo_pattern_destroy(pattern);
+    }
+    else
+    {
+      cairo_save(draw_ctx);
+      cairo_scale(draw_ctx, 1.0 / scale, 1.0 / scale);
+      cairo_set_source_surface(draw_ctx, surface, bw, title_h + bw);
+      cairo_paint(draw_ctx);
+      cairo_restore(draw_ctx);
+    }
+    cairo_surface_destroy(surface);
+  }
+  if (!hwnd->m_hashaddestroy && !background && titlebar)
+    swell_wayland_paint_manual_titlebar(hwnd, event->window, draw_ctx);
+  hwnd->Release();
+}
+
+static void configure(GdkEventConfigure *event)
+{
+  HWND hwnd = swell_oswindow_to_hwnd(event->window);
+  if (!hwnd || event->width != gdk_window_get_width(event->window) ||
+      event->height != gdk_window_get_height(event->window)) return;
+  GdkEventConfigure pixels = *event;
+  const int scale = swell_gdk_window_scale(event->window);
+  pixels.x *= scale;
+  pixels.y *= scale;
+  pixels.width *= scale;
+  pixels.height *= scale;
+  if (swell_wayland_needs_manual_titlebar(hwnd))
+  {
+    const int bw = SWELL_WAYLAND_BORDER_WIDTH * scale;
+    const int title_h = g_swell_wayland_title_h * scale;
+    pixels.x += bw;
+    pixels.y += title_h + bw;
+    pixels.width -= bw * 2;
+    pixels.height -= title_h + bw * 2;
+  }
+  swell_gdk_configure(&pixels);
 }
 
 static void swell_wayland_scale_changed(GtkWidget *widget, GParamSpec *, gpointer data)
@@ -130,7 +218,7 @@ static void swell_wayland_scale_changed(GtkWidget *widget, GParamSpec *, gpointe
   cfg.window = hwnd->m_oswindow;
   gdk_window_get_geometry(cfg.window, &cfg.x, &cfg.y, &cfg.width, &cfg.height);
   hwnd->Retain();
-  swell_gdk_configure(&cfg);
+  configure(&cfg);
   if (!hwnd->m_hashaddestroy) InvalidateRect(hwnd, NULL, FALSE);
   hwnd->Release();
 }
@@ -158,12 +246,12 @@ static gboolean swell_wayland_draw(GtkWidget *widget, cairo_t *cr, gpointer data
   gdk_cairo_region(cr, region);
   cairo_region_destroy(region);
   cairo_clip(cr);
-  if (gdk_cairo_get_clip_rectangle(cr, &exp.area)) swell_gdk_expose(&exp, cr);
+  if (gdk_cairo_get_clip_rectangle(cr, &exp.area)) expose(&exp, cr);
   cairo_restore(cr);
   return FALSE;
 }
 
-bool swell_wayland_create_window(HWND hwnd, GdkWindow *transient_for)
+static bool swell_wayland_create_window(HWND hwnd, GdkWindow *transient_for)
 {
   const RECT r = hwnd->m_position;
   bool is_popup_menu = (hwnd->m_classname && strcmp(hwnd->m_classname, "__SWELL_MENU") == 0);
@@ -565,7 +653,7 @@ bool swell_wayland_button_event(HWND hwnd, const GdkEventButton *b)
   return false;
 }
 
-void swell_wayland_forget_window(HWND hwnd)
+static void swell_wayland_forget_window(HWND hwnd)
 {
   if (s_wayland_active_tooltip == hwnd) s_wayland_active_tooltip = NULL;
   if (s_armed_drag_oswindow == hwnd->m_oswindow) s_armed_drag_oswindow = NULL;
@@ -807,7 +895,7 @@ static void on_drag_data_received(GtkWidget *widget, GdkDragContext *context, gi
   }
 }
 
-void swell_wayland_setup_drag(HWND hwnd)
+static void swell_wayland_setup_drag(HWND hwnd)
 {
   GtkWidget *gtk_win = hwnd->m_oswidget;
   if (gtk_win && gtk_window_get_window_type(GTK_WINDOW(gtk_win)) == GTK_WINDOW_TOPLEVEL)
@@ -827,10 +915,6 @@ void swell_wayland_setup_drag(HWND hwnd)
   }
 }
 
-bool swell_wayland_is_drag_widget(HWND hwnd)
-{
-  return hwnd->m_oswidget == s_wayland_drag_widget;
-}
 
 static void mouse_event(GdkEvent *event)
 {
@@ -892,6 +976,8 @@ static void event_handler(GdkEvent *event)
     gtk_main_do_event(event);
     return;
   }
+  if (event->type == GDK_EXPOSE) expose(&event->expose, NULL, true);
+  else if (event->type == GDK_CONFIGURE) configure(&event->configure);
   swell_gdk_dispatch_event(event);
   if (event->type == GDK_EXPOSE && !gdk_window_is_destroyed(event->any.window) &&
       swell_oswindow_to_hwnd(event->any.window))
@@ -957,8 +1043,278 @@ static WORD get_async_key_state(int key)
   return swell_gdk_get_async_key_state(key);
 }
 
+static void update_window(HWND hwnd, const RECT *rect)
+{
+  if (!hwnd || !hwnd->m_oswindow) return;
+  GdkRectangle area = { rect->left, rect->top, rect->right - rect->left, rect->bottom - rect->top };
+  area = swell_gdk_logical_rect(area, swell_gdk_window_scale(hwnd->m_oswindow));
+  if (swell_wayland_needs_manual_titlebar(hwnd))
+  {
+    area.x += SWELL_WAYLAND_BORDER_WIDTH;
+    area.y += g_swell_wayland_title_h + SWELL_WAYLAND_BORDER_WIDTH;
+  }
+  if (hwnd->m_oswidget)
+    gtk_widget_queue_draw_area(hwnd->m_oswidget, area.x, area.y, area.width, area.height);
+  else
+    gdk_window_invalidate_rect(hwnd->m_oswindow, &area, FALSE);
+}
+
+static void invalidate(HWND hwnd, const RECT *r)
+{
+  GdkRectangle gdkr;
+  if (r)
+  {
+    gdkr.x = r->left;
+    gdkr.y = r->top;
+    gdkr.width = r->right-r->left;
+    gdkr.height = r->bottom-r->top;
+    gdkr = swell_gdk_logical_rect(gdkr, swell_gdk_window_scale(hwnd->m_oswindow));
+    if (swell_wayland_needs_manual_titlebar(hwnd))
+    {
+      gdkr.x += SWELL_WAYLAND_BORDER_WIDTH;
+      gdkr.y += g_swell_wayland_title_h + SWELL_WAYLAND_BORDER_WIDTH;
+    }
+  }
+
+  gdk_window_invalidate_rect(hwnd->m_oswindow,r ? &gdkr : NULL,true);
+}
+
+static void get_window_rect(HWND hwnd, RECT *r)
+{
+  *r = hwnd->m_position;
+}
+
+static void swell_wl_sizepin_release(GdkFrameClock *clock, gpointer data)
+{
+  HWND hwnd = (HWND)data;
+  g_signal_handlers_disconnect_by_func(clock, (gpointer)swell_wl_sizepin_release, data);
+  hwnd->m_oswindow_private &= ~PRIVATE_SIZEPIN;
+  swell_recalcMinMaxInfo(hwnd);
+}
+
+static void swell_wayland_release_sizepin(HWND hwnd)
+{
+  if (hwnd && (hwnd->m_oswindow_private & PRIVATE_SIZEPIN))
+  {
+    hwnd->m_oswindow_private &= ~PRIVATE_SIZEPIN;
+    if (hwnd->m_oswindow)
+      g_signal_handlers_disconnect_by_func(gdk_window_get_frame_clock(hwnd->m_oswindow),
+                                           (gpointer)swell_wl_sizepin_release, hwnd);
+  }
+}
+
+static void pin_window_size(HWND hwnd, RECT f)
+{
+  const int scale = swell_gdk_window_scale(hwnd->m_oswindow);
+  int w = wdl_max(swell_gdk_ceil(f.right - f.left, scale), 1);
+  int h = wdl_max(swell_gdk_ceil(f.bottom - f.top, scale), 1);
+  if (swell_wayland_needs_manual_titlebar(hwnd))
+  {
+    w += SWELL_WAYLAND_BORDER_WIDTH*2;
+    h += g_swell_wayland_title_h + SWELL_WAYLAND_BORDER_WIDTH*2;
+  }
+
+  GdkGeometry gh;
+  memset(&gh,0,sizeof(gh));
+  gh.min_width = gh.max_width = w;
+  gh.min_height = gh.max_height = h;
+  swell_wayland_set_geometry_hints(hwnd, &gh);
+  gdk_window_set_geometry_hints(hwnd->m_oswindow, &gh,
+    (GdkWindowHints)(GDK_HINT_MIN_SIZE | GDK_HINT_MAX_SIZE));
+  if (!(hwnd->m_oswindow_private & PRIVATE_SIZEPIN))
+  {
+    hwnd->m_oswindow_private |= PRIVATE_SIZEPIN;
+    g_signal_connect(gdk_window_get_frame_clock(hwnd->m_oswindow), "after-paint",
+                     G_CALLBACK(swell_wl_sizepin_release), hwnd);
+  }
+}
+
+static void resize_window(GdkWindow *wnd, int reposflag, RECT f, bool mapped)
+{
+  HWND hwnd = swell_oswindow_to_hwnd(wnd);
+  if (mapped && (reposflag & 2) && hwnd && hwnd->m_oswidget &&
+      gtk_window_get_type_hint(GTK_WINDOW(hwnd->m_oswidget)) != GDK_WINDOW_TYPE_HINT_TOOLTIP)
+  {
+    pin_window_size(hwnd, f);
+    return;
+  }
+  const int scale = swell_gdk_window_scale(wnd);
+  const int width = swell_gdk_ceil(f.right - f.left, scale);
+  const int height = swell_gdk_ceil(f.bottom - f.top, scale);
+  f.left = swell_gdk_floor(f.left, scale);
+  f.top = swell_gdk_floor(f.top, scale);
+  f.right = f.left + width;
+  f.bottom = f.top + height;
+  if (swell_wayland_needs_manual_titlebar(hwnd))
+  {
+    const int w = f.right - f.left;
+    const int h = f.bottom - f.top;
+    f.left -= SWELL_WAYLAND_BORDER_WIDTH;
+    f.top -= g_swell_wayland_title_h + SWELL_WAYLAND_BORDER_WIDTH;
+    f.right = f.left + w + SWELL_WAYLAND_BORDER_WIDTH*2;
+    f.bottom = f.top + h + g_swell_wayland_title_h + SWELL_WAYLAND_BORDER_WIDTH*2;
+  }
+  if ((reposflag&3)==3) gdk_window_move_resize(wnd,f.left,f.top,f.right-f.left,f.bottom-f.top);
+  else if (reposflag&2) gdk_window_resize(wnd,f.right-f.left,f.bottom-f.top);
+  else if (reposflag&1) gdk_window_move(wnd,f.left,f.top);
+}
+
+static void set_size_hints(HWND hwnd, const RECT *fixed)
+{
+  if (!fixed && (hwnd->m_oswindow_private & PRIVATE_SIZEPIN)) return;
+  GdkGeometry h;
+  if (!swell_gdk_size_hints(hwnd, fixed, &h)) return;
+  const int scale = swell_gdk_window_scale(hwnd->m_oswindow);
+  h.min_width = swell_gdk_ceil(h.min_width, scale);
+  h.min_height = swell_gdk_ceil(h.min_height, scale);
+  h.max_width = wdl_max(h.min_width, swell_gdk_floor(h.max_width, scale));
+  h.max_height = wdl_max(h.min_height, swell_gdk_floor(h.max_height, scale));
+  if (swell_wayland_needs_manual_titlebar(hwnd))
+  {
+    h.min_width += SWELL_WAYLAND_BORDER_WIDTH*2;
+    h.max_width += SWELL_WAYLAND_BORDER_WIDTH*2;
+    h.min_height += g_swell_wayland_title_h + SWELL_WAYLAND_BORDER_WIDTH*2;
+    h.max_height += g_swell_wayland_title_h + SWELL_WAYLAND_BORDER_WIDTH*2;
+  }
+  swell_wayland_set_geometry_hints(hwnd, &h);
+}
+
+static void activate(bool) { }
+
+static const char *window_manager_name()
+{
+  swell_wayland_init();
+  return NULL;
+}
+
+static void show_window(HWND hwnd, bool, bool modal, guint32)
+{
+  if (modal) gtk_window_set_modal(GTK_WINDOW(hwnd->m_oswidget), TRUE);
+  gdk_window_register_dnd(hwnd->m_oswindow);
+  swell_wayland_setup_drag(hwnd);
+  gtk_widget_show(hwnd->m_oswidget);
+}
+
+static void destroy_window(HWND hwnd)
+{
+  GtkWidget *widget = hwnd->m_oswidget;
+  if (widget)
+  {
+    g_signal_handlers_disconnect_by_data(widget, hwnd);
+    gtk_window_set_modal(GTK_WINDOW(widget), FALSE);
+  }
+  swell_wayland_release_sizepin(hwnd);
+  if (swell_captured_window && hwnd->m_classname && !strcmp(hwnd->m_classname, "__SWELL_MENU"))
+  {
+    SendMessage(swell_captured_window, WM_CAPTURECHANGED, 0, 0);
+    swell_captured_window = NULL;
+  }
+  swell_wayland_forget_window(hwnd);
+  if (widget)
+  {
+    xw_bridge_detach_children(hwnd);
+    if (widget == s_wayland_drag_widget)
+    {
+      g_signal_connect(widget, "drag-end", G_CALLBACK(+[](GtkWidget *w, GdkDragContext *, gpointer) {
+        gtk_widget_destroy(w);
+      }), NULL);
+      gtk_widget_hide(widget);
+    }
+    else gtk_widget_destroy(widget);
+  }
+  else gdk_window_destroy(hwnd->m_oswindow);
+  hwnd->m_oswidget = NULL;
+}
+
+static bool close_window(HWND hwnd)
+{
+  if (xw_bridge_popup_blocks_close(hwnd)) return false;
+  xw_bridge_swell_on_gdk_delete_release(hwnd);
+  return true;
+}
+
+static bool focus_window(HWND hwnd, bool, bool)
+{
+  gdk_window_raise(hwnd->m_oswindow);
+  if (hwnd->m_oswindow == SWELL_focused_oswindow) return false;
+  SWELL_focused_oswindow = hwnd->m_oswindow;
+  gdk_window_focus(hwnd->m_oswindow, GDK_CURRENT_TIME);
+  return true;
+}
+
+static void set_decorations(HWND hwnd)
+{
+  if (hwnd->m_oswidget)
+    gtk_window_set_decorated(GTK_WINDOW(hwnd->m_oswidget), (hwnd->m_style & WS_CAPTION) != 0);
+  if (GDK_IS_WAYLAND_WINDOW(hwnd->m_oswindow))
+  {
+    if (!(hwnd->m_style & WS_CAPTION) || g_swell_wayland_title_h)
+      gdk_wayland_window_announce_csd(hwnd->m_oswindow);
+    else
+      gdk_wayland_window_announce_ssd(hwnd->m_oswindow);
+  }
+  swell_gdk_set_decorations(hwnd);
+}
+
+static void set_cursor(GdkWindow *window, GdkCursor *cursor, bool)
+{
+  gdk_window_set_cursor(window, cursor);
+}
+
+static HWND create_bridge(HWND parent, void **window, const RECT *rect)
+{
+  return xw_bridge_create(parent, window, rect, "REAPERXBridge");
+}
+
+static void invalidate_focus(GdkWindow *window)
+{
+  gdk_window_invalidate_rect(window, NULL, FALSE);
+}
+
+static bool get_viewport(RECT *r)
+{
+  GdkDisplay *disp = gdk_display_get_default();
+  GdkMonitor *mon = SWELL_focused_oswindow ?
+    gdk_display_get_monitor_at_window(disp, SWELL_focused_oswindow) : NULL;
+  if (mon)
+  {
+    GdkRectangle rc = {0,};
+    gdk_monitor_get_geometry(mon, &rc);
+    r->left = 0;
+    r->top = 0;
+    const int scale = swell_gdk_window_scale(SWELL_focused_oswindow);
+    r->right = rc.width * scale;
+    r->bottom = rc.height * scale;
+    return true;
+  }
+  return false;
+}
+
+static void monitor_geometry(int index, bool work, GdkRectangle *rect)
+{
+  swell_gdk_monitor_geometry(index, work, rect);
+  const int scale = gdk_screen_get_monitor_scale_factor(gdk_screen_get_default(), index);
+  rect->x *= scale;
+  rect->y *= scale;
+  rect->width *= scale;
+  rect->height *= scale;
+}
+
+static void scaling_init(bool no_auto_hidpi)
+{
+  if (!no_auto_hidpi && g_swell_ui_scale == 256)
+  {
+    const int scale = swell_gdk_window_scale();
+    if (scale > 1 && scale < 8) g_swell_ui_scale = scale * 256;
+  }
+}
+
 const SWELL_GdkBackend swell_gdk_wayland = {
-  event_handler, mouse_event, run_events, get_cursor_pos, get_async_key_state
+  event_handler, mouse_event, run_events, get_cursor_pos, get_async_key_state,
+  update_window, invalidate, get_window_rect, resize_window, set_size_hints,
+  activate, window_manager_name, swell_wayland_create_window, show_window, destroy_window,
+  close_window, focus_window, set_decorations, set_cursor, create_bridge, invalidate_focus, true,
+  get_viewport, monitor_geometry, scaling_init
 };
 
 #endif

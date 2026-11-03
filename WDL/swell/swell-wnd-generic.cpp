@@ -779,11 +779,7 @@ void SetWindowPos(HWND hwnd, HWND zorder, int x, int y, int cx, int cy, int flag
 
     if (hwnd->m_oswindow && !hwnd->m_oswindow_fullscreen)
     {
-#ifdef SWELL_TARGET_WAYLAND
-      swell_oswindow_resize_mapped(hwnd,reposflag,f);
-#else
-      swell_oswindow_resize(hwnd->m_oswindow,reposflag,f);
-#endif
+      swell_oswindow_resize(hwnd->m_oswindow,reposflag,f,true);
       if (reposflag&2) SendMessage(hwnd,WM_SIZE,SIZE_RESTORED,0);
     }
     else

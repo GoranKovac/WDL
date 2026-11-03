@@ -35,6 +35,8 @@
 #include "swell-xcb.h"
 #include <GL/glx.h>
 
+//#define SWELL_GDK_IMPROVE_WINDOWRECT // does not work yet (gdk_window_get_frame_extents() does not seem to be sufficiently reliable)
+
 static HWND s_ddrop_forward_last_hwnd; // last top level window, which receives events from the drag source
 static Window s_ddrop_forward_last_target; // plug-in window we're sending XdndEnter etc to
 static Window s_ddrop_forward_last_container; // bridged container window, we receive notifications back from s_ddrop_forward_last_target
@@ -1109,10 +1111,31 @@ static void mouse_event(GdkEvent *event)
   }
 }
 
+static void expose(GdkEventExpose *event)
+{
+  HWND hwnd = swell_oswindow_to_hwnd(event->window);
+  if (!hwnd) return;
+  gdk_window_begin_paint_rect(event->window, &event->area);
+  cairo_surface_t *surface = swell_gdk_paint(hwnd, event->area);
+  if (surface)
+  {
+    cairo_t *cr = gdk_cairo_create(event->window);
+    cairo_set_source_surface(cr, surface, 0, 0);
+    cairo_paint(cr);
+    cairo_destroy(cr);
+    cairo_surface_destroy(surface);
+  }
+  gdk_window_end_paint(event->window);
+}
+
 static void event_handler(GdkEvent *event)
 {
   switch (event->type)
   {
+    case GDK_EXPOSE: // paint! GdkEventExpose...
+      expose(&event->expose); break;
+    case GDK_CONFIGURE: // size/move, GdkEventConfigure
+      swell_gdk_configure(&event->configure); break;
     case GDK_KEY_PRESS:
     case GDK_KEY_RELEASE:
       swell_gdk_prepare_key_event();
@@ -1152,8 +1175,221 @@ static void get_cursor_pos(POINT *pt)
 //#endif
 }
 
+static void update_window(HWND hwnd, const RECT *rect)
+{
+  if (!hwnd || !hwnd->m_oswindow) return;
+  cairo_surface_t *surface = swell_gdk_surface(hwnd);
+  if (!surface) return;
+  GdkRectangle area = { rect->left, rect->top, rect->right - rect->left, rect->bottom - rect->top };
+  gdk_window_begin_paint_rect(hwnd->m_oswindow, &area);
+  cairo_t *cr = gdk_cairo_create(hwnd->m_oswindow);
+  cairo_set_source_surface(cr, surface, 0, 0);
+  cairo_paint(cr);
+  cairo_destroy(cr);
+  cairo_surface_destroy(surface);
+  gdk_window_end_paint(hwnd->m_oswindow);
+}
+
+static void invalidate(HWND hwnd, const RECT *r)
+{
+  GdkRectangle gdkr;
+  if (r)
+  {
+    gdkr.x = r->left;
+    gdkr.y = r->top;
+    gdkr.width = r->right-r->left;
+    gdkr.height = r->bottom-r->top;
+  }
+
+  gdk_window_invalidate_rect(hwnd->m_oswindow,r ? &gdkr : NULL,true);
+}
+
+static void get_window_rect(HWND hwnd, RECT *r)
+{
+#ifdef SWELL_GDK_IMPROVE_WINDOWRECT
+  GdkRectangle gr;
+  gdk_window_get_frame_extents(hwnd->m_oswindow,&gr);
+
+  r->left=gr.x;
+  r->top=gr.y;
+  r->right=gr.x + gr.width;
+  r->bottom = gr.y + gr.height;
+#else
+  // this is wrong (returns client rect in screen coordinates), but gdk_window_get_frame_extents() doesn't seem to work
+  gint x=hwnd->m_position.left,y=hwnd->m_position.top;
+  gdk_window_get_root_origin(hwnd->m_oswindow,&x,&y);
+  r->left=x;
+  r->top=y;
+  r->right=x + hwnd->m_position.right - hwnd->m_position.left;
+  r->bottom = y + hwnd->m_position.bottom - hwnd->m_position.top;
+#endif
+}
+
+static void resize_window(GdkWindow *wnd, int reposflag, RECT f, bool)
+{
+#ifdef SWELL_GDK_IMPROVE_WINDOWRECT
+  if (reposflag & 2)
+  {
+    // increase size to include titlebars etc
+    GdkRectangle gr;
+    gdk_window_get_frame_extents(wnd,&gr);
+    gint cw=gr.width, ch=gr.height;
+    gdk_window_get_geometry(wnd,NULL,NULL,&cw,&ch);
+    // when it matters, this seems to always make gr.height=ch, which is pointless
+    f.right -= gr.width - cw;
+    f.bottom -= gr.height - ch;
+  }
+#endif
+  if ((reposflag&3)==3) gdk_window_move_resize(wnd,f.left,f.top,f.right-f.left,f.bottom-f.top);
+  else if (reposflag&2) gdk_window_resize(wnd,f.right-f.left,f.bottom-f.top);
+  else if (reposflag&1) gdk_window_move(wnd,f.left,f.top);
+}
+
+static void set_size_hints(HWND hwnd, const RECT *fixed)
+{
+  GdkGeometry h;
+  if (!swell_gdk_size_hints(hwnd, fixed, &h)) return;
+  gdk_window_set_geometry_hints(hwnd->m_oswindow, &h, (GdkWindowHints)
+    ((hwnd->m_has_had_position ? GDK_HINT_POS : 0) | GDK_HINT_MIN_SIZE | GDK_HINT_MAX_SIZE));
+}
+
+static int s_last_desktop;
+
+static void activate(bool active)
+{
+  s_last_desktop = 0;
+  HWND hwnd = swell_oswindow_to_hwnd(SWELL_focused_oswindow);
+  if (!active && hwnd && hwnd->m_oswindow)
+    s_last_desktop = swell_x11_get_desktop(hwnd->m_oswindow) + 1;
+}
+
+static const char *window_manager_name()
+{
+  return gdk_x11_screen_get_window_manager_name(gdk_screen_get_default());
+}
+
+static bool create_window(HWND hwnd, GdkWindow *)
+{
+  const RECT r = hwnd->m_position;
+  GdkWindowAttr attr={0,};
+  attr.title = (char *)hwnd->m_title.Get();
+  attr.event_mask = GDK_ALL_EVENTS_MASK|GDK_EXPOSURE_MASK;
+  attr.x = r.left;
+  attr.y = r.top;
+  attr.width = r.right-r.left;
+  attr.height = r.bottom-r.top;
+  attr.wclass = GDK_INPUT_OUTPUT;
+  const char *appname = g_swell_appname;
+  attr.wmclass_name = (gchar*)appname;
+  attr.wmclass_class = (gchar*)appname;
+  attr.window_type = GDK_WINDOW_TOPLEVEL;
+  if (GetProp(hwnd,"SWELLGdkAlphaChannel"))
+    attr.visual = gdk_screen_get_rgba_visual(gdk_screen_get_default());
+  hwnd->m_oswindow = gdk_window_new(NULL,&attr,GDK_WA_X|GDK_WA_Y|(appname?GDK_WA_WMCLASS:0)|(attr.visual ? GDK_WA_VISUAL : 0));
+  return hwnd->m_oswindow != NULL;
+}
+
+static void show_window(HWND hwnd, bool raise, bool modal, guint32 user_time)
+{
+  if (modal) gdk_window_set_modal_hint(hwnd->m_oswindow, TRUE);
+  if (user_time) gdk_x11_window_set_user_time(hwnd->m_oswindow, user_time);
+  gdk_window_register_dnd(hwnd->m_oswindow);
+  if (raise) gdk_window_show(hwnd->m_oswindow);
+  else gdk_window_show_unraised(hwnd->m_oswindow);
+  if (s_last_desktop > 0) swell_x11_move_to_desktop(hwnd->m_oswindow, s_last_desktop - 1);
+}
+
+static void destroy_window(HWND hwnd)
+{
+  gdk_window_destroy(hwnd->m_oswindow);
+}
+
+static bool close_window(HWND) { return true; }
+
+static bool focus_window(HWND hwnd, bool allow_force, bool override_redirect)
+{
+  bool force = false;
+  if (SWELL_focused_oswindow == hwnd->m_oswindow && allow_force)
+  {
+    force = !swell_x11_has_focus(hwnd->m_oswindow);
+  }
+
+  gdk_window_raise(hwnd->m_oswindow);
+
+  if (force || hwnd->m_oswindow != SWELL_focused_oswindow)
+  {
+    SWELL_focused_oswindow = hwnd->m_oswindow;
+    gdk_window_focus(hwnd->m_oswindow,GDK_CURRENT_TIME);
+
+    if (force || hwnd->m_style == WS_CHILD || (!(hwnd->m_style & WS_CAPTION) && override_redirect))
+    {
+      // WS_CHILD is used by menus to force override redirect
+      // if override redirect, gdk_window_focus() uses_NET_ACTIVE_WINDOW, but xfce4/plasma do not set focus properly
+      if (allow_force &&
+          gdk_x11_screen_supports_net_wm_hint(gdk_window_get_screen(hwnd->m_oswindow), gdk_atom_intern_static_string("_NET_ACTIVE_WINDOW")))
+      {
+        swell_x11_force_focus(hwnd->m_oswindow);
+      }
+    }
+    return true;
+  }
+  return false;
+}
+
+static void set_cursor(GdkWindow *window, GdkCursor *cursor, bool grabbed)
+{
+  gdk_window_set_cursor(window, cursor);
+#ifndef SWELL_TARGET_GDK_NO_CURSOR_HACK
+  if (grabbed) swell_x11_set_grab_cursor(window, cursor);
+#endif
+}
+
+static void scaling_init(bool no_auto_hidpi)
+{
+  #if SWELL_TARGET_GDK == 3
+
+  if (!no_auto_hidpi && g_swell_ui_scale == 256)
+  {
+    int (*gsf)(void*);
+    void * (*gpm)(GdkDisplay *);
+    *(void **)&gsf = dlsym(RTLD_DEFAULT,"gdk_monitor_get_scale_factor");
+    *(void **)&gpm = dlsym(RTLD_DEFAULT,"gdk_display_get_primary_monitor");
+
+    if (gpm && gsf)
+    {
+      GdkDisplay *gdkdisp = gdk_display_get_default();
+      if (gdkdisp)
+      {
+        void *m = gpm(gdkdisp);
+        if (m)
+        {
+          int sf = gsf(m);
+          if (sf > 1 && sf < 8)
+            g_swell_ui_scale = sf*256;
+        }
+      }
+    }
+  }
+
+  if (g_swell_ui_scale != 256)
+  {
+    GdkDisplay *gdkdisp = gdk_display_get_default();
+    if (gdkdisp)
+    {
+      void (*p)(GdkDisplay*, gint);
+      *(void **)&p = dlsym(RTLD_DEFAULT,"gdk_x11_display_set_window_scale");
+      if (p && GDK_IS_X11_DISPLAY(gdkdisp)) p(gdkdisp,1);
+    }
+  }
+  #endif
+}
+
 const SWELL_GdkBackend swell_gdk_x11 = {
-  event_handler, mouse_event, run_events, get_cursor_pos, swell_gdk_get_async_key_state
+  event_handler, mouse_event, run_events, get_cursor_pos, swell_gdk_get_async_key_state,
+  update_window, invalidate, get_window_rect, resize_window, set_size_hints,
+  activate, window_manager_name, create_window, show_window, destroy_window,
+  close_window, focus_window, swell_gdk_set_decorations, set_cursor, swell_x11_create_bridge, NULL, false,
+  NULL, swell_gdk_monitor_geometry, scaling_init
 };
 
 #endif
