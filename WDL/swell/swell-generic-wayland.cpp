@@ -110,7 +110,7 @@ static void swell_wayland_suppress_csd_shadow_once()
 
   GtkCssProvider *provider = gtk_css_provider_new();
   const char *css =
-    "decoration, decoration:backdrop {"
+    "window.swell decoration {"
     "  box-shadow: none;"
     "  border: none;"
     "  border-radius: 0;"
@@ -291,6 +291,7 @@ static bool swell_wayland_create_window(HWND hwnd, GdkWindow *transient_for)
 
   if (g_swell_wayland_title_h)
   {
+    gtk_style_context_add_class(gtk_widget_get_style_context(gtk_win), "swell");
     gtk_window_set_titlebar(GTK_WINDOW(gtk_win), gtk_label_new(NULL));
   }
   if (!is_popup_menu && !is_tooltip && !is_splash)

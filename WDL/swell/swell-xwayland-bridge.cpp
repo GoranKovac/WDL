@@ -1911,11 +1911,6 @@ static void connect_widget(Capture *c)
                           GDK_KEY_RELEASE_MASK |
                           GDK_SCROLL_MASK);
 
-    {
-        GtkSettings *settings = gtk_widget_get_settings(c->widget);
-        if (settings) g_object_set(settings, "gtk-enable-animations", FALSE, NULL);
-    }
-
     connect_toplevel(c);
 
     g_signal_connect(c->widget, "realize", G_CALLBACK(on_realize), c);
