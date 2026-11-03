@@ -30,6 +30,7 @@ struct SWELL_GdkBackend
   const char *(*window_manager_name)();
   bool (*create_window)(HWND hwnd, GdkWindow *transient_for);
   void (*show_window)(HWND hwnd, bool raise, bool modal, guint32 user_time);
+  void (*hide_window)(HWND hwnd);
   void (*destroy_window)(HWND hwnd);
   bool (*close_window)(HWND hwnd);
   bool (*focus_window)(HWND hwnd, bool allow_force, bool override_redirect);

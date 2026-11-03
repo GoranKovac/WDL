@@ -235,6 +235,16 @@ static HWND s_wayland_active_tooltip;
 static SWELL_OSWINDOW s_last_hover_oswindow;
 bool PopupMenuIsActive();
 
+static void hide_tooltip(GtkWidget *parent)
+{
+  HWND tooltip = s_wayland_active_tooltip;
+  if (!tooltip) return;
+  if (parent && (!tooltip->m_oswidget ||
+      gtk_window_get_transient_for(GTK_WINDOW(tooltip->m_oswidget)) != GTK_WINDOW(parent))) return;
+  s_wayland_active_tooltip = NULL;
+  ShowWindow(tooltip, SW_HIDE);
+}
+
 static SWELL_OSWINDOW s_armed_drag_oswindow;
 static guint s_armed_drag_button;
 static gint s_armed_drag_root_x, s_armed_drag_root_y;
@@ -317,12 +327,7 @@ static bool swell_wayland_create_window(HWND hwnd, GdkWindow *transient_for)
     swell_wayland_set_geometry_hints(hwnd, &gh);
   }
 
-  if (is_popup_menu && s_wayland_active_tooltip)
-  {
-    if (s_wayland_active_tooltip->m_oswindow)
-      gdk_window_hide(s_wayland_active_tooltip->m_oswindow);
-    s_wayland_active_tooltip = NULL;
-  }
+  if (is_popup_menu) hide_tooltip(NULL);
   if (is_tooltip && !is_drag_preview && PopupMenuIsActive())
   {
     gtk_widget_destroy(gtk_win);
@@ -1207,11 +1212,18 @@ static void show_window(HWND hwnd, bool, bool modal, guint32)
   gtk_widget_show(hwnd->m_oswidget);
 }
 
+static void hide_window(HWND hwnd)
+{
+  if (hwnd->m_oswidget) hide_tooltip(hwnd->m_oswidget);
+  gdk_window_hide(hwnd->m_oswindow);
+}
+
 static void destroy_window(HWND hwnd)
 {
   GtkWidget *widget = hwnd->m_oswidget;
   if (widget)
   {
+    hide_tooltip(widget);
     g_signal_handlers_disconnect_by_data(widget, hwnd);
     gtk_window_set_modal(GTK_WINDOW(widget), FALSE);
   }
@@ -1555,7 +1567,7 @@ static void end_modal(HWND hwnd)
 const SWELL_GdkBackend swell_gdk_wayland = {
   event_handler, mouse_event, run_events, get_cursor_pos, get_async_key_state,
   update_window, invalidate, get_window_rect, resize_window, set_size_hints,
-  activate, NULL, swell_wayland_create_window, show_window, destroy_window,
+  activate, NULL, swell_wayland_create_window, show_window, hide_window, destroy_window,
   close_window, focus_window, set_decorations, set_cursor, create_bridge, invalidate_focus, true,
   get_viewport, monitor_geometry, scaling_init,
   clipboard_open, req_wayland_clipboard, NULL, publish_wayland_clipboard, clipboard_text, drag_files,

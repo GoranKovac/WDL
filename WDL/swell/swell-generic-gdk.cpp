@@ -582,7 +582,7 @@ static void swell_hide_owned_windows_transient(HWND hwnd)
     while (l)
     {
       if (l->m_oswindow && l->m_owner == hwnd && l->m_visible)
-        gdk_window_hide(l->m_oswindow);
+        swell_gdk_backend->hide_window(l);
       l = l->m_next;
     }
   }
@@ -1706,7 +1706,7 @@ void swell_oswindow_update_style(HWND hwnd, LONG oldstyle)
   {
     swell_hide_owned_windows_transient(hwnd);
 
-    gdk_window_hide(hwnd->m_oswindow);
+    swell_gdk_backend->hide_window(hwnd);
     swell_gdk_backend->set_decorations(hwnd);
     hwnd->m_oswindow_private |= PRIVATE_NEEDSHOW;
   }
