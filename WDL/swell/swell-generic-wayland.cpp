@@ -204,6 +204,20 @@ static void configure(GdkEventConfigure *event)
   swell_gdk_configure(&pixels);
 }
 
+static void swell_wayland_check_resize(GtkContainer *container, gpointer data)
+{
+  HWND hwnd = (HWND)data;
+  GtkWidget *widget = GTK_WIDGET(container);
+  GdkWindow *window = gtk_widget_get_window(widget);
+  if (!gtk_widget_get_mapped(widget) || window != hwnd->m_oswindow) return;
+  GdkEventConfigure cfg = {};
+  cfg.window = window;
+  gdk_window_get_geometry(window, &cfg.x, &cfg.y, &cfg.width, &cfg.height);
+  if (cfg.width != gtk_widget_get_allocated_width(widget) ||
+      cfg.height != gtk_widget_get_allocated_height(widget))
+    configure(&cfg);
+}
+
 static void swell_wayland_scale_changed(GtkWidget *widget, GParamSpec *, gpointer data)
 {
   HWND hwnd = (HWND)data;
@@ -268,6 +282,7 @@ static bool swell_wayland_create_window(HWND hwnd, GdkWindow *transient_for)
 
   gtk_widget_set_app_paintable(gtk_win, TRUE);
   g_signal_connect(gtk_win, "draw", G_CALLBACK(swell_wayland_draw), hwnd);
+  g_signal_connect(gtk_win, "check-resize", G_CALLBACK(swell_wayland_check_resize), hwnd);
   gtk_widget_add_events(gtk_win, GDK_ALL_EVENTS_MASK|GDK_EXPOSURE_MASK);
 
   if (!is_popup_menu && !is_tooltip)
@@ -972,7 +987,15 @@ static void event_handler(GdkEvent *event)
     return;
   }
   if (event->type == GDK_EXPOSE) expose(&event->expose, NULL, true);
-  else if (event->type == GDK_CONFIGURE) configure(&event->configure);
+  else if (event->type == GDK_CONFIGURE)
+  {
+    HWND hwnd = swell_oswindow_to_hwnd(event->any.window);
+    GtkWidget *widget = hwnd ? hwnd->m_oswidget : NULL;
+    if (!widget || !gtk_widget_get_mapped(widget) ||
+        (gtk_widget_get_allocated_width(widget) == event->configure.width &&
+         gtk_widget_get_allocated_height(widget) == event->configure.height))
+      configure(&event->configure);
+  }
   swell_gdk_dispatch_event(event);
   if (event->type == GDK_EXPOSE && !gdk_window_is_destroyed(event->any.window) &&
       swell_oswindow_to_hwnd(event->any.window))
