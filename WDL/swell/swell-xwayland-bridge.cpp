@@ -1734,8 +1734,9 @@ static gboolean on_crossing(GtkWidget *, GdkEventCrossing *e, gpointer data)
     return FALSE;
 }
 
-void xw_raise_modals()
+bool xw_bridge_raise_modals()
 {
+    bool any = false;
     for (auto &kv : g_captures)
     {
         Capture *c = kv.second;
@@ -1747,16 +1748,11 @@ void xw_raise_modals()
                 raise_window(md.x11_win);
                 gtk_window_present(GTK_WINDOW(md.gtk_win));
                 gtk_window_set_keep_above(GTK_WINDOW(md.gtk_win), TRUE);
+                any = true;
             }
     }
-    if (wm_connection()) xcb_flush(wm_connection());
-}
-
-static bool any_modal_open()
-{
-    for (auto &kv : g_captures)
-        if (kv.second && !kv.second->modals.empty()) return true;
-    return false;
+    if (any && wm_connection()) xcb_flush(wm_connection());
+    return any;
 }
 
 static bool on_button_press(GtkWidget *widget, GdkEventButton *e, gpointer data)
@@ -1764,10 +1760,7 @@ static bool on_button_press(GtkWidget *widget, GdkEventButton *e, gpointer data)
     DEBUG_PRINT("[DNDX] widget button PRESS btn=%d\n", e->button);
     Capture *c = (Capture*)data;
     if (!c || !c->connection) return false;
-    if (any_modal_open()){
-        xw_raise_modals();
-        return true;
-    }
+    if (xw_bridge_raise_modals()) return true;
     set_active_capture(c);
     if (c->hwnd) SetFocus(c->hwnd);
     forward_motion(c, e->x, e->y);
@@ -1832,11 +1825,6 @@ static bool on_scroll(GtkWidget *, GdkEventScroll *e, gpointer data)
     return true;
 }
 
-static bool has_live_ui(Capture *c)
-{
-    return c && !c->modals.empty();
-}
-
 static void on_toplevel_active(GObject *obj, GParamSpec *, gpointer data)
 {
     Capture *c = (Capture*)data;
@@ -1846,7 +1834,7 @@ static void on_toplevel_active(GObject *obj, GParamSpec *, gpointer data)
     g_object_get(obj, "is-active", &active, NULL);
 
     if (active) {
-        if (g_active_capture && g_active_capture != c && has_live_ui(g_active_capture))
+        if (g_active_capture && g_active_capture != c && !g_active_capture->modals.empty())
             return;
 
         set_active_capture(c);
@@ -1862,9 +1850,9 @@ static void on_toplevel_active(GObject *obj, GParamSpec *, gpointer data)
             raise_window(c->parent_win);
             xcb_flush(wm_connection());
         }
-        xw_raise_modals();
+        xw_bridge_raise_modals();
     } else if (g_active_capture == c) {
-        if (has_live_ui(c)) return;
+        if (!c->modals.empty()) return;
         set_active_capture(nullptr);
     }
 }
@@ -2743,15 +2731,11 @@ static void dismiss_popups(Capture *c)
 
 bool xw_bridge_swell_on_button_event_escape()
 {
-    bool any = false;
+    bool any = xw_bridge_raise_modals();
     for (auto &kv : g_captures)
     {
         Capture *c = kv.second;
         if (!c || kv.first != c->parent_win) continue;
-        if (!c->modals.empty()){
-            xw_raise_modals();
-            any = true;
-        }
         if (!c->popups.empty()){
             dismiss_popups(c);
             any = true;
@@ -3179,33 +3163,10 @@ HWND xw_bridge_create(HWND viewpar, void **wref, const RECT *r, const char *brid
 
     *wref = (void*)(uintptr_t)container;
 
-    {
-        HWND top = viewpar;
-        while (top && !top->m_oswidget) top = top->m_parent;
-        if (top) SetProp(top, "SWELL_XW_BRIDGE_PLUGIN", (HANDLE)(INT_PTR)1);
-    }
-
     xw_size(hwnd);
 
     SetTimer(hwnd, 1, 100, NULL);
     return hwnd;
-}
-
-bool xw_bridge_forward_key_to_modal(int keycode, int state, bool is_press)
-{
-    for (auto &kv : g_captures)
-    {
-        Capture *c = kv.second;
-        if (!c || kv.first != c->parent_win) continue;
-        if (!c || !c->connection || c->modals.empty()) continue;
-
-        Capture::ModalWin &md = c->modals.back();
-        xcb_window_t target = md.x11_win;
-        if (!target) continue;
-        xw_raise_modals();
-        return true;
-    }
-    return false;
 }
 
 bool xw_bridge_forward_key(HWND hwnd, int keycode, int state, bool is_press)

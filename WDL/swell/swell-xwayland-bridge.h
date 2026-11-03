@@ -13,7 +13,7 @@ HWND xw_bridge_create(
 );
 bool xw_bridge_forward_key(HWND hwnd, int keycode, int state, bool is_press);
 bool xw_bridge_key_event(GdkEventKey *event);
-bool xw_bridge_forward_key_to_modal(int keycode, int state, bool is_press);
+bool xw_bridge_raise_modals();
 bool xw_bridge_swell_on_button_event_escape();
 bool xw_bridge_popup_blocks_close(HWND hwnd);
 bool xw_bridge_swell_on_gdk_delete_release(HWND hwnd);

@@ -964,8 +964,7 @@ static void event_handler(GdkEvent *event)
     {
       swell_gdk_prepare_key_event();
       HWND hwnd = swell_oswindow_to_hwnd(key->window);
-      if (hwnd && !xw_bridge_forward_key_to_modal(key->hardware_keycode, key->state,
-                                                 key->type == GDK_KEY_PRESS))
+      if (hwnd && !xw_bridge_raise_modals())
       {
         HWND focus = GetFocusIncludeMenus();
         if (focus && focus->m_classname && !strcmp(focus->m_classname, "REAPERXBridge"))
