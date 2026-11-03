@@ -30,7 +30,7 @@
 #include "swell-gdk.h"
 #include "swell-wayland.h"
 #include "swell-gdk-scale.h"
-#include "xwayland-bridge.h"
+#include "swell-xwayland-bridge.h"
 
 #define PRIVATE_SIZEPIN 2
 
