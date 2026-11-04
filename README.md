@@ -1,3 +1,5 @@
+SWELL with native Wayland support + XWayland plugin bridge
+
 To compile
 
 cd swell
