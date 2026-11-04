@@ -287,7 +287,7 @@ bool swell_gdk_size_hints(HWND hwnd, const RECT *fixed, GdkGeometry *hints)
 
 void swell_recalcMinMaxInfo(HWND hwnd)
 {
-  if (hwnd && hwnd->m_oswindow && (hwnd->m_style & WS_CAPTION))
+  if (hwnd && hwnd->m_oswindow && (hwnd->m_style & (WS_CAPTION | WS_THICKFRAME)))
     swell_gdk_backend->set_size_hints(hwnd, NULL);
 }
 
