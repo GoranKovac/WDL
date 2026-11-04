@@ -1128,6 +1128,20 @@ static void get_window_rect(HWND hwnd, RECT *r)
   *r = hwnd->m_position;
 }
 
+static void restore_geometry_hints(GdkFrameClock *clock, GtkWidget *widget)
+{
+  g_signal_handlers_disconnect_by_func(clock, (gpointer)restore_geometry_hints, widget);
+  GdkWindow *window = gtk_widget_get_window(widget);
+  GdkGeometry empty = {};
+  GdkGeometry *hints = (GdkGeometry*)g_object_get_data(G_OBJECT(widget), "swell-geometry-hints");
+  if (window)
+  {
+    gdk_window_set_geometry_hints(window, hints ? hints : &empty,
+        (GdkWindowHints)(hints ? GDK_HINT_MIN_SIZE | GDK_HINT_MAX_SIZE : 0));
+    gtk_widget_queue_draw(widget);
+  }
+}
+
 static void resize_window(GdkWindow *wnd, int reposflag, RECT f, bool mapped)
 {
   HWND hwnd = swell_oswindow_to_hwnd(wnd);
@@ -1149,7 +1163,26 @@ static void resize_window(GdkWindow *wnd, int reposflag, RECT f, bool mapped)
   }
   if (mapped && (reposflag & 2) && hwnd && hwnd->m_oswidget &&
       gtk_window_get_type_hint(GTK_WINDOW(hwnd->m_oswidget)) != GDK_WINDOW_TYPE_HINT_TOOLTIP)
-    gtk_window_resize(GTK_WINDOW(hwnd->m_oswidget), wdl_max(f.right-f.left, 1), wdl_max(f.bottom-f.top, 1));
+  {
+    const int w = wdl_max(f.right-f.left, 1), h = wdl_max(f.bottom-f.top, 1);
+    const int oldw = gdk_window_get_width(wnd), oldh = gdk_window_get_height(wnd);
+    const GdkWindowState state = gdk_window_get_state(wnd);
+    if ((state & (GDK_WINDOW_STATE_MAXIMIZED | GDK_WINDOW_STATE_TILED)) &&
+        !(state & GDK_WINDOW_STATE_FULLSCREEN) && (w != oldw || h != oldh))
+    {
+      GdkGeometry hints = {};
+      if (w > oldw) hints.min_width = w;
+      else if (w < oldw) hints.max_width = w;
+      if (h > oldh) hints.min_height = h;
+      else if (h < oldh) hints.max_height = h;
+      gdk_window_set_geometry_hints(wnd, &hints, (GdkWindowHints)(GDK_HINT_MIN_SIZE | GDK_HINT_MAX_SIZE));
+      GdkFrameClock *clock = gdk_window_get_frame_clock(wnd);
+      g_signal_handlers_disconnect_by_func(clock, (gpointer)restore_geometry_hints, hwnd->m_oswidget);
+      g_signal_connect_object(clock, "after-paint", G_CALLBACK(restore_geometry_hints),
+                              G_OBJECT(hwnd->m_oswidget), (GConnectFlags)0);
+    }
+    gtk_window_resize(GTK_WINDOW(hwnd->m_oswidget), w, h);
+  }
   else if ((reposflag&3)==3) gdk_window_move_resize(wnd,f.left,f.top,f.right-f.left,f.bottom-f.top);
   else if (reposflag&2) gdk_window_resize(wnd,f.right-f.left,f.bottom-f.top);
   else if (reposflag&1) gdk_window_move(wnd,f.left,f.top);
