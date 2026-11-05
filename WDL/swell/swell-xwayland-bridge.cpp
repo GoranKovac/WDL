@@ -1,5 +1,6 @@
 #include <gtk/gtk.h>
 #include <gdk/gdkwayland.h>
+#include <gdk/gdkkeysyms.h>
 #include <cairo-xcb.h>
 #include <epoxy/egl.h>
 #include <epoxy/gl.h>
@@ -1759,6 +1760,16 @@ bool xw_bridge_raise_modals()
     return any;
 }
 
+static void restore_input_focus(xcb_connection_t *connection, xcb_window_t window)
+{
+    xcb_get_input_focus_reply_t *focus = xcb_get_input_focus_reply(connection,
+        xcb_get_input_focus(connection), nullptr);
+    if (focus && (focus->focus == XCB_NONE || focus->focus == XCB_INPUT_FOCUS_POINTER_ROOT ||
+                  focus->focus == swell_xcb_screen(connection)->root))
+        xcb_set_input_focus(connection, XCB_INPUT_FOCUS_PARENT, window, XCB_CURRENT_TIME);
+    free(focus);
+}
+
 static gboolean on_button_press(GtkWidget *widget, GdkEventButton *e, gpointer data)
 {
     DEBUG_PRINT("[DNDX] widget button PRESS btn=%d\n", e->button);
@@ -1767,6 +1778,7 @@ static gboolean on_button_press(GtkWidget *widget, GdkEventButton *e, gpointer d
     if (xw_bridge_raise_modals()) return true;
     set_active_capture(c);
     if (c->hwnd) SetFocus(c->hwnd);
+    restore_input_focus(c->connection, c->gui_win ? c->gui_win : c->plugin_win);
     forward_motion(c, e->x, e->y);
     fake_button(c->connection, e->button, true);
     xcb_flush(c->connection);
@@ -2388,6 +2400,7 @@ static gboolean modal_button_press(GtkWidget *widget, GdkEventButton *e, gpointe
 {
     ModalRender *m = (ModalRender*)data;
     if (!m || !m->cap->connection) return false;
+    restore_input_focus(m->cap->connection, m->x11_win);
     modal_forward_motion(m, widget, e->x, e->y);
     fake_button(m->cap->connection, e->button, true);
     xcb_flush(m->cap->connection);
@@ -2747,11 +2760,13 @@ static void dismiss_popups(Capture *c)
         const int keycode = codes ? codes[0] : 0;
         free(codes);
         if (symbols) xcb_key_symbols_free(symbols);
-        if (!keycode) return;
-        for (int i = 0; i < wdl_max(levels, 1); ++i) {
-            xw_bridge_forward_key(c->hwnd, keycode, 0, true);
-            xw_bridge_forward_key(c->hwnd, keycode, 0, false);
+        if (keycode) for (int i = 0; i < wdl_max(levels, 1); ++i) {
+            forward_key(c->connection, c->root_popup, keycode, 0, true);
+            forward_key(c->connection, c->root_popup, keycode, 0, false);
         }
+        xcb_set_input_focus(c->connection, XCB_INPUT_FOCUS_POINTER_ROOT,
+                            swell_xcb_screen(c->connection)->root, XCB_CURRENT_TIME);
+        xcb_flush(c->connection);
     }
 }
 
@@ -3195,7 +3210,7 @@ HWND xw_bridge_create(HWND viewpar, void **wref, const RECT *r, const char *brid
     return hwnd;
 }
 
-bool xw_bridge_forward_key(HWND hwnd, int keycode, int state, bool is_press)
+bool xw_bridge_forward_key(HWND hwnd, GdkEventKey *event)
 {
     if (!hwnd || !hwnd->m_private_data) return false;
     XWaylandBridge *bs = (XWaylandBridge*)hwnd->m_private_data;
@@ -3206,7 +3221,12 @@ bool xw_bridge_forward_key(HWND hwnd, int keycode, int state, bool is_press)
                   : (c->gui_win ? c->gui_win : c->plugin_win);
     if (!target) return false;
 
-    forward_key(c->connection, target, keycode, state, is_press);
+    if (c->root_popup && event->keyval == GDK_KEY_Escape) {
+        if (event->type == GDK_KEY_PRESS) dismiss_popups(c);
+        return true;
+    }
+
+    forward_key(c->connection, target, event->hardware_keycode, event->state, event->type == GDK_KEY_PRESS);
     return true;
 }
 
@@ -3217,8 +3237,7 @@ bool xw_bridge_key_event(GdkEventKey *e)
         if (kv.first != c->parent_win) continue;
         if ((c->widget && gtk_widget_get_window(c->widget) == e->window) ||
             (c->popup_canvas && gtk_widget_get_window(c->popup_canvas) == e->window))
-            return xw_bridge_forward_key(c->hwnd, e->hardware_keycode,
-                                         e->state, e->type == GDK_KEY_PRESS);
+            return xw_bridge_forward_key(c->hwnd, e);
     }
     return false;
 }

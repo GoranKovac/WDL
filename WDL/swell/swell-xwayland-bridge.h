@@ -11,7 +11,7 @@ HWND xw_bridge_create(
     const RECT *r,
     const char* bridge_class_name
 );
-bool xw_bridge_forward_key(HWND hwnd, int keycode, int state, bool is_press);
+bool xw_bridge_forward_key(HWND hwnd, GdkEventKey *event);
 bool xw_bridge_key_event(GdkEventKey *event);
 bool xw_bridge_raise_modals();
 bool xw_bridge_swell_on_button_event_escape();
