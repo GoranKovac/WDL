@@ -18,6 +18,9 @@
 #include <xcb/xcb_keysyms.h>
 #include <xcb/xcb_renderutil.h>
 #include <xcb/xfixes.h>
+#define explicit explicit_
+#include <xcb/xkb.h>
+#undef explicit
 #include <xcb/xtest.h>
 #include <sys/mman.h>
 #include <sys/prctl.h>
@@ -1516,8 +1519,15 @@ static xcb_damage_damage_t create_damage(xcb_window_t window)
     return damage;
 }
 
-static void fake_motion(xcb_connection_t *connection, int x, int y)
+static void forward_modifiers(xcb_connection_t *connection, int state)
 {
+    xcb_xkb_latch_lock_state(connection, XCB_XKB_ID_USE_CORE_KBD, 0xff, state & 0xff,
+                             false, 0, 0, false, 0);
+}
+
+static void fake_motion(xcb_connection_t *connection, int x, int y, int state = -1)
+{
+    if (state >= 0) forward_modifiers(connection, state);
     xcb_test_fake_input(connection, XCB_MOTION_NOTIFY, 0, XCB_CURRENT_TIME,
                         swell_xcb_screen(connection)->root, x, y, 0);
 }
@@ -1700,7 +1710,7 @@ static void raise_window(xcb_window_t window)
     swell_xcb_raise(wm_connection(), window);
 }
 
-static void forward_motion(Capture *c, double wx, double wy)
+static void forward_motion(Capture *c, double wx, double wy, int state)
 {
     resume_pointer();
     raise_window(c->parent_win);
@@ -1708,7 +1718,7 @@ static void forward_motion(Capture *c, double wx, double wy)
     int rx = 0, ry = 0;
     swell_xcb_translate(wm_connection(), c->plugin_win, swell_xcb_screen(c->connection)->root,
                           (int)(wx * scale), (int)(wy * scale), &rx, &ry);
-    fake_motion(c->connection, rx, ry);
+    fake_motion(c->connection, rx, ry, state);
 }
 
 static gboolean on_crossing(GtkWidget *, GdkEventCrossing *e, gpointer data)
@@ -1717,7 +1727,7 @@ static gboolean on_crossing(GtkWidget *, GdkEventCrossing *e, gpointer data)
     if (!c || !c->connection || e->mode != GDK_CROSSING_NORMAL ||
         e->detail == GDK_NOTIFY_INFERIOR) return FALSE;
     if (e->type == GDK_ENTER_NOTIFY) {
-        forward_motion(c, e->x, e->y);
+        forward_motion(c, e->x, e->y, e->state);
         xcb_flush(c->connection);
     } else if (!(e->state & (GDK_BUTTON1_MASK | GDK_BUTTON2_MASK | GDK_BUTTON3_MASK |
                             GDK_BUTTON4_MASK | GDK_BUTTON5_MASK)) && c->popups.empty()) {
@@ -1779,7 +1789,7 @@ static gboolean on_button_press(GtkWidget *widget, GdkEventButton *e, gpointer d
     set_active_capture(c);
     if (c->hwnd) SetFocus(c->hwnd);
     restore_input_focus(c->connection, c->gui_win ? c->gui_win : c->plugin_win);
-    forward_motion(c, e->x, e->y);
+    forward_motion(c, e->x, e->y, e->state);
     fake_button(c->connection, e->button, true);
     xcb_flush(c->connection);
     return true;
@@ -1790,7 +1800,7 @@ static gboolean on_button_release(GtkWidget *, GdkEventButton *e, gpointer data)
     DEBUG_PRINT("[DNDX] widget button RELEASE btn=%d\n", e->button);
     Capture *c = (Capture*)data;
     if (!c || !c->connection) return false;
-    forward_motion(c, e->x, e->y);
+    forward_motion(c, e->x, e->y, e->state);
     fake_button(c->connection, e->button, false);
     xcb_flush(c->connection);
     return true;
@@ -1817,7 +1827,7 @@ static gboolean on_motion(GtkWidget *, GdkEventMotion *e, gpointer data)
 
     Capture *c = (Capture*)data;
     if (!c || !c->connection) return false;
-    forward_motion(c, e->x, e->y);
+    forward_motion(c, e->x, e->y, e->state);
     xcb_flush(c->connection);
     return true;
 }
@@ -1834,7 +1844,7 @@ static gboolean on_scroll(GtkWidget *, GdkEventScroll *e, gpointer data)
         case GDK_SCROLL_RIGHT: btn = 7; break;
         default: return false;
     }
-    forward_motion(c, e->x, e->y);
+    forward_motion(c, e->x, e->y, e->state);
     fake_button(c->connection, btn, true);
     fake_button(c->connection, btn, false);
     xcb_flush(c->connection);
@@ -2096,7 +2106,7 @@ static gboolean canvas_button_press(GtkWidget *widget, GdkEventButton *e, gpoint
             screen_y >= it->y && screen_y < it->y + it->h &&
             popup_accepts_input(c->connection, it->x11_win)) {
             hit = true;
-            fake_motion(c->connection, x11_x, x11_y);
+            fake_motion(c->connection, x11_x, x11_y, e->state);
             xcb_flush(c->connection);
             fake_button(c->connection, e->button, true);
             if (e->button < 32) c->canvas_buttons |= 1u << e->button;
@@ -2115,6 +2125,7 @@ static gboolean canvas_button_release(GtkWidget *, GdkEventButton *e, gpointer d
 {
     Capture *c = (Capture*)data;
     if (!c || !c->connection) return false;
+    forward_modifiers(c->connection, e->state);
     fake_button(c->connection, e->button, false);
     if (e->button < 32) c->canvas_buttons &= ~(1u << e->button);
     xcb_flush(c->connection);
@@ -2133,7 +2144,7 @@ static gboolean canvas_motion(GtkWidget *widget, GdkEventMotion *e, gpointer dat
     int x11_x = screen_x - c->gtk_x;
     int x11_y = screen_y - c->gtk_y;
 
-    fake_motion(c->connection, x11_x, x11_y);
+    fake_motion(c->connection, x11_x, x11_y, e->state);
     xcb_flush(c->connection);
 
     return true;
@@ -2385,7 +2396,7 @@ static gboolean modal_draw_cb(GtkWidget *widget, cairo_t *cr, gpointer data)
     return true;
 }
 
-static void modal_forward_motion(ModalRender *m, GtkWidget *widget, double wx, double wy)
+static void modal_forward_motion(ModalRender *m, GtkWidget *widget, double wx, double wy, int state)
 {
     resume_pointer();
     raise_window(m->x11_win);
@@ -2393,7 +2404,7 @@ static void modal_forward_motion(ModalRender *m, GtkWidget *widget, double wx, d
     int rx = 0, ry = 0;
     swell_xcb_translate(wm_connection(), m->x11_win, swell_xcb_screen(m->cap->connection)->root,
                           (int)(wx * scale), (int)(wy * scale), &rx, &ry);
-    fake_motion(m->cap->connection, rx, ry);
+    fake_motion(m->cap->connection, rx, ry, state);
 }
 
 static gboolean modal_button_press(GtkWidget *widget, GdkEventButton *e, gpointer data)
@@ -2401,7 +2412,7 @@ static gboolean modal_button_press(GtkWidget *widget, GdkEventButton *e, gpointe
     ModalRender *m = (ModalRender*)data;
     if (!m || !m->cap->connection) return false;
     restore_input_focus(m->cap->connection, m->x11_win);
-    modal_forward_motion(m, widget, e->x, e->y);
+    modal_forward_motion(m, widget, e->x, e->y, e->state);
     fake_button(m->cap->connection, e->button, true);
     xcb_flush(m->cap->connection);
     return true;
@@ -2411,7 +2422,7 @@ static gboolean modal_button_release(GtkWidget *widget, GdkEventButton *e, gpoin
 {
     ModalRender *m = (ModalRender*)data;
     if (!m || !m->cap->connection) return false;
-    modal_forward_motion(m, widget, e->x, e->y);
+    modal_forward_motion(m, widget, e->x, e->y, e->state);
     fake_button(m->cap->connection, e->button, false);
     xcb_flush(m->cap->connection);
     return true;
@@ -2421,7 +2432,7 @@ static gboolean modal_motion(GtkWidget *widget, GdkEventMotion *e, gpointer data
 {
     ModalRender *m = (ModalRender*)data;
     if (!m || !m->cap->connection) return false;
-    modal_forward_motion(m, widget, e->x, e->y);
+    modal_forward_motion(m, widget, e->x, e->y, e->state);
     xcb_flush(m->cap->connection);
     return true;
 }
@@ -3170,9 +3181,11 @@ HWND xw_bridge_create(HWND viewpar, void **wref, const RECT *r, const char *brid
     const auto composite = xcb_composite_query_version(connection, 0, 4);
     const auto fixes = xcb_xfixes_query_version(connection, 5, 0);
     const auto randr = xcb_randr_query_version(connection, 1, 5);
+    const auto xkb = xcb_xkb_use_extension(connection, 1, 0);
     free(xcb_composite_query_version_reply(connection, composite, nullptr));
     free(xcb_xfixes_query_version_reply(connection, fixes, nullptr));
     free(xcb_randr_query_version_reply(connection, randr, nullptr));
+    free(xcb_xkb_use_extension_reply(connection, xkb, nullptr));
     xcb_screen_t *screen = swell_xcb_screen(connection);
     int w = wdl_max(r->right - r->left, 1);
     int h = wdl_max(r->bottom - r->top, 1);

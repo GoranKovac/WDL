@@ -124,8 +124,8 @@ ifndef NOGDK
     #Wayland (SWELL_TARGET_WAYLAND) depends on GTK3 so load it automatically
     ifdef WAYLAND
       SWELL_OBJS += swell-generic-wayland.o swell-xwayland-bridge.o
-      CFLAGS += $(shell $(PKG_CONFIG) --cflags wayland-client wayland-egl xcb-keysyms xcb-randr xcb-damage xcb-shape xcb-shm xcb-dri3 xcb-sync xcb-composite xcb-ewmh xcb-icccm xcb-xtest xcb-xfixes xcb-image xcb-renderutil cairo-xcb epoxy libdrm)
-      LINKEXTRA += $(shell $(PKG_CONFIG) --libs wayland-client wayland-egl xcb-keysyms xcb-randr xcb-damage xcb-shape xcb-shm xcb-dri3 xcb-sync xcb-composite xcb-ewmh xcb-icccm xcb-xtest xcb-xfixes xcb-image xcb-renderutil cairo-xcb epoxy libdrm)
+      CFLAGS += $(shell $(PKG_CONFIG) --cflags wayland-client wayland-egl xcb-keysyms xcb-randr xcb-damage xcb-shape xcb-shm xcb-dri3 xcb-sync xcb-composite xcb-ewmh xcb-icccm xcb-xtest xcb-xfixes xcb-xkb xcb-image xcb-renderutil cairo-xcb epoxy libdrm)
+      LINKEXTRA += $(shell $(PKG_CONFIG) --libs wayland-client wayland-egl xcb-keysyms xcb-randr xcb-damage xcb-shape xcb-shm xcb-dri3 xcb-sync xcb-composite xcb-ewmh xcb-icccm xcb-xtest xcb-xfixes xcb-xkb xcb-image xcb-renderutil cairo-xcb epoxy libdrm)
       override SWELL_GDK_ONLY =
       # spare-window for modal dialogs doesn't resize on an already
       # mapped Wayland so disable it
