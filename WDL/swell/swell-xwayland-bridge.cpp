@@ -1436,6 +1436,7 @@ struct Capture {
     int        gtk_x           = 0;
     int        gtk_y           = 0;
     xcb_window_t root_popup      = 0;
+    uint32_t   canvas_buttons   = 0;
 
     struct PopupWin {
         xcb_window_t x11_win;
@@ -2086,6 +2087,7 @@ static gboolean canvas_button_press(GtkWidget *widget, GdkEventButton *e, gpoint
             fake_motion(c->connection, x11_x, x11_y);
             xcb_flush(c->connection);
             fake_button(c->connection, e->button, true);
+            if (e->button < 32) c->canvas_buttons |= 1u << e->button;
             xcb_flush(c->connection);
             return true;
         }
@@ -2102,6 +2104,7 @@ static gboolean canvas_button_release(GtkWidget *, GdkEventButton *e, gpointer d
     Capture *c = (Capture*)data;
     if (!c || !c->connection) return false;
     fake_button(c->connection, e->button, false);
+    if (e->button < 32) c->canvas_buttons &= ~(1u << e->button);
     xcb_flush(c->connection);
     return true;
 }
@@ -2307,6 +2310,10 @@ static void canvas_remove_popup(Capture *c, xcb_window_t x11_win)
     if (c->root_popup == x11_win) c->root_popup = XCB_NONE;
 
     if (c->popups.empty()) {
+        for (int button = 1; button < 32; ++button)
+            if (c->canvas_buttons & (1u << button)) fake_button(c->connection, button, false);
+        if (c->canvas_buttons) xcb_flush(c->connection);
+        c->canvas_buttons = 0;
         if (c->popup_canvas) {
             gtk_widget_destroy(c->popup_canvas);
             c->popup_canvas = nullptr;
