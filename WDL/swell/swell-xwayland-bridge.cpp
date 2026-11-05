@@ -764,12 +764,15 @@ void XWaylandWM::read_wm_hints(xcb_window_t w, WMWindowState &st) {
 
 bool XWaylandWM::owns_window(xcb_window_t window, xcb_window_t gui)
 {
+    if (!window || !gui) return false;
     uint32_t window_pid = 0, gui_pid = 0;
     xcb_get_property_cookie_t a = xcb_ewmh_get_wm_pid(&atoms_, window);
     xcb_get_property_cookie_t b = xcb_ewmh_get_wm_pid(&atoms_, gui);
     xcb_ewmh_get_wm_pid_reply(&atoms_, a, &window_pid, nullptr);
     xcb_ewmh_get_wm_pid_reply(&atoms_, b, &gui_pid, nullptr);
-    return window_pid && window_pid == gui_pid;
+    if (window_pid && gui_pid) return window_pid == gui_pid;
+    const uint32_t client_mask = ~xcb_get_setup(connection_)->resource_id_mask;
+    return (window & client_mask) == (gui & client_mask);
 }
 
 XWaylandWM::WindowType XWaylandWM::window_type(xcb_window_t window, bool override_redirect)
