@@ -1171,6 +1171,7 @@ static void resize_window(GdkWindow *wnd, int reposflag, RECT f, bool mapped)
         !(state & GDK_WINDOW_STATE_FULLSCREEN) && (w != oldw || h != oldh))
     {
       GdkGeometry hints = {};
+      hints.max_width = hints.max_height = G_MAXSHORT;
       if (w > oldw) hints.min_width = w;
       else if (w < oldw) hints.max_width = w;
       if (h > oldh) hints.min_height = h;
