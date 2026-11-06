@@ -2085,6 +2085,14 @@ static bool has_input_popup(const Capture *c)
     return false;
 }
 
+static void canvas_update_input(Capture *c)
+{
+    if (!c->popup_canvas) return;
+    cairo_region_t *region = has_input_popup(c) ? nullptr : cairo_region_create();
+    gtk_widget_input_shape_combine_region(c->popup_canvas, region);
+    if (region) cairo_region_destroy(region);
+}
+
 static void dismiss_popups(Capture *c);
 
 static gboolean canvas_button_press(GtkWidget *widget, GdkEventButton *e, gpointer data)
@@ -2278,6 +2286,7 @@ static void canvas_add_popup(Capture *c, xcb_window_t x11_win, xcb_get_geometry_
         pp->w == attr->width && pp->h == attr->height)
     {
         pp->visible = true;
+        canvas_update_input(c);
         if (c->popup_canvas && !gtk_widget_get_visible(c->popup_canvas))
             gtk_widget_show_all(c->popup_canvas);
         return;
@@ -2314,6 +2323,7 @@ static void canvas_add_popup(Capture *c, xcb_window_t x11_win, xcb_get_geometry_
     if (c->root_popup == XCB_NONE && popup_accepts_input(c->connection, x11_win))
         c->root_popup = x11_win;
 
+    canvas_update_input(c);
     if (!gtk_widget_get_visible(c->popup_canvas))
         gtk_widget_show_all(c->popup_canvas);
     if (c->canvas_draw) gtk_widget_queue_draw(c->canvas_draw);
@@ -2343,6 +2353,7 @@ static void canvas_remove_popup(Capture *c, xcb_window_t x11_win)
             c->canvas_draw  = nullptr;
         }
     } else if (c->canvas_draw) {
+        canvas_update_input(c);
         gtk_widget_queue_draw(c->canvas_draw);
     }
 }
@@ -2716,12 +2727,16 @@ static void bridge_handle_event(xcb_generic_event_t *ev)
 
     if (g_shape_event_base >= 0 && type == g_shape_event_base + XCB_SHAPE_NOTIFY) {
         xcb_shape_notify_event_t *shape = (xcb_shape_notify_event_t *)ev;
-        if (shape->shape_kind != XCB_SHAPE_SK_BOUNDING) return;
+        if (shape->shape_kind != XCB_SHAPE_SK_BOUNDING && shape->shape_kind != XCB_SHAPE_SK_INPUT) return;
         for (auto &kv : g_captures) {
             Capture *c = kv.second;
             if (kv.first != c->parent_win) continue;
             for (auto &p : c->popups) {
                 if (p.x11_win != shape->affected_window) continue;
+                if (shape->shape_kind == XCB_SHAPE_SK_INPUT) {
+                    canvas_update_input(c);
+                    return;
+                }
                 p.shape_dirty = true;
                 if (c->canvas_draw)
                     swell_gdk_queue_draw_pixels(c->canvas_draw, p.x - c->canvas_x,
