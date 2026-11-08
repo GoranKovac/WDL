@@ -3349,6 +3349,9 @@ static GdkFilterReturn filterCreateShowProc(GdkXEvent *xev, GdkEvent *event, gpo
     case GenericEvent:
       // XInput2
       {
+        int opcode, event_base, error_base;
+        if (!XQueryExtension(xevent->xany.display, "XInputExtension", &opcode, &event_base, &error_base) ||
+            xevent->xcookie.extension != opcode) break;
         XIDeviceEvent *xievent = (XIDeviceEvent*)xevent->xcookie.data;
         if (!xevent->xany.send_event &&
             xievent &&
