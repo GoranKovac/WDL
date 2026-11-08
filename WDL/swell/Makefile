@@ -117,10 +117,18 @@ ifndef NOGDK
     ifndef PRELOAD_GDK
       LINKEXTRA += $(shell $(PKG_CONFIG) --libs gdk-2.0 gio-2.0)
     else
-      LINKEXTRA += -lX11 -lXi
+      LINKEXTRA += -lX11
       CFLAGS += -DSWELL_PRELOAD="libgdk-x11-2.0.so.0"
     endif
   else
+    #Wayland (SWELL_TARGET_WAYLAND) depends on GTK3 so load it automatically
+    ifdef WAYLAND
+      SWELL_OBJS += swell-generic-wayland.o swell-xwayland-bridge.o
+      CFLAGS += $(shell $(PKG_CONFIG) --cflags wayland-client wayland-egl xcb-keysyms xcb-randr xcb-damage xcb-shape xcb-shm xcb-dri3 xcb-sync xcb-composite xcb-ewmh xcb-icccm xcb-xtest xcb-xfixes xcb-xkb xcb-image xcb-renderutil cairo-xcb epoxy libdrm)
+      LINKEXTRA += $(shell $(PKG_CONFIG) --libs wayland-client wayland-egl xcb-keysyms xcb-randr xcb-damage xcb-shape xcb-shm xcb-dri3 xcb-sync xcb-composite xcb-ewmh xcb-icccm xcb-xtest xcb-xfixes xcb-xkb xcb-image xcb-renderutil cairo-xcb epoxy libdrm)
+      override SWELL_GDK_ONLY =
+      CFLAGS += -DSWELL_NO_SPARE_MODALDLG
+    endif
     ifndef SWELL_GDK_ONLY
       CFLAGS += -DSWELL_TARGET_GDK=3 $(shell $(PKG_CONFIG) --cflags gtk+-3.0) -DSWELL_SUPPORT_GTK
     else
@@ -133,8 +141,15 @@ ifndef NOGDK
         LINKEXTRA += $(shell $(PKG_CONFIG) --libs gdk-3.0 gio-2.0)
       endif
     else
-      LINKEXTRA += -lX11 -lXi
-      CFLAGS += -DSWELL_PRELOAD="libgdk-3.so.0"
+      LINKEXTRA += -lX11
+      ifdef WAYLAND
+        CFLAGS += -DSWELL_PRELOAD="libgtk-3.so.0"
+      else
+        CFLAGS += -DSWELL_PRELOAD="libgdk-3.so.0"
+      endif
+    endif
+    ifdef WAYLAND
+      CFLAGS += -DSWELL_TARGET_WAYLAND
     endif
   endif
   CFLAGS += -DSWELL_LICE_GDI
@@ -162,7 +177,7 @@ default: libSwell$(DLL_EXT)
 
 .PHONY: clean 
 
-SWELL_HEADERS=swell-dlggen.h swell-gdi-internalpool.h swell-menugen.h swell-types.h swell-functions.h swell-internal.h
+SWELL_HEADERS=swell-dlggen.h swell-gdi-internalpool.h swell-menugen.h swell-types.h swell-functions.h swell-internal.h swell-gdk-scale.h
 
 swell.o: $(SWELL_HEADERS)
 swell-ini.o: $(SWELL_HEADERS)
@@ -176,10 +191,12 @@ swell-kb-generic.o: $(SWELL_HEADERS)
 swell-miscdlg-generic.o: $(SWELL_HEADERS)
 swell-modstub-generic.o: $(SWELL_HEADERS)
 swell-appstub-generic.o: $(SWELL_HEADERS)
-
-swell-generic-gdk.o swell-generic-x11.o swell-gdk-clipboard.o: $(SWELL_HEADERS) swell-gdk.h
-
-swell-generic-x11.o: swell-xcb.h
+swell-generic-gdk.o swell-xwayland-bridge.o swell-generic-x11.o swell-generic-wayland.o: $(SWELL_HEADERS)
+swell-generic-x11.o swell-xwayland-bridge.o: swell-xcb.h
+swell-generic-gdk.o swell-generic-x11.o swell-generic-wayland.o swell-gdk-clipboard.o: swell-gdk.h
+swell-gdk-clipboard.o: $(SWELL_HEADERS)
+swell-generic-wayland.o swell-xwayland-bridge.o: swell-wayland.h
+swell-xwayland-bridge.o swell-generic-wayland.o: swell-xwayland-bridge.h
 
 libSwell$(DLL_EXT): $(OBJS)
 	$(CXX) -shared -o $@ $(CFLAGS) $(LFLAGS) $^ $(LINKEXTRA)

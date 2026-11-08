@@ -56,6 +56,10 @@ struct SWELL_GdkBackend
 
 extern const SWELL_GdkBackend swell_gdk_x11;
 void swell_x11_init();
+#ifdef SWELL_TARGET_WAYLAND
+extern const SWELL_GdkBackend swell_gdk_wayland;
+bool swell_wayland_init_display();
+#endif
 extern const SWELL_GdkBackend *swell_gdk_backend;
 extern GdkEvent *swell_gdk_current_event;
 extern HWND swell_gdk_drag_source;

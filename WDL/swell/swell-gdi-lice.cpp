@@ -1952,7 +1952,12 @@ void ImageList_Destroy(HIMAGELIST list)
 
 int ImageList_ReplaceIcon(HIMAGELIST list, int offset, HICON image)
 {
-  if (WDL_NOT_NORMALLY(!image || !list)) return -1;
+  if (WDL_NOT_NORMALLY(!list)) return -1;
+#ifdef SWELL_TARGET_WAYLAND
+  if (!image) return -1;
+#else
+  if (WDL_NOT_NORMALLY(!image)) return -1;
+#endif
   WDL_PtrList<HGDIOBJ__> *l=(WDL_PtrList<HGDIOBJ__> *)list;
 
   HGDIOBJ__ *imgsrc = (HGDIOBJ__*)image;
