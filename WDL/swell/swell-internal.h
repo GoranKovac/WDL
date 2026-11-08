@@ -889,6 +889,9 @@ typedef GdkWindow *SWELL_OSWINDOW;
 #else
 typedef void *SWELL_OSWINDOW; // maps to the HWND__ itself on visible, non-GDK, top level windows
 #endif
+#ifdef SWELL_TARGET_WAYLAND
+typedef GtkWidget *SWELL_OSWIDGET;
+#endif
 
 struct HWND__
 {
@@ -903,6 +906,9 @@ struct HWND__
   const char *m_classname;
 
   SWELL_OSWINDOW m_oswindow;
+#ifdef SWELL_TARGET_WAYLAND
+  SWELL_OSWIDGET m_oswidget;
+#endif
 
   WDL_FastString m_title;
 
@@ -1038,6 +1044,9 @@ void swell_oswindow_postresize(HWND hwnd, RECT f);
 void swell_oswindow_invalidate(HWND hwnd, const RECT *r);
 void swell_oswindow_destroy(HWND hwnd);
 void swell_oswindow_manage(HWND hwnd, bool wantfocus);
+#ifdef SWELL_TARGET_WAYLAND
+bool swell_is_wayland();
+#endif
 void swell_oswindow_maximize(HWND, bool wantmax); // false=restore
 void swell_oswindow_updatetoscreen(HWND hwnd, RECT *rect);
 HWND swell_window_wants_all_input(); // window with an active drag of menubar will have this set, to route all mouse events to nonclient area of window
