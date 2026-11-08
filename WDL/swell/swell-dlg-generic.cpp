@@ -255,6 +255,7 @@ int SWELL_DialogBox(SWELL_DialogResourceIndex *reshead, const char *resid, HWND 
       Sleep(10);
     }
     ret=r.ret;
+    swell_oswindow_end_modal(hwnd);
     s_modalDialogs.DeletePtr(&r);
 
     a = SWELL_topwindows;

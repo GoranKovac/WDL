@@ -1158,6 +1158,11 @@ static LRESULT WINAPI submenuWndProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM
 
             inf->hSubMenu->sel_vis=-1;
 
+            if (hh && !swell_oswindow_reuse_popup())
+            {
+              DestroyWindow(hh);
+              hh = NULL;
+            }
             if (hh)
             {
               m_trackingMenus.Delete(nextidx);

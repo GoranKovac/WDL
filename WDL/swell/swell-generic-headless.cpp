@@ -99,6 +99,12 @@ void swell_oswindow_manage(HWND hwnd, bool wantfocus)
   if (wantVis) swell_oswindow_update_text(hwnd);
 }
 
+void swell_oswindow_begin_drag(HWND) { }
+bool swell_oswindow_from_point(POINT, HWND *) { return false; }
+bool swell_oswindow_reuse_popup() { return true; }
+
+void swell_oswindow_end_modal(HWND) { }
+
 void SWELL_RunEvents()
 {
 }
@@ -148,7 +154,7 @@ bool GetWindowRect(HWND hwnd, RECT *r)
 }
 
 void swell_oswindow_begin_resize(SWELL_OSWINDOW wnd) { }
-void swell_oswindow_resize(SWELL_OSWINDOW wnd, int reposflag, RECT f) { }
+void swell_oswindow_resize(SWELL_OSWINDOW wnd, int reposflag, RECT f, bool mapped) { }
 void swell_oswindow_postresize(HWND hwnd, RECT f) { }
 void swell_oswindow_invalidate(HWND hwnd, const RECT *r) { }
 

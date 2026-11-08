@@ -846,7 +846,6 @@ SWELL_IMPLEMENT_GETOSXVERSION int SWELL_GetOSXVersion()
 
 #include <gdk/gdk.h>
 #include <gdk/gdkkeysyms.h>
-#include <gdk/gdkx.h>
 
 
 #else
@@ -1026,11 +1025,15 @@ void swell_on_toplevel_raise(SWELL_OSWINDOW wnd); // called by swell-generic-gdk
 HWND swell_oswindow_to_hwnd(SWELL_OSWINDOW w);
 SWELL_OSWINDOW swell_oswindow_from_hwnd(HWND hwnd);
 void swell_oswindow_focus(HWND hwnd);
+void swell_oswindow_begin_drag(HWND source);
+bool swell_oswindow_from_point(POINT point, HWND *window);
+bool swell_oswindow_reuse_popup();
+void swell_oswindow_end_modal(HWND hwnd);
 void swell_oswindow_update_style(HWND hwnd, LONG oldstyle);
 void swell_oswindow_update_enable(HWND hwnd);
 void swell_oswindow_update_text(HWND hwnd);
 void swell_oswindow_begin_resize(SWELL_OSWINDOW wnd);
-void swell_oswindow_resize(SWELL_OSWINDOW wnd, int reposflag, RECT f);
+void swell_oswindow_resize(SWELL_OSWINDOW wnd, int reposflag, RECT f, bool mapped = false);
 void swell_oswindow_postresize(HWND hwnd, RECT f);
 void swell_oswindow_invalidate(HWND hwnd, const RECT *r);
 void swell_oswindow_destroy(HWND hwnd);

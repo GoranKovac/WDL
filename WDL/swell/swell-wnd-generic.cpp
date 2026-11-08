@@ -771,7 +771,7 @@ void SetWindowPos(HWND hwnd, HWND zorder, int x, int y, int cx, int cy, int flag
 
     if (hwnd->m_oswindow && !hwnd->m_oswindow_fullscreen)
     {
-      swell_oswindow_resize(hwnd->m_oswindow,reposflag,f);
+      swell_oswindow_resize(hwnd->m_oswindow,reposflag,f,true);
       if (reposflag&2) SendMessage(hwnd,WM_SIZE,SIZE_RESTORED,0);
     }
     else
@@ -4652,6 +4652,7 @@ forceMouseMove:
                 NMLISTVIEW nm={{hwnd,hwnd->m_id,LVN_BEGINDRAG},lvs->m_capmode_data1,lvs->GetColumnIndex(lvs->m_capmode_data2)};
                 lvs->m_capmode_state=LISTVIEW_CAP_NONE;
                 SendMessage(GetParent(hwnd),WM_NOTIFY,hwnd->m_id,(LPARAM)&nm);
+                swell_oswindow_begin_drag(hwnd);
               }
             }
           break;
@@ -5923,6 +5924,7 @@ forceMouseMove:
                 nm.itemNew.hItem = item;
                 nm.itemNew.lParam = item ? item->m_param : 0;
                 SendMessage(GetParent(hwnd),WM_NOTIFY,nm.hdr.idFrom,(LPARAM)&nm);
+                swell_oswindow_begin_drag(hwnd);
               }
             }
           break;
@@ -7131,6 +7133,8 @@ static HWND recurseOwnedWindowHitTest(HWND h, POINT p, int maxdepth)
 
 HWND WindowFromPoint(POINT p)
 {
+  HWND window;
+  if (swell_oswindow_from_point(p, &window)) return window;
   HWND h = SWELL_topwindows;
   while (h)
   {
@@ -7143,6 +7147,9 @@ HWND WindowFromPoint(POINT p)
   }
   return NULL;
 }
+
+
+
 
 #ifdef _DEBUG
 int g_swell_in_paint;

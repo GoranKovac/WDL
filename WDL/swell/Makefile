@@ -109,6 +109,7 @@ LICE_OBJS = lice.o  lice_arc.o lice_colorspace.o lice_line.o lice_text.o \
 OBJS = $(SWELL_OBJS)
 
 ifndef NOGDK
+  SWELL_OBJS += swell-generic-x11.o swell-gdk-clipboard.o
   ifdef GDK2
     CFLAGS += -DSWELL_TARGET_GDK=2 $(shell $(PKG_CONFIG) --cflags gdk-2.0)
     ifndef PRELOAD_GDK
@@ -173,6 +174,8 @@ swell-kb-generic.o: $(SWELL_HEADERS)
 swell-miscdlg-generic.o: $(SWELL_HEADERS)
 swell-modstub-generic.o: $(SWELL_HEADERS)
 swell-appstub-generic.o: $(SWELL_HEADERS)
+
+swell-generic-gdk.o swell-generic-x11.o swell-gdk-clipboard.o: $(SWELL_HEADERS) swell-gdk.h
 
 libSwell$(DLL_EXT): $(OBJS)
 	$(CXX) -shared -o $@ $(CFLAGS) $(LFLAGS) $^ $(LINKEXTRA)
