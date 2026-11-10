@@ -2040,9 +2040,51 @@ static void getHotSpotForFile(const char *fn, POINT *pt)
   fclose(fp);
 }
 
+// gdk-pixbuf 2.44+ hands files to glycin, which takes a Windows cursor (.cur,
+// header type 2) for a TGA image and fails. Load the bytes with the header
+// relabelled as an icon (type 1), which glycin decodes; the hotspot is still
+// read from the original file. Falls back to a plain file load.
+static GdkPixbuf *swell_load_cur_pixbuf(const char *fn)
+{
+  GdkPixbuf *pb = NULL;
+  FILE *fp = WDL_fopenA(fn,"rb");
+  if (fp)
+  {
+    unsigned char *data = NULL;
+    long len = 0;
+    if (!fseek(fp,0,SEEK_END) && (len = ftell(fp)) > 6 && len < (1<<20) && !fseek(fp,0,SEEK_SET))
+    {
+      data = (unsigned char *)malloc(len);
+      if (data && fread(data,1,len,fp) != (size_t)len) { free(data); data = NULL; }
+    }
+    fclose(fp);
+    if (data)
+    {
+      if (!data[0] && !data[1] && data[2] == 2 && !data[3])
+      {
+        data[2] = 1;
+        GdkPixbufLoader *ld = gdk_pixbuf_loader_new();
+        if (ld)
+        {
+          bool ok = gdk_pixbuf_loader_write(ld,data,len,NULL);
+          if (gdk_pixbuf_loader_close(ld,NULL) && ok)
+          {
+            pb = gdk_pixbuf_loader_get_pixbuf(ld);
+            if (pb) g_object_ref(pb);
+          }
+          g_object_unref(ld);
+        }
+      }
+      free(data);
+    }
+  }
+  if (!pb) pb = gdk_pixbuf_new_from_file(fn,NULL);
+  return pb;
+}
+
 HCURSOR SWELL_LoadCursorFromFile(const char *fn)
 {
-  GdkPixbuf *pb = gdk_pixbuf_new_from_file(fn,NULL);
+  GdkPixbuf *pb = swell_load_cur_pixbuf(fn);
   if (pb) 
   {
     POINT hs = {0,};
@@ -2080,8 +2122,8 @@ HCURSOR SWELL_LoadCursor(const char *_idx)
         GetModuleFileName(NULL,buf,sizeof(buf));
         WDL_remove_filepart(buf);
         snprintf_append(buf,sizeof(buf),"/Resources/%s.cur",p->resname);
-        GdkPixbuf *pb = gdk_pixbuf_new_from_file(buf,NULL);
-        if (pb) 
+        GdkPixbuf *pb = swell_load_cur_pixbuf(buf);
+        if (pb)
         {
           getHotSpotForFile(buf,&p->hotspot);
           GdkCursor *curs = gdk_cursor_new_from_pixbuf(gdk_display_get_default(),pb,p->hotspot.x,p->hotspot.y);
